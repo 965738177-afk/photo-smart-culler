@@ -1,0 +1,5 @@
+Pillow==12.3.0
+numpy==2.5.3
+opencv-python-headless==4.11.0.86
+rawpy==0.27.1
+tkinterdnd2==0.6.3

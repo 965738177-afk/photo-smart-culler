@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="930" viewBox="0 0 900 930">
+  <style>
+    .bg{fill:#151719}.panel{fill:#1b1e20}.line{stroke:#34383c;stroke-width:1}.t{fill:#f2efe8;font:700 25px -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif}.b{fill:#dedbd4;font:400 18px -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif}.m{fill:#9da19f;font:400 16px -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif}.btn{fill:#262a2e}.bt{fill:#74797e;font:600 18px -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif}.idx{fill:#d4922f}.it{fill:#211b13;font:700 15px -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif}.card{fill:#201d19;stroke:#5e503c;stroke-width:1}.gold{fill:#efc987;font:700 18px -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif}.dot{fill:#2d3135}.num{fill:#efc987;font:700 13px -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif}
+  </style>
+  <rect class="bg" width="900" height="930"/><rect class="panel" x="24" y="20" width="852" height="890"/>
+  <text class="m" x="56" y="63">写入完成后，可在 Lightroom 同步查看</text>
+  <rect class="btn" x="56" y="80" width="772" height="52"/><text class="bt" x="377" y="113">导出筛选日志</text>
+  <line class="line" x1="56" y1="160" x2="828" y2="160"/>
+  <text class="t" x="56" y="206">Lightroom 星级同步</text>
+  <text class="m" x="56" y="236">写入 XMP 后，在 Lightroom 读取星级</text>
+  <g transform="translate(56 260)">
+    <rect class="idx" width="30" height="30"/><text class="it" x="11" y="21">1</text><text class="b" x="46" y="21">取消勾选「仅显示目标照片的元数据」</text>
+    <rect class="idx" y="43" width="30" height="30"/><text class="it" x="11" y="64">2</text><text class="b" x="46" y="64">图库按 G，网格视图全选本次照片</text>
+    <rect class="idx" y="86" width="30" height="30"/><text class="it" x="11" y="107">3</text><text class="b" x="46" y="107">元数据面板选择「选定的照片」</text>
+    <rect class="idx" y="129" width="30" height="30"/><text class="it" x="11" y="150">4</text><text class="b" x="46" y="150">右键照片 → 元数据 → 从文件中读取元数据</text>
+  </g>
+  <line class="line" x1="56" y1="450" x2="828" y2="450"/>
+  <text class="t" x="56" y="496">个人校准</text>
+  <text class="m" x="56" y="526">用你在 Lightroom 的最终选择，调整本机筛选偏好</text>
+  <text class="m" x="56" y="550">全程本地处理，不上传原片或星级数据</text>
+  <rect class="card" x="56" y="578" width="772" height="192"/>
+  <text class="m" x="80" y="612">更新前请准备</text>
+  <g transform="translate(80 632)">
+    <circle class="dot" cx="10" cy="10" r="10"/><text class="num" x="7" y="15">1</text><text class="b" x="32" y="16">本软件导出的筛选日志</text>
+    <circle class="dot" cx="10" cy="52" r="10"/><text class="num" x="7" y="57">2</text><text class="b" x="32" y="58">Lightroom 导出的带星级 JPG</text>
+    <circle class="dot" cx="10" cy="94" r="10"/><text class="num" x="7" y="99">3</text><text class="b" x="32" y="100">对应的原片文件夹（可多选）</text>
+  </g>
+  <rect x="56" y="790" width="772" height="58" fill="#2b241a" stroke="#a67632" stroke-width="1"/>
+  <text class="gold" x="354" y="826">更新个人校准</text>
+  <text class="m" x="282" y="881">只影响后续分析结果，不会修改原片或 Lightroom 星级</text>
+</svg>

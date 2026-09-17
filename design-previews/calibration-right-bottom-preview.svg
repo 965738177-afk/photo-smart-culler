@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1180" viewBox="0 0 900 1180">
+  <defs>
+    <style>
+      .bg { fill: #151719; }
+      .panel { fill: #1b1e20; }
+      .line { stroke: #34383c; stroke-width: 1; }
+      .hairline { stroke: #c6b99a; stroke-width: 1; opacity: .68; }
+      .title { fill: #f2efe8; font: 700 25px -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+      .body { fill: #dedbd4; font: 400 18px -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+      .muted { fill: #969ba0; font: 400 17px -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+      .small { fill: #9da19f; font: 400 15px -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+      .button { fill: #262a2e; }
+      .buttonText { fill: #f0ede7; font: 600 18px -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+      .gold { fill: #d4922f; }
+      .goldSoft { fill: #2b241a; stroke: #a67632; stroke-width: 1; }
+      .goldText { fill: #efc987; font: 700 18px -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+      .chip { fill: #d4922f; }
+      .chipText { fill: #211b13; font: 700 15px -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="900" height="1180"/>
+  <rect class="panel" x="24" y="22" width="852" height="1136"/>
+
+  <text class="title" x="56" y="70">本张决策</text>
+  <text class="muted" x="56" y="106">从左侧选择一张照片</text>
+  <text class="muted" x="56" y="130">查看评分与原因</text>
+  <text class="muted" x="56" y="180">手动评级</text>
+  <rect class="button" x="56" y="198" width="187" height="52"/>
+  <rect class="button" x="251" y="198" width="187" height="52"/>
+  <rect class="button" x="446" y="198" width="187" height="52"/>
+  <rect class="button" x="641" y="198" width="187" height="52"/>
+  <text class="buttonText" x="132" y="231">清除</text>
+  <text class="buttonText" x="327" y="231">1★</text>
+  <text class="buttonText" x="522" y="231">2★</text>
+  <text class="buttonText" x="717" y="231">3★</text>
+  <line class="hairline" x1="56" y1="276" x2="828" y2="276"/>
+  <text class="muted" x="56" y="318">写入方式</text>
+  <rect x="56" y="334" width="394" height="40" fill="#e8e5dd"/>
+  <text x="68" y="361" fill="#26272a" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="17">安全写入｜跳过已有星级</text>
+  <polygon points="424,349 440,349 432,361" fill="#2a2b2c"/>
+  <rect class="goldSoft" x="56" y="394" width="772" height="54"/>
+  <text x="345" y="428" fill="#8e856f" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="18" font-weight="600">确认写入 XMP 星级</text>
+  <rect class="button" x="56" y="460" width="772" height="50"/>
+  <text x="373" y="492" fill="#72777c" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="17">还原本次星级</text>
+  <rect class="button" x="56" y="520" width="772" height="50"/>
+  <text x="379" y="552" fill="#72777c" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="17">导出筛选日志</text>
+
+  <line class="line" x1="56" y1="598" x2="828" y2="598"/>
+  <text class="title" x="56" y="642">Lightroom 星级同步</text>
+  <text class="small" x="56" y="674">写入 XMP 后，在 Lightroom 读取星级</text>
+  <g transform="translate(56 698)">
+    <rect class="chip" width="30" height="30"/><text class="chipText" x="11" y="21">1</text>
+    <text class="body" x="46" y="21">取消勾选「仅显示目标照片的元数据」</text>
+    <rect class="chip" y="45" width="30" height="30"/><text class="chipText" x="11" y="66">2</text>
+    <text class="body" x="46" y="66">图库按 G，网格视图全选本次照片</text>
+    <rect class="chip" y="90" width="30" height="30"/><text class="chipText" x="11" y="111">3</text>
+    <text class="body" x="46" y="111">元数据面板选择「选定的照片」</text>
+    <rect class="chip" y="135" width="30" height="30"/><text class="chipText" x="11" y="156">4</text>
+    <text class="body" x="46" y="156">右键照片 → 元数据 → 从文件中读取元数据</text>
+  </g>
+
+  <line class="line" x1="56" y1="888" x2="828" y2="888"/>
+  <text class="title" x="56" y="934">个人校准</text>
+  <text class="small" x="56" y="964">用你在 Lightroom 的最终选择，调整本机筛选偏好</text>
+  <text class="small" x="56" y="987">全程本地处理，不上传原片或星级数据</text>
+  <g transform="translate(56 1014)">
+    <circle cx="10" cy="10" r="10" fill="#2d3135"/><text x="7" y="15" fill="#efc987" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="13" font-weight="700">1</text>
+    <text class="body" x="32" y="16">本软件导出的筛选日志</text>
+    <circle cx="10" cy="40" r="10" fill="#2d3135"/><text x="7" y="45" fill="#efc987" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="13" font-weight="700">2</text>
+    <text class="body" x="32" y="46">Lightroom 导出的带星级 JPG</text>
+    <circle cx="10" cy="70" r="10" fill="#2d3135"/><text x="7" y="75" fill="#efc987" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="13" font-weight="700">3</text>
+    <text class="body" x="32" y="76">对应的原片文件夹（可多选）</text>
+  </g>
+  <rect class="goldSoft" x="56" y="1110" width="772" height="52"/>
+  <text class="goldText" x="355" y="1143">更新个人校准</text>
+</svg>
