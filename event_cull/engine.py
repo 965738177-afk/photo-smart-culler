@@ -6,6 +6,7 @@ import os
 import json
 import math
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -43,6 +44,7 @@ MESSAGES = {
         "expression": "多人表情不完整，不作为 3★ 首选",
         "soft_scene": "连续场景整体偏柔，可能是头纱或前景遮挡，保留代表画面复核",
         "scene_coverage": "连续场景保底：不依赖人脸，保留代表画面复核",
+        "single_scene": "独立场景代表：无相似连拍，保留供复核",
         "best": "本组最佳",
         "backup": "优质备用",
         "review": "初选复核",
@@ -62,6 +64,7 @@ MESSAGES = {
         "expression": "Group expressions are incomplete; not a first-choice 3-star frame",
         "soft_scene": "The continuous scene is uniformly soft, possibly through a veil or foreground layer; keep a representative frame for review",
         "scene_coverage": "Continuous-scene safeguard: keep a representative frame regardless of face detection",
+        "single_scene": "Independent scene representative: no similar burst, retained for review",
         "best": "Best in group",
         "backup": "Strong backup",
         "review": "Review selection",
@@ -90,11 +93,21 @@ class AnalysisCancelled(Exception):
 @dataclass(frozen=True)
 class AnalysisOptions:
     picks_per_group: int = 2
+    max_picks_per_group: int | None = None
     target_keep_count: int | None = None
+    target_keep_max_count: int | None = None
     burst_gap_seconds: float = 8.0
     similarity_threshold: int = 18
     blur_floor: float = 55.0
     severe_clip_fraction: float = 0.12
+    detect_closed_eyes: bool = True
+    detect_blur: bool = True
+    detect_exposure: bool = True
+    detect_duplicates: bool = True
+    ai_selection_enabled: bool = True
+    prefer_people: bool = True
+    max_duplicate_picks_per_group: int | None = None
+    fill_with_similar: bool = False
     language: str = "zh"
 
 
@@ -163,32 +176,118 @@ def _paths_for_selected_files(paths: list[Path]) -> list[Path]:
     return sorted(expanded)
 
 
-def _load_preview(path: Path) -> np.ndarray:
+def _resize_preview(image: np.ndarray, maximum_dimension: int) -> np.ndarray:
+    """Bound display/analysis preview memory without touching the original file."""
+    if image is None or image.size == 0:
+        return image
+    limit = max(1, int(maximum_dimension))
+    largest = max(image.shape[:2])
+    if largest <= limit:
+        return image
+    scale = limit / largest
+    return cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+
+def _load_preview(path: Path, *, maximum_dimension: int = 1600) -> np.ndarray:
     if path.suffix.lower() in RAW_EXTENSIONS:
         if rawpy is None:
             raise RuntimeError("RAW support requires rawpy; install requirements-mvp.txt")
-        with rawpy.imread(str(path)) as raw:
-            thumb = raw.extract_thumb()
-            if thumb.format == rawpy.ThumbFormat.JPEG:
-                array = np.frombuffer(thumb.data, np.uint8)
-                image = cv2.imdecode(array, cv2.IMREAD_COLOR)
-            else:
-                image = cv2.cvtColor(thumb.data, cv2.COLOR_RGB2BGR)
-            if image is None:
-                raise RuntimeError("camera did not contain a usable RAW preview")
-            return image
+        try:
+            with rawpy.imread(str(path)) as raw:
+                try:
+                    thumb = raw.extract_thumb()
+                    if thumb.format == rawpy.ThumbFormat.JPEG:
+                        array = np.frombuffer(thumb.data, np.uint8)
+                        image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+                    else:
+                        image = cv2.cvtColor(thumb.data, cv2.COLOR_RGB2BGR)
+                    if image is not None:
+                        return _resize_preview(image, maximum_dimension)
+                except (
+                    rawpy.LibRawNoThumbnailError,
+                    rawpy.LibRawUnsupportedThumbnailError,
+                ):
+                    # Some camera profiles expose no embedded JPEG.  LibRaw can
+                    # still generate a fast half-size display preview without
+                    # changing the original RAW file.
+                    pass
+                rendered = raw.postprocess(
+                    half_size=True,
+                    use_camera_wb=True,
+                    no_auto_bright=True,
+                    output_bps=8,
+                )
+                if rendered is not None and rendered.size:
+                    return _resize_preview(
+                        cv2.cvtColor(rendered, cv2.COLOR_RGB2BGR), maximum_dimension
+                    )
+        except rawpy.LibRawError:
+            # Fall through to macOS Quick Look below. It sometimes supports a
+            # recently released camera before the bundled LibRaw does.
+            pass
+        quicklook = _macos_quicklook_preview(path, maximum_dimension)
+        if quicklook is not None:
+            return quicklook
+        raise RuntimeError(
+            "无法生成 RAW 缩略图：此机型暂未被 LibRaw 或 macOS Quick Look 支持"
+        )
     if path.suffix.lower() in {".jpg", ".jpeg"}:
         image = cv2.imread(str(path), cv2.IMREAD_REDUCED_COLOR_4)
         if image is None:
             raise RuntimeError("JPEG could not be decoded")
-        if max(image.shape[:2]) > 1600:
-            scale = 1600 / max(image.shape[:2])
-            image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        return image
+        return _resize_preview(image, maximum_dimension)
     with Image.open(path) as image:
         image = ImageOps.exif_transpose(image).convert("RGB")
-        image.thumbnail((1600, 1600))
+        image.thumbnail((maximum_dimension, maximum_dimension))
         return cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+
+
+def _macos_quicklook_preview(path: Path, maximum_dimension: int = 1600) -> np.ndarray | None:
+    """Ask macOS for a read-only RAW thumbnail after LibRaw has exhausted it.
+
+    Quick Look has Apple-maintained camera profiles. It is deliberately a
+    fallback because spawning it for every ordinary RAW would be slower than
+    extracting the embedded JPEG through LibRaw.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix="event-cull-quicklook-") as directory:
+            output = Path(directory)
+            command = [
+                "/usr/bin/qlmanage", "-t", "-s", str(max(1, int(maximum_dimension))),
+                "-o", str(output), str(path),
+            ]
+            # Tk has background preview and network threads by the time this
+            # fallback is reached.  ``subprocess`` may fork that threaded
+            # process on recent macOS releases, which can terminate the app
+            # inside Cocoa/Tk.  posix_spawn creates Quick Look directly.
+            process_id = os.posix_spawn(command[0], command, os.environ.copy())
+            deadline = time.monotonic() + 20
+            while True:
+                finished_id, wait_status = os.waitpid(process_id, os.WNOHANG)
+                if finished_id:
+                    if os.waitstatus_to_exitcode(wait_status) != 0:
+                        return None
+                    break
+                if time.monotonic() >= deadline:
+                    os.kill(process_id, 15)
+                    os.waitpid(process_id, 0)
+                    return None
+                time.sleep(0.05)
+            if not output.exists():
+                return None
+            candidates = [
+                item
+                for item in output.rglob("*")
+                if item.is_file() and item.suffix.lower() in {".png", ".jpg", ".jpeg"}
+            ]
+            if not candidates:
+                return None
+            image = cv2.imread(str(candidates[0]), cv2.IMREAD_COLOR)
+            return _resize_preview(image, maximum_dimension) if image is not None else None
+    except OSError:
+        return None
 
 
 def _dhash(gray: np.ndarray) -> int:
@@ -323,9 +422,13 @@ def _face_metrics(
         if haar_smile or emotion_smile:
             smiling_face_count += 1
     reasons: list[str] = []
-    if len(distinct) == 1 and open_eye_face_count == 0:
+    if options.detect_closed_eyes and len(distinct) == 1 and open_eye_face_count == 0:
         reasons.append(_message(options, "closed"))
-    if len(clear_faces) >= 2 and 0 < open_eye_face_count < len(clear_faces):
+    if (
+        options.detect_closed_eyes
+        and len(clear_faces) >= 2
+        and 0 < open_eye_face_count < len(clear_faces)
+    ):
         reasons.append(_message(options, "expression"))
     return (
         reasons,
@@ -401,6 +504,9 @@ def _cache_signature(source: Path, options: AnalysisOptions) -> dict:
         "mtime_ns": stat.st_mtime_ns,
         "blur_floor": options.blur_floor,
         "clip_fraction": options.severe_clip_fraction,
+        "detect_closed_eyes": options.detect_closed_eyes,
+        "detect_blur": options.detect_blur,
+        "detect_exposure": options.detect_exposure,
         "language": options.language,
     }
 
@@ -486,16 +592,16 @@ def _analyze(path: Path, pairs: list[Path], options: AnalysisOptions) -> PhotoRe
     median_luminance = float(np.median(gray))
     effective_sharpness = _effective_sharpness(sharpness, subject_sharpness)
     reasons: list[str] = []
-    if effective_sharpness < options.blur_floor:
+    if options.detect_blur and effective_sharpness < options.blur_floor:
         reasons.append(_message(options, "blur"))
     severe_overexposure = highlights >= options.severe_clip_fraction and (
         median_luminance >= 205
         or (subject_luminance is not None and subject_luminance >= 220)
     )
     severe_underexposure = shadows >= options.severe_clip_fraction and median_luminance <= 50
-    if severe_overexposure:
+    if options.detect_exposure and severe_overexposure:
         reasons.append(_message(options, "over"))
-    if severe_underexposure:
+    if options.detect_exposure and severe_underexposure:
         reasons.append(_message(options, "under"))
     reasons.extend(face_reasons)
     if (
@@ -510,7 +616,8 @@ def _analyze(path: Path, pairs: list[Path], options: AnalysisOptions) -> PhotoRe
         )
     quality = min(effective_sharpness / max(options.blur_floor, 1), 3.0) * 25
     quality += (1 - min(highlights + shadows, 0.5) / 0.5) * 25
-    quality += _people_priority_bonus(frontal_faces, smiling_faces)
+    if options.prefer_people:
+        quality += _people_priority_bonus(frontal_faces, smiling_faces)
     return PhotoResult(path, pairs, score=quality, reasons=reasons, sharpness=sharpness, highlight_clip=highlights, shadow_clip=shadows, perceptual_hash=_dhash(gray), subject_sharpness=subject_sharpness, frontal_face_count=frontal_faces, smiling_face_count=smiling_faces, open_eye_face_count=open_eye_faces, median_luminance=median_luminance, subject_luminance=subject_luminance)
 
 
@@ -531,6 +638,8 @@ def _analyze_cached(
 
 
 def _same_group(previous: PhotoResult, current: PhotoResult, options: AnalysisOptions) -> bool:
+    if not options.detect_duplicates:
+        return False
     if previous.path.parent.resolve() != current.path.parent.resolve():
         return False
     gap = current.path.stat().st_mtime - previous.path.stat().st_mtime
@@ -560,6 +669,8 @@ def _mark_relative_exposure_outliers(
     """
     for item in group:
         item.relative_exposure_ev = None
+    if not options.detect_exposure:
+        return
     if len(group) < 3:
         return
     for index, item in enumerate(group):
@@ -611,6 +722,8 @@ def _mark_relative_exposure_outliers(
 
 
 def _people_focus_issue(item: PhotoResult, options: AnalysisOptions) -> bool:
+    if not options.detect_blur:
+        return False
     return (
         item.subject_sharpness is not None
         and item.sharpness is not None
@@ -631,7 +744,7 @@ def _group_expression_issue(item: PhotoResult) -> bool:
 
 
 def _focus_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
-    return item.sharpness is not None and _effective_sharpness(
+    return options.detect_blur and item.sharpness is not None and _effective_sharpness(
         item.sharpness, item.subject_sharpness
     ) < options.blur_floor
 
@@ -676,6 +789,8 @@ def _has_hard_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
 
 
 def _has_exposure_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
+    if not options.detect_exposure:
+        return False
     severe_overexposure = (
         item.highlight_clip is not None
         and item.highlight_clip >= options.severe_clip_fraction
@@ -764,7 +879,7 @@ def _review_priority(item: PhotoResult, options: AnalysisOptions) -> float:
         if item.frontal_face_count > 0 and _message(options, "closed") in item.reasons
         else 0.0
     )
-    smile_priority = min(item.smiling_face_count, 2) * 24.0
+    smile_priority = min(item.smiling_face_count, 2) * 24.0 if options.prefer_people else 0.0
     return item.score + smile_priority - closed_eye_penalty
 
 
@@ -794,7 +909,7 @@ def _diverse_selection(
 
 
 def _group_keep_quota(group: list[PhotoResult], options: AnalysisOptions) -> int:
-    """Scale backups with burst length instead of imposing a fixed cap."""
+    """Scale backups with burst length, respecting an optional user ceiling."""
     count = len(group)
     if count <= 0:
         return 0
@@ -802,7 +917,10 @@ def _group_keep_quota(group: list[PhotoResult], options: AnalysisOptions) -> int
     quota = full_windows * 2 + min(remainder, 2)
     if count >= 8 and max((item.frontal_face_count for item in group), default=0) >= 4:
         quota = max(quota, math.ceil(count / 3))
-    return min(count, max(options.picks_per_group, quota))
+    keep_quota = max(options.picks_per_group, quota)
+    if options.max_picks_per_group is not None:
+        keep_quota = min(keep_quota, options.max_picks_per_group)
+    return min(count, keep_quota)
 
 
 def _sequence_priority_order(
@@ -849,13 +967,39 @@ def _density_selection(
             ranked_groups.append(_sequence_priority_order(group_candidates, priority))
             source_group_lengths.append(len(group))
 
+    # A photographer can set a separate cap for each detected duplicate
+    # cluster.  It intentionally applies only when clustering is enabled;
+    # independent photos remain free to satisfy the wider task target.
+    group_limits = (
+        {
+            group_id: min(
+                _group_keep_quota(group, options),
+                options.max_duplicate_picks_per_group
+                if options.max_duplicate_picks_per_group is not None
+                else len(group),
+            )
+            for group_id, group in enumerate(groups, start=1)
+        }
+        if (
+            options.max_picks_per_group is not None
+            or options.max_duplicate_picks_per_group is not None
+        )
+        else {}
+    )
     selected: list[PhotoResult] = []
     selected_paths: set[Path] = set()
+    selected_per_group: dict[int, int] = {}
 
     def add(item: PhotoResult) -> None:
-        if len(selected) < limit and item.path not in selected_paths:
+        group_limit = group_limits.get(item.group_id, len(candidates))
+        if (
+            len(selected) < limit
+            and item.path not in selected_paths
+            and selected_per_group.get(item.group_id, 0) < group_limit
+        ):
             selected.append(item)
             selected_paths.add(item.path)
+            selected_per_group[item.group_id] = selected_per_group.get(item.group_id, 0) + 1
 
     # Scene completeness precedes both singleton coverage and global score:
     # 3-5 consecutive frames keep at least one representative, and 6+ keep at
@@ -922,6 +1066,17 @@ def _density_selection(
 
     for item in sorted(candidates, key=priority, reverse=True):
         add(item)
+
+    # When explicitly requested, use additional frames from already capped
+    # duplicate clusters to meet the task target.  The checkbox makes this
+    # trade-off deliberate instead of silently adding near-duplicates.
+    if options.fill_with_similar and len(selected) < limit:
+        for item in sorted(candidates, key=priority, reverse=True):
+            if len(selected) >= limit:
+                break
+            if item.path not in selected_paths:
+                selected.append(item)
+                selected_paths.add(item.path)
     return selected
 
 
@@ -949,8 +1104,29 @@ def _assign_tiered_ratings(
             if not _has_hard_fault(item, options):
                 eligible.append(item)
 
+    if not options.ai_selection_enabled:
+        # Still perform local quality checks and grouping, but leave every
+        # rating for the photographer to decide manually.
+        for item in eligible:
+            item.reasons.append("待人工复核" if options.language == "zh" else "Awaiting manual review")
+        return
+
     ranked = sorted(eligible, key=lambda item: _ranking_score(item, options), reverse=True)
-    target = len(ranked) if options.target_keep_count is None else max(1, options.target_keep_count)
+    target_floor = len(ranked) if options.target_keep_count is None else max(1, options.target_keep_count)
+    target = target_floor
+    if options.target_keep_max_count is not None:
+        # The second number is a preferred quantity rather than a hard cap.
+        # Scene coverage may legitimately go beyond it; the photographer's
+        # first number remains the guaranteed minimum whenever enough sound
+        # photos exist to meet it.
+        coverage_floor = sum(
+            1 for group in groups if any(item in eligible for item in group)
+        )
+        target = max(
+            target_floor,
+            max(1, options.target_keep_max_count),
+            coverage_floor,
+        )
     one_star_or_more = _density_selection(
         ranked,
         min(target, len(ranked)),
@@ -958,6 +1134,19 @@ def _assign_tiered_ratings(
         options,
         priority=lambda item: _review_priority(item, options),
     )
+
+    # Per-burst and duplicate caps make the review wall manageable, but they
+    # must not silently reduce an explicit minimum target.  If there are
+    # enough eligible photos, relax those caps only until that floor is met.
+    required_floor = min(target_floor, len(ranked))
+    if len(one_star_or_more) < required_floor:
+        selected_paths = {item.path for item in one_star_or_more}
+        for item in ranked:
+            if len(one_star_or_more) >= required_floor:
+                break
+            if item.path not in selected_paths:
+                one_star_or_more.append(item)
+                selected_paths.add(item.path)
 
     selected_by_group: dict[int, list[PhotoResult]] = {}
     for item in one_star_or_more:
@@ -1009,6 +1198,10 @@ def _assign_tiered_ratings(
     one_paths = {item.path for item in one_star_or_more}
     two_paths = {item.path for item in two_star_or_more}
     three_paths = {item.path for item in three_star}
+    singleton_group_ids = {
+        group_id for group_id, group in enumerate(groups, start=1) if len(group) == 1
+    }
+    single_scene_reason = _message(options, "single_scene")
     for item in eligible:
         if item.path in three_paths:
             item.suggested_rating = 3
@@ -1021,6 +1214,9 @@ def _assign_tiered_ratings(
             item.reasons.append(_message(options, "review"))
         else:
             item.reasons.append(_message(options, "target"))
+        if item.suggested_rating > 0 and item.group_id in singleton_group_ids:
+            if single_scene_reason not in item.reasons:
+                item.reasons.append(single_scene_reason)
 
 
 def analyze_folder(
@@ -1043,6 +1239,22 @@ def analyze_paths(
     """Analyze exactly the dropped photos, automatically pairing RAW+JPG."""
     if options.picks_per_group < 1:
         raise ValueError("picks_per_group must be at least 1")
+    if (
+        options.max_picks_per_group is not None
+        and options.max_picks_per_group < options.picks_per_group
+    ):
+        raise ValueError("max_picks_per_group must be at least picks_per_group")
+    if (
+        options.max_duplicate_picks_per_group is not None
+        and options.max_duplicate_picks_per_group < 1
+    ):
+        raise ValueError("max_duplicate_picks_per_group must be at least 1")
+    if (
+        options.target_keep_max_count is not None
+        and options.target_keep_count is not None
+        and options.target_keep_max_count < options.target_keep_count
+    ):
+        raise ValueError("target_keep_max_count must be at least target_keep_count")
     entries = _representatives(_paths_for_selected_files(paths))
     cache = _load_analysis_cache()
     ordered_results: list[PhotoResult | None] = [None] * len(entries)

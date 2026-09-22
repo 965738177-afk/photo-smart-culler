@@ -19,12 +19,19 @@ import cv2
 import numpy as np
 
 from event_cull.engine import IMAGE_EXTENSIONS, PhotoResult, _load_preview
+from event_cull.deep_features import (
+    PIPELINE_ID as DEEP_PIPELINE_ID,
+    DeepFeatureUnavailable,
+    encode_images,
+    preferred_backend,
+)
 
 
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2
 PROFILE_FILENAME = "personal-calibration-v1.json"
 MIN_VALIDATION_AUC = 0.60
 _RATING_PATTERN = re.compile(rb"xmp:Rating=[\"'](-?\d+)[\"']")
+HANDCRAFTED_PIPELINE_ID = "handcrafted-visual-v1"
 
 
 class CalibrationError(RuntimeError):
@@ -41,6 +48,7 @@ class CalibrationProfile:
     training_examples: int
     positive_examples: int
     validation_auc: float
+    feature_pipeline: str = HANDCRAFTED_PIPELINE_ID
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -53,11 +61,12 @@ class CalibrationProfile:
             "training_examples": self.training_examples,
             "positive_examples": self.positive_examples,
             "validation_auc": self.validation_auc,
+            "feature_pipeline": self.feature_pipeline,
         }
 
     @classmethod
     def from_dict(cls, value: object) -> "CalibrationProfile":
-        if not isinstance(value, dict) or value.get("version") != PROFILE_VERSION:
+        if not isinstance(value, dict) or value.get("version") not in {1, PROFILE_VERSION}:
             raise CalibrationError("个人校准文件版本不兼容。")
         try:
             mean = tuple(float(item) for item in value["mean"])
@@ -72,6 +81,7 @@ class CalibrationProfile:
                 training_examples=int(value["training_examples"]),
                 positive_examples=int(value["positive_examples"]),
                 validation_auc=float(value["validation_auc"]),
+                feature_pipeline=str(value.get("feature_pipeline") or HANDCRAFTED_PIPELINE_ID),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CalibrationError("个人校准文件不完整。") from exc
@@ -80,7 +90,10 @@ class CalibrationProfile:
         return profile
 
     def probability(self, image: np.ndarray) -> float:
-        values = _visual_descriptor(image)
+        values = _feature_matrix([image], self.feature_pipeline)[0]
+        return self.probability_for_feature(values)
+
+    def probability_for_feature(self, values: np.ndarray) -> float:
         if len(values) != len(self.weights):
             raise CalibrationError("个人校准特征与当前版本不匹配。请重新导入一次校准结果。")
         normalized = (values - np.asarray(self.mean)) / np.asarray(self.scale)
@@ -121,33 +134,39 @@ def read_xmp_rating(path: Path) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def exported_ratings(folder: Path) -> dict[str, int]:
-    """Return unambiguous stem-to-rating labels from Lightroom JPEG exports."""
-    candidates: dict[str, list[int]] = {}
+def exported_selection_stems(folder: Path) -> set[str]:
+    """Return the names of frames a photographer deliberately kept.
+
+    The feedback signal is the photographer exporting (or collecting) a frame,
+    not an XMP star embedded in that file.  Lightroom can omit XMP metadata,
+    and photographers may use flags or collections instead of a star value.
+    Matching by filename works for both rendered JPGs and selected originals.
+    """
+    stems: set[str] = set()
     try:
         files = folder.rglob("*")
     except OSError as exc:
-        raise CalibrationError("无法读取 Lightroom 导出文件夹。") from exc
+        raise CalibrationError("无法读取人工选片文件夹。") from exc
     for path in files:
-        if not path.is_file() or path.suffix.lower() not in {".jpg", ".jpeg"}:
+        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
-        rating = read_xmp_rating(path)
-        if rating is not None:
-            candidates.setdefault(path.stem.casefold(), []).append(rating)
-    return {
-        stem: values[0]
-        for stem, values in candidates.items()
-        if len(set(values)) == 1
-    }
+        stems.add(path.stem.casefold())
+    return stems
 
 
 def _log_rows(log_path: Path) -> dict[str, tuple[str, int]]:
     """Map unique original names to their historical burst group and rating."""
     try:
-        with log_path.open(encoding="utf-8-sig", newline="") as stream:
-            rows = list(csv.DictReader(stream))
-    except (OSError, UnicodeDecodeError, csv.Error) as exc:
-        raise CalibrationError("无法读取旧版筛选日志 CSV。") from exc
+        if log_path.suffix.lower() == ".json":
+            payload = json.loads(log_path.read_text(encoding="utf-8"))
+            rows = payload.get("photos", []) if isinstance(payload, dict) else []
+            if not isinstance(rows, list):
+                rows = []
+        else:
+            with log_path.open(encoding="utf-8-sig", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+    except (OSError, UnicodeDecodeError, csv.Error, json.JSONDecodeError) as exc:
+        raise CalibrationError("无法读取筛选日志（CSV 或自动保存的 JSON）。") from exc
     records: dict[str, tuple[str, int] | None] = {}
     for row in rows:
         name = Path(str(row.get("file") or "")).stem.casefold()
@@ -217,6 +236,29 @@ def _visual_descriptor(image: np.ndarray) -> np.ndarray:
         for column in range(4)
     ]
     return np.asarray([*tiles, *thumbnail.tolist(), *edge_tiles], dtype=np.float32)
+
+
+def _preferred_feature_pipeline() -> str:
+    """Use the bundled deep encoder when it is safely available locally."""
+    return DEEP_PIPELINE_ID if preferred_backend() != "unavailable" else HANDCRAFTED_PIPELINE_ID
+
+
+def _feature_matrix(images: list[np.ndarray], pipeline: str) -> np.ndarray:
+    """Build stable local features, adding batched MPS embeddings when present."""
+    if not images:
+        return np.empty((0, 0), dtype=np.float32)
+    handcrafted = np.vstack([_visual_descriptor(image) for image in images]).astype(np.float32)
+    if pipeline == HANDCRAFTED_PIPELINE_ID:
+        return handcrafted
+    if pipeline != DEEP_PIPELINE_ID:
+        raise CalibrationError("个人校准特征版本不兼容。请重新导入一次校准结果。")
+    try:
+        deep_values, _backend = encode_images(images)
+    except DeepFeatureUnavailable as exc:
+        raise CalibrationError("深度评分组件不可用；请重新更新个人校准。") from exc
+    if len(deep_values) != len(handcrafted):
+        raise CalibrationError("深度评分没有返回完整的画面特征。")
+    return np.hstack((handcrafted, deep_values)).astype(np.float32)
 
 
 def _sigmoid(value: float) -> float:
@@ -293,6 +335,8 @@ def _balanced_group_holdout(groups: list[str], labels: np.ndarray) -> np.ndarray
 def train_profile(
     samples: list[tuple[np.ndarray, int, str]],
     featured_rating: int,
+    *,
+    feature_pipeline: str = HANDCRAFTED_PIPELINE_ID,
 ) -> CalibrationProfile:
     if len(samples) < 80:
         raise CalibrationError("可用于校准的原图不足 80 张。")
@@ -320,6 +364,7 @@ def train_profile(
         training_examples=len(samples),
         positive_examples=positive_count,
         validation_auc=validation,
+        feature_pipeline=feature_pipeline,
     )
 
 
@@ -330,25 +375,43 @@ def build_profile(
     *,
     progress_callback: Callable[[int, int, Path], None] | None = None,
 ) -> CalibrationProfile:
-    """Build a profile from a prior app CSV, Lightroom exports, and originals."""
+    """Build a profile from an app log, kept filenames, and originals."""
     rows = _log_rows(log_path)
-    ratings = exported_ratings(exported_folder)
-    if not ratings:
-        raise CalibrationError("没有从 Lightroom 导出 JPG 读到嵌入星级。")
-    featured_rating = max(ratings.values())
+    selected_stems = exported_selection_stems(exported_folder)
+    if not selected_stems:
+        raise CalibrationError("人工选片文件夹中没有读取到 JPG 或 RAW 文件名。")
+    featured_rating = 3
+    if not set(rows).intersection(selected_stems):
+        raise CalibrationError("人工选片文件名与筛选日志没有匹配；请确认导出时没有重命名照片。")
     sources = _source_previews(original_folders, set(rows))
-    samples: list[tuple[np.ndarray, int, str]] = []
+    source_rows: list[tuple[str, str, Path, int]] = []
     items = sorted(sources.items())
     for index, (stem, path) in enumerate(items, start=1):
         group, _old_rating = rows[stem]
-        try:
-            feature = _visual_descriptor(_load_preview(path))
-        except Exception:
-            continue
-        samples.append((feature, ratings.get(stem, 0), group))
+        source_rows.append((stem, group, path, featured_rating if stem in selected_stems else 0))
         if progress_callback:
             progress_callback(index, len(items), path)
-    return train_profile(samples, featured_rating)
+    images: list[np.ndarray] = []
+    usable_rows: list[tuple[str, str, Path, int]] = []
+    for row in source_rows:
+        try:
+            images.append(_load_preview(row[2]))
+            usable_rows.append(row)
+        except Exception:
+            continue
+    pipeline = _preferred_feature_pipeline()
+    try:
+        features = _feature_matrix(images, pipeline)
+    except CalibrationError:
+        # A damaged optional deep runtime must never block the proven local
+        # pipeline. The saved profile records the fallback explicitly.
+        pipeline = HANDCRAFTED_PIPELINE_ID
+        features = _feature_matrix(images, pipeline)
+    samples = [
+        (feature, row[3], row[1])
+        for feature, row in zip(features, usable_rows)
+    ]
+    return train_profile(samples, featured_rating, feature_pipeline=pipeline)
 
 
 def apply_profile(
@@ -362,17 +425,26 @@ def apply_profile(
     candidates = [item for item in results if item.suggested_rating > 0]
     if not candidates or existing_featured == 0:
         return 0
-    probabilities: dict[Path, float] = {}
+    candidates_with_images: list[tuple[PhotoResult, np.ndarray]] = []
     for index, item in enumerate(candidates, start=1):
         visual = next((path for path in item.pair_paths if path.suffix.lower() in {".jpg", ".jpeg"}), item.path)
         try:
-            probability = profile.probability(_load_preview(visual))
+            candidates_with_images.append((item, _load_preview(visual)))
         except Exception:
             continue
-        item.calibration_confidence = probability
-        probabilities[item.path] = probability
         if progress_callback:
             progress_callback(index, len(candidates), item.path)
+    try:
+        features = _feature_matrix(
+            [image for _item, image in candidates_with_images], profile.feature_pipeline
+        )
+    except CalibrationError:
+        raise
+    probabilities: dict[Path, float] = {}
+    for (item, _image), feature in zip(candidates_with_images, features):
+        probability = profile.probability_for_feature(feature)
+        item.calibration_confidence = probability
+        probabilities[item.path] = probability
     if not probabilities:
         raise CalibrationError("当前照片无法生成校准特征，已保留原有推荐。")
     by_group: dict[int, PhotoResult] = {}

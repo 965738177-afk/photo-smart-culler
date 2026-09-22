@@ -8,6 +8,7 @@ from datetime import datetime as datetime_obj
 from typing import Any
 
 from PyQt6.QtCore import QObject, QTimer
+from PyQt6.QtWidgets import QMessageBox
 from core.best_photo_finder.payloads import PickBestResults
 from core.app_settings import (
     DBSCAN_MIN_SAMPLES,
@@ -36,6 +37,7 @@ from ui.controllers.model_prerequisites import (
 )
 from core.image_file_ops import ImageFileOperations
 from core.grouping import GroupingMode, build_grouping_output_root
+from core.license_access import LicenseAccessController
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +171,7 @@ class AppController(QObject):
         self.main_window = main_window
         self.app_state = app_state
         self.worker_manager = worker_manager
+        self.license_access = LicenseAccessController()
         # Track pending rotations for batch preview regeneration
         self._pending_rotated_paths: list[str] = []
         self._rotation_loading_text = "Applying rotations..."
@@ -202,6 +205,17 @@ class AppController(QObject):
         # Starts waiting on the probe above, kept together so every reset path
         # clears all of them.
         self._deferred_starts = DeferredModelStarts()
+
+    def require_analysis_license(self, feature_name: str = "开始分析") -> bool:
+        """Gate every paid analysis workflow through one shared entitlement check."""
+
+        if self.license_access.permits_analysis():
+            return True
+        message = self.license_access.blocked_message(feature_name)
+        logger.info("Blocked %s because license access is unavailable: %s", feature_name, message)
+        self.main_window.statusBar().showMessage(message, 6000)
+        QMessageBox.information(self.main_window, "需要激活", message)
+        return False
 
     def is_workflow_analysis_running(self, workflow: str) -> bool:
         if workflow == "organize":
@@ -669,6 +683,8 @@ class AppController(QObject):
         self.start_similarity_analysis()
 
     def start_similarity_analysis(self):
+        if not self.require_analysis_license("相似照片分析"):
+            return
         self._ignore_similarity_results = False
         logger.info("Starting similarity analysis.")
         if self.worker_manager.is_similarity_worker_running():
@@ -1489,6 +1505,8 @@ class AppController(QObject):
 
     def start_pick_best_workflow(self) -> None:
         """Start Pick Best after preparing shared same-subject groups if needed."""
+        if not self.require_analysis_license("最佳照片筛选"):
+            return
         _reactivate_workflow(self, "pick_best")
         if not self.app_state.image_files_data:
             self.main_window.statusBar().showMessage("No images loaded.", 3000)
@@ -1601,6 +1619,8 @@ class AppController(QObject):
     # ------------------------------------------------------------------
 
     def start_easy_delete_workflow(self) -> None:
+        if not self.require_analysis_license("废片筛选"):
+            return
         _reactivate_workflow(self, "easy_delete")
         if not self.app_state.image_files_data:
             self.main_window.statusBar().showMessage("No images loaded.", 3000)
@@ -1870,6 +1890,8 @@ class AppController(QObject):
 
     def start_cull_similarity_workflow(self) -> None:
         """Start Cull as one consented, continuous, cancellable task."""
+        if not self.require_analysis_license("智能筛选"):
+            return
         if self.worker_manager.is_cull_grouping_running():
             return
         if not self._get_image_paths() or not self.app_state.current_folder_path:

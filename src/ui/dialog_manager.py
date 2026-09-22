@@ -839,6 +839,14 @@ class DialogManager:
             dialog.show()
             logger.info("Showing about dialog (non-blocking mode)")
 
+    def show_license_dialog(self) -> None:
+        """Show the shared entitlement status and its environment-safe actions."""
+
+        from ui.license_dialog import LicenseDialog
+
+        controller = self.parent.app_controller.license_access
+        LicenseDialog(controller, self.parent).exec()
+
     def _open_logs_folder(self):
         """Open the application's logs directory in the system file browser."""
         try:

@@ -13,6 +13,8 @@ from core.image_features.face_analysis import (
 )
 from core.image_features.near_duplicate import (
     CHANGE_COMPONENT_MIN_FRACTION,
+    HIGH_CONFIDENCE_ALIGNMENT,
+    HIGH_CONFIDENCE_ALIGNMENT_TOLERANCE,
     MAX_ALIGNMENT_ROTATION_DEGREES,
     MAX_ALIGNMENT_SCALE_CHANGE,
     MAX_ALIGNMENT_SHEAR,
@@ -113,7 +115,9 @@ def test_static_high_contrast_handheld_scene_is_safe_at_normal_view():
     assert assessment.structural_similarity is not None
     assert assessment.structural_similarity >= 0.995
     assert assessment.metrics["alignment_mode"] == "pyramidal_affine_ecc"
-    assert assessment.metrics["alignment_correlation"] >= 0.995
+    assert assessment.metrics["alignment_correlation"] >= (
+        HIGH_CONFIDENCE_ALIGNMENT - HIGH_CONFIDENCE_ALIGNMENT_TOLERANCE
+    )
     assert assessment.metrics["alignment_overlap_fraction"] >= 0.85
     assert not assessment.change.meaningful_change
 

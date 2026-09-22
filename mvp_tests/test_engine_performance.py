@@ -25,6 +25,21 @@ def test_jpeg_uses_reduced_decode(monkeypatch, tmp_path: Path):
     assert preview.shape[:2] == (800, 1600)
 
 
+def test_preview_respects_requested_display_limit(monkeypatch, tmp_path: Path):
+    photo = tmp_path / "IMG_0001.JPG"
+    photo.write_bytes(b"jpeg")
+
+    monkeypatch.setattr(
+        cv2,
+        "imread",
+        lambda _path, _flag: np.zeros((1000, 2000, 3), dtype=np.uint8),
+    )
+
+    preview = engine._load_preview(photo, maximum_dimension=320)
+
+    assert preview.shape[:2] == (160, 320)
+
+
 def test_face_detectors_are_reused_within_worker_thread(monkeypatch):
     created = []
 

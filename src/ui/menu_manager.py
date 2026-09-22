@@ -64,6 +64,7 @@ class MenuManager:
         # Settings Menu
         self.preferences_action: QAction
         self.manage_cache_action: QAction
+        self.license_activation_action: QAction
 
         # Image Menu
         self.rotate_clockwise_action: QAction
@@ -542,6 +543,9 @@ class MenuManager:
 
         settings_menu.addSeparator()
 
+        self.license_activation_action = QAction("Login & Activation…", main_win)
+        settings_menu.addAction(self.license_activation_action)
+
     def _create_help_menu(self, menu_bar):
         help_menu = menu_bar.addMenu("&Help")
         help_menu.addAction(self.check_updates_action)
@@ -581,6 +585,9 @@ class MenuManager:
         )
         self.manage_cache_action.triggered.connect(
             self.dialog_manager.show_cache_management_dialog
+        )
+        self.license_activation_action.triggered.connect(
+            self.dialog_manager.show_license_dialog
         )
 
         # View switching shortcuts

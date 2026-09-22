@@ -6,6 +6,7 @@ from event_cull.calibration import (
     CalibrationProfile,
     apply_profile,
     build_profile,
+    exported_selection_stems,
     read_xmp_rating,
     train_profile,
 )
@@ -17,6 +18,15 @@ def test_reads_embedded_xmp_rating(tmp_path: Path):
     image.write_bytes(b"prefix xmp:Rating=\"3\" suffix")
 
     assert read_xmp_rating(image) == 3
+
+
+def test_final_selection_uses_filenames_without_embedded_xmp(tmp_path: Path):
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    (selected / "IMG_0001.JPG").write_bytes(b"plain jpeg without XMP")
+    (selected / "IMG_0002.ARW").write_bytes(b"raw fixture")
+
+    assert exported_selection_stems(selected) == {"img_0001", "img_0002"}
 
 
 def test_profile_trains_with_group_held_out_validation():
@@ -79,4 +89,5 @@ def test_build_profile_reads_log_exports_and_originals(tmp_path: Path):
 
     assert profile.training_examples == 80
     assert profile.positive_examples == 16
-    assert len(profile.weights) == 256
+    assert len(profile.weights) >= 256
+    assert profile.feature_pipeline in {"handcrafted-visual-v1", "mobilenet-v3-small-visual-v1"}

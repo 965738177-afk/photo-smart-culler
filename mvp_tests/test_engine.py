@@ -48,6 +48,43 @@ def test_short_burst_keeps_best_and_one_backup(monkeypatch, tmp_path: Path):
     assert [item.suggested_rating for item in results] == [3, 2, 2]
 
 
+def test_duplicate_cap_can_be_expanded_to_the_preferred_quantity_when_similar_fill_is_enabled():
+    import event_cull.engine as engine
+
+    def group() -> list[PhotoResult]:
+        return [
+            PhotoResult(Path(f"IMG_{index}.jpg"), score=100 - index, perceptual_hash=1)
+            for index in range(4)
+        ]
+
+    capped = group()
+    engine._assign_tiered_ratings(
+        [capped],
+        AnalysisOptions(
+            picks_per_group=1,
+            max_picks_per_group=4,
+            max_duplicate_picks_per_group=2,
+            target_keep_count=2,
+            target_keep_max_count=4,
+        ),
+    )
+    assert sum(item.suggested_rating > 0 for item in capped) == 2
+
+    filled = group()
+    engine._assign_tiered_ratings(
+        [filled],
+        AnalysisOptions(
+            picks_per_group=1,
+            max_picks_per_group=4,
+            max_duplicate_picks_per_group=2,
+            fill_with_similar=True,
+            target_keep_count=2,
+            target_keep_max_count=4,
+        ),
+    )
+    assert sum(item.suggested_rating > 0 for item in filled) == 4
+
+
 def test_same_filename_in_two_folders_is_not_collapsed(tmp_path: Path):
     import event_cull.engine as engine
 
@@ -124,6 +161,45 @@ def test_large_group_photo_burst_keeps_five_of_fifteen():
     ]
 
     assert engine._group_keep_quota(group, AnalysisOptions()) == 5
+
+
+def test_similar_photo_range_can_stay_below_its_preferred_quantity_without_fill():
+    import event_cull.engine as engine
+
+    group = [
+        PhotoResult(Path(f"R_{index}.jpg"), score=100 - index, perceptual_hash=1)
+        for index in range(15)
+    ]
+
+    options = AnalysisOptions(
+        picks_per_group=2,
+        max_picks_per_group=3,
+        target_keep_count=2,
+        target_keep_max_count=15,
+    )
+    engine._assign_tiered_ratings([group], options)
+
+    assert engine._group_keep_quota(group, options) == 3
+    assert sum(item.suggested_rating > 0 for item in group) == 3
+
+
+def test_target_range_expands_only_far_enough_to_cover_distinct_scenes():
+    import event_cull.engine as engine
+
+    groups = [
+        [PhotoResult(Path(f"scene-{index}.jpg"), score=100 - index, perceptual_hash=index)]
+        for index in range(3)
+    ]
+
+    engine._assign_tiered_ratings(
+        groups,
+        AnalysisOptions(
+            target_keep_count=2,
+            target_keep_max_count=3,
+        ),
+    )
+
+    assert sum(item.suggested_rating > 0 for group in groups for item in group) == 3
 
 
 def test_long_burst_protects_two_frames_from_each_eight_frame_window():
@@ -638,6 +714,45 @@ def test_target_count_creates_cumulative_rating_tiers():
         for rating in range(4)
     }
     assert counts == {0: 700, 1: 200, 2: 70, 3: 30}
+
+
+def test_target_floor_is_not_reduced_by_a_per_group_selection_cap():
+    import event_cull.engine as engine
+
+    groups = [[
+        PhotoResult(Path(f"IMG_{index:04d}.jpg"), score=100 - index, perceptual_hash=index + 1)
+        for index in range(12)
+    ]]
+
+    engine._assign_tiered_ratings(
+        groups,
+        AnalysisOptions(
+            picks_per_group=1,
+            max_picks_per_group=2,
+            target_keep_count=6,
+            target_keep_max_count=8,
+        ),
+    )
+
+    assert sum(item.suggested_rating > 0 for item in groups[0]) >= 6
+
+
+def test_qualified_single_photo_scene_is_retained_and_explained():
+    import event_cull.engine as engine
+
+    singleton = PhotoResult(Path("detail.jpg"), score=20, sharpness=100, perceptual_hash=1)
+    competing_scene = [
+        PhotoResult(Path(f"burst-{index}.jpg"), score=100 - index, sharpness=100, perceptual_hash=10)
+        for index in range(3)
+    ]
+
+    engine._assign_tiered_ratings(
+        [[singleton], competing_scene],
+        AnalysisOptions(target_keep_count=1, target_keep_max_count=1),
+    )
+
+    assert singleton.suggested_rating > 0
+    assert "独立场景代表" in "；".join(singleton.reasons)
 
 
 def test_only_one_three_star_is_selected_from_each_similar_group():

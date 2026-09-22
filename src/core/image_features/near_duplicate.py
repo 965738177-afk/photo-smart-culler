@@ -42,6 +42,10 @@ MAX_ALIGNMENT_SHEAR = 0.01
 MIN_ALIGNMENT_OVERLAP = 0.85
 MIN_ALIGNMENT_CORRELATION = 0.90
 HIGH_CONFIDENCE_ALIGNMENT = 0.995
+# OpenCV's ECC correlation varies by a few units in the last decimal place
+# across supported builds. Keep the acceptance proof strict while avoiding a
+# false "uncertain" result for an otherwise indistinguishable normal-view pair.
+HIGH_CONFIDENCE_ALIGNMENT_TOLERANCE = 1e-4
 FACE_MIN_IOU = 0.60
 FACE_LANDMARK_MEDIAN_LIMIT = 0.018
 FACE_LANDMARK_P90_LIMIT = 0.040
@@ -328,7 +332,8 @@ class SubjectSafeNearDuplicateComparator:
             reason_code = "visible_subject_change"
             detail = "coherent change remains visible at normal viewing size"
         elif (
-            prepared.metrics.correlation >= HIGH_CONFIDENCE_ALIGNMENT
+            prepared.metrics.correlation
+            >= HIGH_CONFIDENCE_ALIGNMENT - HIGH_CONFIDENCE_ALIGNMENT_TOLERANCE
             and structural >= SAFE_NEAR_DUPLICATE_MIN_SSIM
         ):
             decision = NearDuplicateDecision.SAFE_NEAR_DUPLICATE

@@ -53,6 +53,153 @@ def test_multiple_folders_are_combined_but_non_photos_are_ignored(tmp_path: Path
     assert files == [first_photo, second_photo]
 
 
+def test_folder_import_includes_photos_in_nested_camera_folders(tmp_path: Path):
+    nested_folder = tmp_path / "card" / "DCIM" / "100SONY"
+    nested_folder.mkdir(parents=True)
+    photo = nested_folder / "DSC00001.ARW"
+    photo.write_bytes(b"fixture")
+
+    assert EventCullApp._files_in_folders([tmp_path]) == [photo]
+
+
+def test_source_counts_prefer_raw_for_a_raw_jpg_pair(tmp_path: Path):
+    paired_raw = tmp_path / "DSC0001.ARW"
+    paired_jpg = tmp_path / "DSC0001.JPG"
+    standalone_jpg = tmp_path / "DSC0002.JPG"
+    other = tmp_path / "DSC0003.PNG"
+    for path in (paired_raw, paired_jpg, standalone_jpg, other):
+        path.write_bytes(b"fixture")
+
+    counts = EventCullApp._source_photo_counts(
+        [paired_raw, paired_jpg, standalone_jpg, other]
+    )
+
+    assert counts == {"jpg": 1, "raw": 1, "other": 1, "total": 3}
+
+
+def test_source_file_counts_show_every_imported_jpg_and_raw(tmp_path: Path):
+    paired_raw = tmp_path / "DSC0001.ARW"
+    paired_jpg = tmp_path / "DSC0001.JPG"
+    standalone_jpg = tmp_path / "DSC0002.JPG"
+    other = tmp_path / "DSC0003.PNG"
+    for path in (paired_raw, paired_jpg, standalone_jpg, other):
+        path.write_bytes(b"fixture")
+
+    counts = EventCullApp._source_file_counts(
+        [paired_raw, paired_jpg, standalone_jpg, other]
+    )
+
+    assert counts == {"jpg": 2, "raw": 1, "other": 1, "total": 4}
+
+
+def test_source_summary_names_other_supported_formats():
+    app = object.__new__(EventCullApp)
+    app.t = TEXT["zh"]
+
+    text = app._source_count_text({"jpg": 2, "raw": 1, "other": 1, "total": 4})
+
+    assert text == "JPG 2 张 · RAW 1 张 · 其他 1 张 · 合计 4 张照片"
+
+
+def test_task_header_says_what_was_added_and_the_current_total():
+    app = object.__new__(EventCullApp)
+    app.t = TEXT["zh"]
+
+    text = app._task_import_summary_text(
+        {"jpg": 2, "raw": 3, "other": 0, "total": 5},
+        {"jpg": 12, "raw": 20, "other": 0, "total": 32},
+    )
+
+    assert text == "本次新增 5 张 · JPG 2 张 · RAW 3 张 · 当前合计 32 张照片"
+
+
+def test_custom_duplicate_limit_accepts_direct_numeric_entry():
+    class Value:
+        def __init__(self, value: str):
+            self.value = value
+
+        def get(self) -> str:
+            return self.value
+
+    app = object.__new__(EventCullApp)
+    app.keep_per_duplicate = Value("12")
+
+    assert app._duplicate_keep_limit() == 12
+
+
+def test_reanalysis_restores_only_manual_ratings_when_requested():
+    path = Path("/photos/IMG_0001.ARW")
+    result = PhotoResult(path, suggested_rating=3)
+
+    EventCullApp._restore_manual_ratings([result], {path: 1}, "zh")
+
+    assert result.suggested_rating == 1
+    assert "保留手动评级" in result.reasons
+
+
+def test_picker_summary_makes_active_detection_rules_explicit():
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    app = object.__new__(EventCullApp)
+    app.picks = Value("2")
+    app.picks_max = Value("3")
+    app.target = Value("200")
+    app.target_max = Value("300")
+    app.detect_closed_eyes = Value(True)
+    app.detect_blur = Value(True)
+    app.detect_exposure = Value(True)
+    app.detect_duplicates = Value(True)
+
+    assert app._picker_rule_summary_text() == "目标 至少 200，建议 300 张 · 每组优选 2–3 张 · 闭眼、模糊、曝光、重复检测"
+
+
+def test_start_analysis_opens_rule_confirmation_before_any_analysis_work():
+    app = object.__new__(EventCullApp)
+    app.imported_files = [Path("/photos/IMG_0001.ARW")]
+    app.picker_settings_confirmed = False
+    app.show_picker_settings = lambda: setattr(app, "settings_opened", True)
+
+    EventCullApp.start_analysis(app)
+
+    assert app.settings_opened is True
+
+
+def test_appending_photos_updates_task_count_without_changing_task_id(tmp_path: Path):
+    class Title:
+        value = ""
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    source = tmp_path / "婚礼原片"
+    source.mkdir()
+    first = source / "IMG_0001.JPG"
+    second = source / "IMG_0002.JPG"
+    app = object.__new__(EventCullApp)
+    app.current_task_id = None
+    app.current_task_name = ""
+    app.current_task_created_at = None
+    app.task_title = Title()
+
+    app._ensure_task_identity([first])
+    task_id = app.current_task_id
+    app._ensure_task_identity([first, second])
+
+    assert app.current_task_id == task_id
+    assert app.current_task_name.endswith("婚礼原片 · 2 张")
+    assert app.task_title.value == app.current_task_name
+
+
+def test_default_target_range_leaves_a_twenty_percent_scene_coverage_allowance():
+    assert EventCullApp._default_target_max_count(1000) == 1200
+    assert EventCullApp._default_target_max_count(90) == 110
+
+
 def test_remaining_time_waits_for_samples_then_estimates_from_real_progress():
     assert EventCullApp._remaining_seconds(1.0, 1, 100) is None
     assert EventCullApp._remaining_seconds(30.0, 3, 12) == 90
@@ -83,7 +230,7 @@ def test_log_record_keeps_rating_quality_and_review_reason():
     assert record["reasons"] == "本组优选"
 
 
-def test_personal_calibration_copy_requires_all_lightroom_metadata():
-    assert TEXT["zh"]["calibration_export_item"] == "Lightroom 导出带星级的 JPG（勾选所有元数据）"
+def test_personal_calibration_copy_uses_final_filenames_without_metadata():
+    assert TEXT["zh"]["calibration_export_item"] == "人工最终选出的 JPG / 原片文件夹（只读取文件名）"
     assert TEXT["zh"]["calibration_update"] == "更新个人校准"
     assert TEXT["zh"]["title"] == "照片智能筛选器"

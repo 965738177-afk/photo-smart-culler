@@ -10,24 +10,22 @@ def test_target_count_keeps_one_lead_per_group_before_filling_global_slots(monke
         path.write_bytes(b"fixture")
         paths.append(path)
 
-    values = iter(
-        [
-            PhotoResult(paths[0], score=90, perceptual_hash=1),
-            PhotoResult(paths[1], score=80, perceptual_hash=1),
-            PhotoResult(paths[2], score=70, perceptual_hash=10),
-            PhotoResult(paths[3], score=60, perceptual_hash=10),
-        ]
-    )
+    values = {
+        paths[0]: PhotoResult(paths[0], score=90, perceptual_hash=1),
+        paths[1]: PhotoResult(paths[1], score=80, perceptual_hash=1),
+        paths[2]: PhotoResult(paths[2], score=70, perceptual_hash=10),
+        paths[3]: PhotoResult(paths[3], score=60, perceptual_hash=10),
+    }
 
     import event_cull.engine as engine
 
     monkeypatch.setattr(engine, "_representatives", lambda folder: [(path, [path]) for path in paths])
-    monkeypatch.setattr(engine, "_analyze", lambda path, pairs, options: next(values))
+    monkeypatch.setattr(engine, "_analyze", lambda path, pairs, options: values[path])
     monkeypatch.setattr(engine, "_same_group", lambda previous, current, options: previous.perceptual_hash == current.perceptual_hash)
 
     results = engine.analyze_folder(tmp_path, AnalysisOptions(target_keep_count=2))
 
-    assert [item.suggested_rating for item in results] == [3, 2, 3, 2]
+    assert [item.suggested_rating for item in results] == [3, 0, 2, 0]
 
 
 def test_single_capture_stays_in_review_instead_of_becoming_an_unrated_reject(monkeypatch, tmp_path: Path):
@@ -40,8 +38,8 @@ def test_single_capture_stays_in_review_instead_of_becoming_an_unrated_reject(mo
     monkeypatch.setattr(engine, "_analyze", lambda path, pairs, options: result)
     results = engine.analyze_folder(tmp_path)
 
-    assert results[0].suggested_rating == 2
-    assert "单张画面保留，建议人工确认" in results[0].reasons
+    assert results[0].suggested_rating == 3
+    assert "本组最佳" in results[0].reasons
 
 
 def test_relative_subject_darkening_is_a_flash_misfire_and_is_not_selected(tmp_path: Path):
