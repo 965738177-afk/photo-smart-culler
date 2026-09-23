@@ -13,16 +13,18 @@ from tkinter import messagebox, ttk
 
 from PIL import ImageTk
 
-from event_cull.licensing import CheckoutOrder, LicenseController, LicenseError, LicensePlan, license_label
+from event_cull.licensing import (
+    TRIAL_DAYS,
+    CheckoutOrder,
+    LicenseController,
+    LicenseError,
+    LicensePlan,
+    license_label,
+)
 
 
 def payment_actions_enabled() -> bool:
-    """Keep checkout safely disconnected while the subscription UI is reviewed.
-
-    A release build must opt in explicitly.  This avoids accidentally sending
-    trial, activation, order, or device-management requests while the product
-    team is still approving the customer-facing experience.
-    """
+    """Whether real purchase checkout has explicitly been enabled for a release."""
     return os.environ.get("EVENT_CULL_ENABLE_PAYMENT", "").strip() == "1"
 
 
@@ -116,6 +118,165 @@ class DeviceManagementDialog(tk.Toplevel):
         self._run(lambda: self.controller.service.remove_device(device_id), complete)
 
 
+class TeamAuthorizationDialog(tk.Toplevel):
+    """A small, focused entry point for a member's team authorization.
+
+    The desktop client only ever manages the signed-in member's own devices.
+    Cross-member invitations and revocations stay in the owner-only web
+    console, which prevents a cached desktop credential from becoming an
+    administrator credential.
+    """
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        controller: LicenseController,
+        on_changed: Callable[[], None],
+        *,
+        initial_email: str = "",
+    ) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self.on_changed = on_changed
+        self.title("团队授权")
+        self.geometry("580x430")
+        self.minsize(520, 390)
+        self.configure(background="#101112")
+        self.transient(parent)
+        self.grab_set()
+        self.after_idle(self._center_on_parent)
+        self._configure_styles()
+
+        outer = ttk.Frame(self, style="Team.Root.TFrame", padding=(28, 24))
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="团队授权", style="Team.Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            outer,
+            text="团队成员在这里验证邀请邮箱，并管理自己已绑定的设备。照片始终只在本机处理。",
+            style="Team.Subtitle.TLabel", wraplength=500, justify="left",
+        ).pack(anchor="w", pady=(6, 18))
+
+        lease = self.controller.lease
+        if lease is not None and lease.team_name:
+            card = ttk.Frame(outer, style="Team.Active.TFrame", padding=(20, 18))
+            card.pack(fill="x")
+            ttk.Label(card, text="团队永久版已启用", style="Team.ActiveTitle.TLabel").pack(anchor="w")
+            ttk.Label(card, text=lease.team_name, style="Team.Name.TLabel").pack(anchor="w", pady=(6, 0))
+            ttk.Label(
+                card,
+                text="当前 Mac 已绑定。团队主人移除这台设备或撤销成员后，设备将在下次联网验证时失效。",
+                style="Team.ActiveCopy.TLabel", wraplength=450, justify="left",
+            ).pack(anchor="w", pady=(8, 0))
+            actions = ttk.Frame(outer, style="Team.Root.TFrame")
+            actions.pack(fill="x", pady=(18, 0))
+            ttk.Button(actions, text="管理我的设备", command=self.manage_devices, style="Team.Primary.TButton").pack(side="left")
+            ttk.Button(actions, text="关闭", command=self.destroy, style="Team.Quiet.TButton").pack(side="right")
+            return
+
+        card = ttk.Frame(outer, style="Team.Card.TFrame", padding=(18, 16))
+        card.pack(fill="x")
+        ttk.Label(card, text="使用团队邀请邮箱", style="Team.Section.TLabel").pack(anchor="w")
+        ttk.Label(
+            card,
+            text="团队主人先在管理页邀请你的邮箱；收到验证码后，即可为当前 Mac 开通团队永久授权。",
+            style="Team.Copy.TLabel", wraplength=470, justify="left",
+        ).pack(anchor="w", pady=(4, 13))
+        ttk.Label(card, text="邀请邮箱", style="Team.Field.TLabel").pack(anchor="w")
+        self.email = tk.StringVar(value=initial_email.strip())
+        ttk.Entry(card, textvariable=self.email).pack(fill="x", pady=(3, 10))
+        request_row = ttk.Frame(card, style="Team.Card.TFrame")
+        request_row.pack(fill="x")
+        self.send_button = ttk.Button(
+            request_row, text="发送验证码", command=self.request_code, style="Team.Secondary.TButton"
+        )
+        self.send_button.pack(side="left")
+        self.note = tk.StringVar(value="验证码会发送至受邀请的团队邮箱。")
+        ttk.Label(request_row, textvariable=self.note, style="Team.Note.TLabel").pack(side="left", padx=(10, 0))
+        ttk.Label(card, text="验证码", style="Team.Field.TLabel").pack(anchor="w", pady=(15, 0))
+        verify_row = ttk.Frame(card, style="Team.Card.TFrame")
+        verify_row.pack(fill="x", pady=(3, 0))
+        self.code = tk.StringVar()
+        ttk.Entry(verify_row, textvariable=self.code, width=16).pack(side="left")
+        self.activate_button = ttk.Button(
+            verify_row, text="确认团队授权", command=self.activate, style="Team.Primary.TButton"
+        )
+        self.activate_button.pack(side="right")
+        footer = ttk.Frame(outer, style="Team.Root.TFrame")
+        footer.pack(fill="x", pady=(18, 0))
+        ttk.Label(footer, text="团队主人请在 cull.lhxx.online/team 管理成员与设备。", style="Team.Note.TLabel").pack(side="left")
+        ttk.Button(footer, text="关闭", command=self.destroy, style="Team.Quiet.TButton").pack(side="right")
+
+    def _configure_styles(self) -> None:
+        style = ttk.Style(self)
+        style.configure("Team.Root.TFrame", background="#101112")
+        style.configure("Team.Card.TFrame", background="#1a1d20")
+        style.configure("Team.Active.TFrame", background="#1c2924")
+        style.configure("Team.Title.TLabel", background="#101112", foreground="#f5f7f8", font=("Helvetica Neue", 25, "bold"))
+        style.configure("Team.Subtitle.TLabel", background="#101112", foreground="#9da6ad", font=("Helvetica Neue", 11))
+        style.configure("Team.Section.TLabel", background="#1a1d20", foreground="#f2f3f3", font=("Helvetica Neue", 14, "bold"))
+        style.configure("Team.Copy.TLabel", background="#1a1d20", foreground="#b6bdc2", font=("Helvetica Neue", 10))
+        style.configure("Team.Field.TLabel", background="#1a1d20", foreground="#aab2b8", font=("Helvetica Neue", 10))
+        style.configure("Team.Note.TLabel", background="#101112", foreground="#8f989e", font=("Helvetica Neue", 10))
+        style.configure("Team.ActiveTitle.TLabel", background="#1c2924", foreground="#f4f7f3", font=("Helvetica Neue", 19, "bold"))
+        style.configure("Team.Name.TLabel", background="#1c2924", foreground="#9bd4ae", font=("Helvetica Neue", 12, "bold"))
+        style.configure("Team.ActiveCopy.TLabel", background="#1c2924", foreground="#c4d2c8", font=("Helvetica Neue", 10))
+        style.configure("Team.Primary.TButton", background="#d99536", foreground="#18130c", borderwidth=0, padding=(13, 9), font=("Helvetica Neue", 11, "bold"))
+        style.map("Team.Primary.TButton", background=[("active", "#e9ab50"), ("disabled", "#625035")])
+        style.configure("Team.Secondary.TButton", background="#292e33", foreground="#edf0f2", borderwidth=0, padding=(12, 9), font=("Helvetica Neue", 11, "bold"))
+        style.map("Team.Secondary.TButton", background=[("active", "#363d44"), ("disabled", "#23272b")])
+        style.configure("Team.Quiet.TButton", background="#101112", foreground="#aab2b8", borderwidth=0, padding=(10, 8), font=("Helvetica Neue", 11))
+
+    def _center_on_parent(self) -> None:
+        self.update_idletasks()
+        width, height = self.winfo_width(), self.winfo_height()
+        x = self.master.winfo_rootx() + max(0, (self.master.winfo_width() - width) // 2)
+        y = self.master.winfo_rooty() + max(0, (self.master.winfo_height() - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _run(self, operation: Callable[[], Any], completed: Callable[[Any], None]) -> None:
+        controls = [control for control in (getattr(self, "send_button", None), getattr(self, "activate_button", None)) if control]
+        for control in controls:
+            control.configure(state="disabled")
+
+        def worker() -> None:
+            try:
+                value = operation()
+            except (LicenseError, ValueError) as error:
+                detail = str(error)
+                self.after(0, lambda detail=detail: self._failed(detail, controls))
+            except Exception:
+                self.after(0, lambda: self._failed("操作暂时无法完成，请检查网络后重试。", controls))
+            else:
+                self.after(0, lambda: self._completed(value, completed, controls))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _failed(self, detail: str, controls: list[ttk.Button]) -> None:
+        for control in controls:
+            control.configure(state="normal")
+        messagebox.showwarning("团队授权", detail, parent=self)
+
+    def _completed(self, value: Any, completed: Callable[[Any], None], controls: list[ttk.Button]) -> None:
+        completed(value)
+        for control in controls:
+            control.configure(state="normal")
+
+    def request_code(self) -> None:
+        self._run(
+            lambda: self.controller.request_team_activation_code(self.email.get()),
+            lambda _result: self.note.set("验证码已发送，请在 10 分钟内完成验证。"),
+        )
+
+    def activate(self) -> None:
+        def activated(_lease: Any) -> None:
+            self.on_changed()
+            messagebox.showinfo("团队授权", "当前 Mac 已获得团队永久授权。", parent=self)
+            self.destroy()
+        self._run(lambda: self.controller.activate_team(self.email.get(), self.code.get()), activated)
+
+    def manage_devices(self) -> None:
+        DeviceManagementDialog(self, self.controller)
+
+
 class LicenseDialog(tk.Toplevel):
     """All billing actions use server-created orders and verified callbacks."""
 
@@ -124,7 +285,7 @@ class LicenseDialog(tk.Toplevel):
         self.controller = controller
         self.on_changed = on_changed
         self.internal_build = self.controller.decision.plan is LicensePlan.DEVELOPER
-        self.design_preview = not payment_actions_enabled() and not self.internal_build
+        self.payment_actions_available = payment_actions_enabled()
         self.pending_order: CheckoutOrder | None = None
         self._qr_image: ImageTk.PhotoImage | None = None
         self.title("授权与订阅")
@@ -136,22 +297,27 @@ class LicenseDialog(tk.Toplevel):
         self.after_idle(self._center_on_parent)
         self._configure_subscription_styles()
 
-        outer = ttk.Frame(self, style="LicenseRoot.TFrame", padding=(28, 22))
-        outer.pack(fill="both", expand=True)
+        viewport = ttk.Frame(self, style="LicenseRoot.TFrame")
+        viewport.pack(fill="both", expand=True)
+        self._scroll_canvas = tk.Canvas(
+            viewport,
+            background="#101112",
+            highlightthickness=0,
+            borderwidth=0,
+            yscrollincrement=28,
+        )
+        self._scroll_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=self._scroll_canvas.yview)
+        scrollbar.pack(side="right", fill="y", padx=(0, 6), pady=8)
+        self._scroll_canvas.configure(yscrollcommand=scrollbar.set)
+        outer = ttk.Frame(self._scroll_canvas, style="LicenseRoot.TFrame", padding=(28, 22))
+        self._scroll_window = self._scroll_canvas.create_window((0, 0), window=outer, anchor="nw")
+        outer.bind("<Configure>", self._sync_scroll_region)
+        self._scroll_canvas.bind("<Configure>", self._fit_scroll_width)
+        self.bind("<MouseWheel>", self._scroll_license_content, add="+")
         hero = ttk.Frame(outer, style="LicenseRoot.TFrame")
         hero.pack(fill="x", pady=(0, 14))
         ttk.Label(hero, text="授权与订阅", style="LicenseTitle.TLabel").pack(anchor="w")
-        ttk.Label(
-            hero,
-            text="先试用，再决定是否购买。授权仅绑定设备，不会上传你的照片。",
-            style="LicenseSubtitle.TLabel",
-        ).pack(anchor="w", pady=(5, 0))
-        if self.design_preview:
-            ttk.Label(
-                hero,
-                text="开发预览：上线包会连接授权服务；这里不发起真实请求。",
-                style="LicensePreview.TLabel",
-            ).pack(anchor="w", pady=(7, 0))
 
         if self.internal_build:
             internal = ttk.Frame(outer, style="LicenseTrial.TFrame", padding=(20, 18))
@@ -178,20 +344,13 @@ class LicenseDialog(tk.Toplevel):
         trial.pack(fill="x")
         trial.columnconfigure(0, weight=1)
         ttk.Label(trial, text="首次使用", style="LicenseTrialEyebrow.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(trial, text="直接领取 1 天试用", style="LicenseTrialTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(trial, text=f"直接领取 {TRIAL_DAYS} 天试用", style="LicenseTrialTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 0))
         ttk.Label(trial, text="无需邮箱", style="LicenseTrialChip.TLabel").grid(row=0, column=1, sticky="e")
-        ttk.Label(
-            trial,
-            text="联网签发并仅绑定当前 Mac。可完整体验 AI 挑图、人工复核与 Lightroom 写入；设备凭据会安全保存在系统钥匙串。",
-            style="LicenseTrialCopy.TLabel",
-            wraplength=590,
-            justify="left",
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 13))
         trial_actions = ttk.Frame(trial, style="LicenseTrial.TFrame")
-        trial_actions.grid(row=3, column=0, columnspan=2, sticky="ew")
+        trial_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(9, 0))
         self.trial_start_button = ttk.Button(
             trial_actions,
-            text="领取 1 天试用",
+            text=f"领取 {TRIAL_DAYS} 天试用",
             command=self.start_trial,
             style="LicenseTrial.TButton",
         )
@@ -213,9 +372,28 @@ class LicenseDialog(tk.Toplevel):
             justify="left",
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
+        team_access = ttk.Frame(outer, style="LicenseTeam.TFrame", padding=(15, 12))
+        team_access.pack(fill="x", pady=(10, 0))
+        team_access.columnconfigure(0, weight=1)
+        ttk.Label(team_access, text="我是团队成员 / 团队主人", style="LicenseTeamTitle.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            team_access,
+            text="已受邀请的邮箱不需要购买或输入个人激活码；验证邮箱即可将团队永久授权绑定到当前 Mac。",
+            style="LicenseTeamCopy.TLabel", wraplength=400, justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        self.team_button = ttk.Button(
+            team_access,
+            text="使用团队邮箱验证",
+            command=self.manage_team,
+            style="LicensePrimary.TButton",
+        )
+        self.team_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(14, 0))
+
         secondary_heading = ttk.Frame(outer, style="LicenseRoot.TFrame")
         secondary_heading.pack(fill="x", pady=(15, 7))
-        ttk.Label(secondary_heading, text="已有授权，或准备购买", style="LicenseSecondaryHeading.TLabel").pack(side="left")
+        ttk.Label(secondary_heading, text="个人授权，或准备购买", style="LicenseSecondaryHeading.TLabel").pack(side="left")
 
         offers = ttk.Frame(outer, style="LicenseRoot.TFrame")
         offers.pack(fill="x")
@@ -224,29 +402,23 @@ class LicenseDialog(tk.Toplevel):
 
         account = ttk.Frame(offers, style="LicenseCard.TFrame", padding=(17, 14))
         account.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        ttk.Label(account, text="正式激活", style="LicenseSection.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(
-            account,
-            text="购买后收到激活码，或输入已有激活码继续使用。",
-            style="LicenseCardCopy.TLabel",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 8))
-        ttk.Label(account, text="购买 / 激活邮箱", style="LicenseField.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Label(account, text="个人购买激活", style="LicenseSection.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(account, text="个人购买 / 激活邮箱", style="LicenseField.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.email = tk.StringVar()
-        ttk.Entry(account, textvariable=self.email).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 7))
-        ttk.Label(account, text="已有激活码（可选）", style="LicenseField.TLabel").grid(row=4, column=0, sticky="w")
+        ttk.Entry(account, textvariable=self.email).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(2, 7))
+        ttk.Label(account, text="已有激活码", style="LicenseField.TLabel").grid(row=3, column=0, sticky="w")
         self.code = tk.StringVar()
-        ttk.Entry(account, textvariable=self.code).grid(row=5, column=0, sticky="ew", pady=(2, 0))
+        ttk.Entry(account, textvariable=self.code).grid(row=4, column=0, sticky="ew", pady=(2, 0))
         self.activate_button = ttk.Button(account, text="激活", command=self.activate, style="LicenseSecondary.TButton")
-        self.activate_button.grid(row=5, column=1, sticky="e", padx=(10, 0))
+        self.activate_button.grid(row=4, column=1, sticky="e", padx=(10, 0))
         account.columnconfigure(0, weight=1)
 
         purchase = ttk.Frame(offers, style="LicenseCard.TFrame", padding=(17, 14))
         purchase.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         ttk.Label(purchase, text="购买或续订", style="LicenseSection.TLabel").pack(anchor="w")
-        ttk.Label(purchase, text="填写左侧邮箱后，选择套餐与支付方式。", style="LicenseCardCopy.TLabel", wraplength=215, justify="left").pack(anchor="w", pady=(3, 8))
         self.plan = tk.StringVar(value="monthly")
         plan_row = ttk.Frame(purchase, style="LicenseCard.TFrame")
-        plan_row.pack(fill="x", pady=(0, 8))
+        plan_row.pack(fill="x", pady=(9, 8))
         self.monthly_plan = ttk.Radiobutton(
             plan_row, text="月度 ¥4.99", value="monthly", variable=self.plan, style="LicensePlan.TRadiobutton",
         )
@@ -264,7 +436,7 @@ class LicenseDialog(tk.Toplevel):
 
         payment_feedback = ttk.Frame(outer, style="LicenseRoot.TFrame")
         payment_feedback.pack(fill="x", pady=(11, 0))
-        self.payment_note = tk.StringVar(value="免费试用无需邮箱；购买或正式激活时再填写邮箱。")
+        self.payment_note = tk.StringVar()
         ttk.Label(payment_feedback, textvariable=self.payment_note, style="LicenseSubtitle.TLabel", wraplength=590, justify="left").pack(anchor="w", fill="x")
         self.order_status_button = ttk.Button(
             payment_feedback,
@@ -287,7 +459,7 @@ class LicenseDialog(tk.Toplevel):
         self._controls = [
             self.trial_start_button, self.alipay_button,
             self.wechat_button, self.order_status_button, self.activate_button,
-            self.refresh_button, self.devices_button, self.monthly_plan, self.lifetime_plan,
+            self.refresh_button, self.devices_button, self.team_button, self.monthly_plan, self.lifetime_plan,
         ]
 
         self.refresh_view()
@@ -303,6 +475,17 @@ class LicenseDialog(tk.Toplevel):
         y = self.master.winfo_rooty() + max(0, (parent_height - height) // 2)
         self.geometry(f"{width}x{height}+{x}+{y}")
 
+    def _sync_scroll_region(self, _event: tk.Event | None = None) -> None:
+        self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
+
+    def _fit_scroll_width(self, event: tk.Event) -> None:
+        self._scroll_canvas.itemconfigure(self._scroll_window, width=event.width)
+
+    def _scroll_license_content(self, event: tk.Event) -> str:
+        if event.delta:
+            self._scroll_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
     def _configure_subscription_styles(self) -> None:
         """Use a calm subscription hierarchy instead of one large control stack."""
         style = ttk.Style(self)
@@ -310,6 +493,7 @@ class LicenseDialog(tk.Toplevel):
         style.configure("LicenseCard.TFrame", background="#1a1d20")
         style.configure("LicenseTrial.TFrame", background="#1c2924")
         style.configure("LicenseStatus.TFrame", background="#17191b")
+        style.configure("LicenseTeam.TFrame", background="#1c2924")
         style.configure("LicenseTitle.TLabel", background="#101112", foreground="#f5f7f8", font=("Helvetica Neue", 25, "bold"))
         style.configure("LicenseSubtitle.TLabel", background="#101112", foreground="#9da6ad", font=("Helvetica Neue", 11))
         style.configure("LicensePreview.TLabel", background="#101112", foreground="#d5a348", font=("Helvetica Neue", 10, "bold"))
@@ -320,6 +504,8 @@ class LicenseDialog(tk.Toplevel):
         style.configure("LicenseTrialChip.TLabel", background="#28583f", foreground="#e4f6e9", padding=(9, 5), font=("Helvetica Neue", 10, "bold"))
         style.configure("LicenseStatusTitle.TLabel", background="#17191b", foreground="#edf0ee", font=("Helvetica Neue", 13, "bold"))
         style.configure("LicenseStatusCopy.TLabel", background="#17191b", foreground="#aeb8b1", font=("Helvetica Neue", 10))
+        style.configure("LicenseTeamTitle.TLabel", background="#1c2924", foreground="#e4f6e9", font=("Helvetica Neue", 12, "bold"))
+        style.configure("LicenseTeamCopy.TLabel", background="#1c2924", foreground="#c4d2c8", font=("Helvetica Neue", 10))
         style.configure("LicenseChip.TLabel", background="#255c43", foreground="#e2f5e8", padding=(9, 5), font=("Helvetica Neue", 10, "bold"))
         style.configure("LicenseSecondaryHeading.TLabel", background="#101112", foreground="#e4e6e6", font=("Helvetica Neue", 12, "bold"))
         style.configure("LicenseSecondaryHint.TLabel", background="#101112", foreground="#8f989e", font=("Helvetica Neue", 10))
@@ -364,38 +550,37 @@ class LicenseDialog(tk.Toplevel):
         self.refresh_view()
 
     def refresh_view(self) -> None:
-        if self.design_preview:
-            self.status.set("开发者内测版 · 已解锁")
-            self.detail.set("当前只展示授权界面。试用、激活、付款回调和设备管理将在正式发布前统一启用。")
-            self.payment_note.set("支付入口为界面预览，不会创建订单、跳转支付或请求授权服务。")
-            for control in self._controls:
-                control.configure(state="disabled")
-            return
         decision = self.controller.decision
         self.status.set(license_label(decision))
-        self.detail.set(decision.message)
+        team_name = decision.lease.team_name if decision.lease is not None else None
+        self.detail.set(
+            f"{team_name} · 团队永久授权已启用。团队主人可在网站管理成员和设备。"
+            if team_name else decision.message
+        )
+        self.team_button.configure(text="管理团队授权设备" if team_name else "使用团队邮箱验证")
         has_device = self.controller.service.credential() is not None
         self.devices_button.configure(state="normal" if has_device else "disabled")
         self.refresh_button.configure(state="normal" if has_device else "disabled")
-        if self.pending_order is not None:
+        if self.pending_order is not None and self.payment_actions_available:
             self.order_status_button.configure(state="normal")
-        for control in (self.alipay_button, self.wechat_button, self.activate_button):
-            if str(control.cget("state")) == "disabled":
-                control.configure(state="normal")
+        else:
+            self.order_status_button.configure(state="disabled")
+        self.activate_button.configure(state="normal")
+        self.alipay_button.configure(state="normal" if self.payment_actions_available else "disabled")
+        self.wechat_button.configure(state="normal" if self.payment_actions_available else "disabled")
         self.trial_start_button.configure(state="disabled" if has_device else "normal")
 
     def start_trial(self) -> None:
-        if self.design_preview:
-            return
         self._run(self.controller.start_device_trial, self._trial_activated)
 
     def _trial_activated(self, _lease: Any) -> None:
-        self.payment_note.set("1 天试用已开通，并已绑定当前 Mac。授权凭据已保存到系统钥匙串。")
+        self.payment_note.set(f"{TRIAL_DAYS} 天试用已开通，并已绑定当前 Mac。授权凭据已保存到系统钥匙串。")
         self.qr.configure(image="")
         self._qr_image = None
 
     def activate(self) -> None:
-        if self.design_preview:
+        if not self.code.get().strip():
+            self.manage_team(initial_email=self.email.get())
             return
         self._run(lambda: self.controller.activate(self.email.get(), self.code.get()), self._activated)
 
@@ -406,12 +591,10 @@ class LicenseDialog(tk.Toplevel):
         self._qr_image = None
 
     def refresh_license(self) -> None:
-        if self.design_preview:
-            return
         self._run(self.controller.refresh, lambda _lease: self.payment_note.set("授权已刷新。"))
 
     def begin_purchase(self, provider: str) -> None:
-        if self.design_preview:
+        if not self.payment_actions_available:
             return
         plan = self.plan.get()
         if plan not in {"monthly", "lifetime"} or provider not in {"alipay", "wechat"}:
@@ -443,7 +626,7 @@ class LicenseDialog(tk.Toplevel):
         )
 
     def refresh_order(self) -> None:
-        if self.design_preview:
+        if not self.payment_actions_available:
             return
         order = self.pending_order
         if order is None:
@@ -463,6 +646,16 @@ class LicenseDialog(tk.Toplevel):
         self._run(lambda: self.controller.service.checkout_status(order), checked)
 
     def manage_devices(self) -> None:
-        if self.design_preview:
-            return
         DeviceManagementDialog(self, self.controller)
+
+    def manage_team(self, *, initial_email: str = "") -> None:
+        def completed_team_authorization() -> None:
+            self.on_changed()
+            self.destroy()
+
+        TeamAuthorizationDialog(
+            self,
+            self.controller,
+            completed_team_authorization,
+            initial_email=initial_email,
+        )

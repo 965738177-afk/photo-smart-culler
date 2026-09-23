@@ -33,6 +33,7 @@ LEASE_ACCOUNT = "verified-lease"
 CREDENTIAL_ACCOUNT = "device-credential"
 DEVICE_ID_ACCOUNT = "device-id"
 OFFLINE_GRACE_DAYS = 5
+TRIAL_DAYS = 3
 
 # This key is public by design.  It can verify an API-issued lease but cannot
 # create one.  Its private counterpart exists only on the authorization host.
@@ -69,6 +70,7 @@ class LicenseLease:
     issued_at: datetime
     offline_until: datetime | None
     subscription_until: datetime | None
+    team_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -119,7 +121,13 @@ def verify_lease(payload: Any) -> LicenseLease:
         "account_id", "device_id", "plan", "issued_at", "offline_until",
         "subscription_until", "signature",
     }
-    if set(payload) != required or not isinstance(payload.get("signature"), str):
+    optional = {"team_name"}
+    if (
+        not required.issubset(payload)
+        or set(payload) - required - optional
+        or not isinstance(payload.get("signature"), str)
+        or ("team_name" in payload and not isinstance(payload["team_name"], str))
+    ):
         raise LicenseError("授权信息不完整。")
     signed = {key: value for key, value in payload.items() if key != "signature"}
     content = json.dumps(signed, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -145,6 +153,7 @@ def verify_lease(payload: Any) -> LicenseLease:
         issued_at=issued_at,  # type: ignore[arg-type]
         offline_until=offline_until,
         subscription_until=subscription_until,
+        team_name=(str(payload["team_name"]).strip() or None) if "team_name" in payload else None,
     )
 
 
@@ -154,7 +163,7 @@ def evaluate_lease(lease: LicenseLease | None, *, now: datetime | None = None) -
         return LicenseDecision(
             AccessState.ACTIVATION_REQUIRED,
             LicensePlan.NONE,
-            "尚未激活。可领取 1 天试用，或购买后使用邮箱与激活码开通。",
+            f"尚未激活。可领取 {TRIAL_DAYS} 天试用，或购买后使用邮箱与激活码开通。",
         )
     if lease.subscription_until is not None and now > lease.subscription_until:
         return LicenseDecision(
@@ -185,6 +194,8 @@ def license_label(decision: LicenseDecision) -> str:
     lease = decision.lease
     if not decision.allows_analysis or lease is None:
         return "开始试用 / 激活"
+    if lease.team_name:
+        return "团队授权"
     if lease.plan is LicensePlan.LIFETIME:
         return "永久版已激活"
     if lease.subscription_until is None:
@@ -194,6 +205,8 @@ def license_label(decision: LicenseDecision) -> str:
     hours = remainder // 3600
     if days == 0 and hours < 25:
         return f"试用剩余 {max(1, hours)} 小时"
+    if (lease.subscription_until - lease.issued_at) <= timedelta(days=TRIAL_DAYS):
+        return f"试用剩余 {days} 天"
     return f"订阅剩余 {days} 天"
 
 
@@ -294,6 +307,23 @@ class LicenseService:
         if not account:
             raise LicenseError("试用服务未返回设备凭据。")
         return self._accept_activation(email=account, device_id=device_id, response=response)
+
+    def request_team_activation_code(self, *, email: str) -> None:
+        self._post("/v1/team/activation/request-code", {"email": _email(email)})
+
+    def activate_team(self, *, email: str, code: str) -> LicenseLease:
+        normalized_email = _email(email)
+        device_id = self.device_id()
+        response = self._post(
+            "/v1/team/activation/complete",
+            {
+                "email": normalized_email,
+                "code": code.strip(),
+                "device_id": device_id,
+                "device_name": self._device_name(),
+            },
+        )
+        return self._accept_activation(email=normalized_email, device_id=device_id, response=response)
 
     def activate(self, *, email: str, activation_code: str) -> LicenseLease:
         device_id = self.device_id()
@@ -468,6 +498,13 @@ class LicenseController:
 
     def activate(self, email: str, activation_code: str) -> LicenseLease:
         self.lease = self.service.activate(email=email, activation_code=activation_code)
+        return self.lease
+
+    def request_team_activation_code(self, email: str) -> None:
+        self.service.request_team_activation_code(email=email)
+
+    def activate_team(self, email: str, code: str) -> LicenseLease:
+        self.lease = self.service.activate_team(email=email, code=code)
         return self.lease
 
     def refresh(self) -> LicenseLease:

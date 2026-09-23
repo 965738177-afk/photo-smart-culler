@@ -40,7 +40,7 @@ from event_cull.build_info import APP_VERSION
 from event_cull.deep_features import status_label as deep_status_label
 from event_cull.history import load_history, task_name as history_task_name, upsert_task
 from event_cull.licensing import LicenseController, license_label
-from event_cull.license_ui import LicenseDialog
+from event_cull.license_ui import LicenseDialog, TeamAuthorizationDialog
 from event_cull.updater import UpdateInfo, check_for_update, download_update
 from event_cull.engine import (
     RAW_EXTENSIONS,
@@ -61,6 +61,8 @@ SUPPORTED_EXTENSIONS = {
 JPEG_EXTENSIONS = {".jpg", ".jpeg"}
 DISPLAY_PREVIEW_MAX_DIMENSION = 320
 MEMORY_PREVIEW_CACHE_LIMIT = 64
+ZOOM_PREVIEW_MAX_DIMENSION = 1600
+ZOOM_PREVIEW_MEMORY_CACHE_LIMIT = 3
 GRID_THUMBNAIL_CACHE_LIMIT = 120
 GRID_CARD_GUTTER = 3
 PRODUCT_TITLE_ZH = "秒选 — 照片智能筛选器"
@@ -105,7 +107,7 @@ TEXT["zh"].update({
     "menu_workflow": "操作",
     "menu_culling": "照片筛选",
     "menu_export": "写入与导出",
-    "menu_calibration": "个人校准",
+    "menu_calibration": "选片偏好校准",
     "menu_picker_settings": "挑图设置…",
     "menu_start_analysis": "开始分析",
     "menu_pause_resume": "暂停或继续分析",
@@ -126,7 +128,7 @@ TEXT["zh"].update({
     "filter_all": "全部照片",
     "filter_three": "仅 3★",
     "filter_two": "仅 2★",
-    "filter_one": "仅 1★",
+    "filter_one": "仅 1★ 初选复核",
     "filter_zero": "仅未入选",
     "write_mode": "写入方式",
     "per_group": "相似图保留",
@@ -160,12 +162,12 @@ TEXT["zh"].update({
     "export_log_title": "导出本次筛选日志",
     "export_log_done": "筛选日志已导出：{path}",
     "export_log_failed": "日志导出失败：{error}",
-    "calibration": "个人校准",
-    "calibration_active": "个人校准：已启用",
-    "calibration_idle": "个人校准",
-    "calibration_update": "更新个人校准",
-    "calibration_intro": "自动比对人工最终选片，调整本机筛选偏好",
-    "calibration_privacy": "全程本地处理；不上传、不修改原片或 Lightroom 星级",
+    "calibration": "选片偏好校准",
+    "calibration_active": "选片偏好校准：已启用",
+    "calibration_idle": "选片偏好校准",
+    "calibration_update": "更新选片偏好校准",
+    "calibration_intro": "根据人工最终选片，在本机微调后续推荐",
+    "calibration_privacy": "本地偏好学习；不上传、不修改原片或 Lightroom 星级",
     "sync_summary": "写入 XMP 后，请在 Lightroom 中读取元数据即可同步。",
     "sync_show": "查看 Lightroom 同步说明",
     "sync_hide": "收起 Lightroom 同步说明",
@@ -179,9 +181,9 @@ TEXT["zh"].update({
     "calibration_running": "正在本地学习你的最终选片偏好；只读取文件名与画面特征，不修改原图…",
     "calibration_progress": "正在提取本地画面特征 {current}/{total} · {name}",
     "calibration_apply": "正在按你的历史选片偏好复核 3★ {current}/{total} · {name}",
-    "calibration_done": "个人校准已启用：学习 {samples} 张原图，其中 {positive} 张为最高星级；分组验证区分度 {auc:.0%}。",
-    "calibration_failed": "个人校准未启用：{error}",
-    "calibration_apply_skipped": "个人校准未应用到本次结果：{error}；已保留基础筛选结果。",
+    "calibration_done": "选片偏好校准已启用：学习 {samples} 张原图，其中 {positive} 张为最高星级；分组验证区分度 {auc:.0%}。",
+    "calibration_failed": "选片偏好校准未启用：{error}",
+    "calibration_apply_skipped": "选片偏好校准未应用到本次结果：{error}；已保留基础筛选结果。",
 })
 TEXT["en"].update({
     "empty_preview": "Drop files or folders anywhere",
@@ -209,13 +211,13 @@ TEXT["en"].update({
     "menu_workflow": "Actions",
     "menu_culling": "Photo culling",
     "menu_export": "Write & export",
-    "menu_calibration": "Personal calibration",
+    "menu_calibration": "Selection preference tuning",
     "menu_picker_settings": "Culling settings…",
     "menu_start_analysis": "Start analysis",
     "menu_pause_resume": "Pause or resume analysis",
     "menu_stop_analysis": "Stop analysis",
     "menu_write_ratings": "Confirm writing XMP ratings",
-    "about_content": "Photo Smart Culler\nLocal RAW culling, personal calibration, and read-only previews.\nNever moves, deletes, or rewrites originals.",
+    "about_content": "Photo Smart Culler\nLocal RAW culling, selection preferences, and read-only previews.\nNever moves, deletes, or rewrites originals.",
     "choose_files": "Choose files",
     "pick_files": "Choose photo files",
     "new_task_confirm": "Start a new task?",
@@ -229,7 +231,7 @@ TEXT["en"].update({
     "filter_all": "All photos",
     "filter_three": "3★ only",
     "filter_two": "2★ only",
-    "filter_one": "1★ only",
+    "filter_one": "1★ review only",
     "filter_zero": "Not selected",
     "write_mode": "WRITE MODE",
     "per_group": "SIMILAR PHOTOS KEPT",
@@ -263,12 +265,12 @@ TEXT["en"].update({
     "export_log_title": "Export this culling log",
     "export_log_done": "Culling log exported: {path}",
     "export_log_failed": "Could not export the log: {error}",
-    "calibration": "Personal calibration",
-    "calibration_active": "Personal calibration: on",
-    "calibration_idle": "Personal calibration",
-    "calibration_update": "Update personal calibration",
-    "calibration_intro": "Compare your final picks to tune local culling preferences",
-    "calibration_privacy": "Runs locally; never uploads or changes originals or Lightroom ratings",
+    "calibration": "Selection preference tuning",
+    "calibration_active": "Selection preference tuning: on",
+    "calibration_idle": "Selection preference tuning",
+    "calibration_update": "Update selection preference tuning",
+    "calibration_intro": "Use your final picks to tune future recommendations locally",
+    "calibration_privacy": "Local preference learning; never uploads or changes originals or Lightroom ratings",
     "sync_summary": "After writing XMP, read metadata from files in Lightroom to sync.",
     "sync_show": "Show Lightroom sync instructions",
     "sync_hide": "Hide Lightroom sync instructions",
@@ -282,9 +284,9 @@ TEXT["en"].update({
     "calibration_running": "Learning your final selections locally; originals stay read-only…",
     "calibration_progress": "Extracting local visual features {current}/{total} · {name}",
     "calibration_apply": "Reviewing featured picks against your history {current}/{total} · {name}",
-    "calibration_done": "Personal calibration is on: learned {samples} originals, with {positive} top-rated; group-separated validation {auc:.0%}.",
-    "calibration_failed": "Personal calibration was not enabled: {error}",
-    "calibration_apply_skipped": "Personal calibration was not applied: {error}. Base culling results were kept.",
+    "calibration_done": "Selection preference tuning is on: learned {samples} originals, with {positive} top-rated; group-separated validation {auc:.0%}.",
+    "calibration_failed": "Selection preference tuning was not enabled: {error}",
+    "calibration_apply_skipped": "Selection preference tuning was not applied: {error}. Base culling results were kept.",
 })
 
 
@@ -341,10 +343,20 @@ class EventCullApp(TkinterDnD.Tk):
         self.last_import_directory = Path.home()
         self.selected: PhotoResult | None = None
         self.preview: ImageTk.PhotoImage | None = None
+        self._active_preview_path: Path | None = None
         self.brand_logo: ImageTk.PhotoImage | None = None
         self._preview_memory: OrderedDict[Path, Image.Image] = OrderedDict()
+        self._zoom_preview_memory: OrderedDict[Path, Image.Image] = OrderedDict()
         self._preview_lock = threading.RLock()
         self._preview_generation = 0
+        self._preview_zoom_generation = 0
+        self._preview_zoom_window: tk.Toplevel | None = None
+        self._preview_zoom_canvas: tk.Canvas | None = None
+        self._preview_zoom_source: Image.Image | None = None
+        self._preview_zoom_photo: ImageTk.PhotoImage | None = None
+        self._preview_zoom_path: Path | None = None
+        self._preview_zoom_scale = 1.0
+        self._preview_zoom_fit = True
         self.current_task_id: str | None = None
         self.current_task_name = ""
         self.current_task_created_at: str | None = None
@@ -1065,6 +1077,8 @@ class EventCullApp(TkinterDnD.Tk):
         style.map("ViewModeActive.TButton", background=[("active", "#614722")])
         style.configure("SideBuy.TButton", background=colors["copper"], foreground="#fffaf3", borderwidth=0, padding=(13, 10), font=("Helvetica Neue", 11, "bold"))
         style.map("SideBuy.TButton", background=[("active", colors["copper_deep"])])
+        style.configure("SideTeam.TButton", background="#25211a", foreground="#f6d89e", borderwidth=1, padding=(11, 8), font=("Helvetica Neue", 10, "bold"))
+        style.map("SideTeam.TButton", background=[("active", "#3b3020")], foreground=[("active", "#ffe8ba")])
         style.configure("TEntry", fieldbackground="#151719", foreground=colors["ink"], insertcolor=colors["ink"], bordercolor=colors["line"], padding=(8, 6))
         style.configure("TSpinbox", fieldbackground="#151719", foreground=colors["ink"], arrowcolor=colors["muted"], bordercolor=colors["line"], padding=(5, 4))
         # Selection controls deliberately remain white-on-black: photographers
@@ -1195,13 +1209,21 @@ class EventCullApp(TkinterDnD.Tk):
 
         self.cull_nav_button = nav_row("cull", "照片筛选", "cull", self.show_culling_workspace, active=True)
         self.export_nav_button = nav_row("export", "写入与导出", "export", self.show_export_workspace)
-        self.calibration_nav_button = nav_row("calibration", "个人校准", "calibration", self.show_calibration_workspace)
+        self.calibration_nav_button = nav_row("calibration", "选片偏好校准", "calibration", self.show_calibration_workspace)
         sidebar_spacer = ttk.Frame(sidebar, style="Side.TFrame")
         sidebar_spacer.pack(fill="both", expand=True)
         ttk.Separator(sidebar).pack(fill="x", padx=25, pady=(0, 14))
-        ttk.Label(sidebar, text="试用版", style="SideMuted.TLabel").pack(anchor="w", padx=28)
+        self.license_caption = ttk.Label(sidebar, text="试用版", style="SideMuted.TLabel")
+        self.license_caption.pack(anchor="w", padx=28)
         self.license_button = ttk.Button(sidebar, style="SideBuy.TButton", command=self.show_license_dialog)
-        self.license_button.pack(fill="x", padx=25, pady=(6, 22))
+        self.license_button.pack(fill="x", padx=25, pady=(6, 7))
+        self.team_authorization_button = ttk.Button(
+            sidebar,
+            text="团队授权与设备",
+            style="SideTeam.TButton",
+            command=self.show_team_authorization,
+        )
+        self.team_authorization_button.pack(fill="x", padx=25, pady=(0, 22))
         ttk.Label(sidebar, text=f"v{APP_VERSION}", style="SideMuted.TLabel").pack(anchor="w", padx=28, pady=(0, 26))
         self._refresh_license_entry()
 
@@ -1383,6 +1405,9 @@ class EventCullApp(TkinterDnD.Tk):
     def _build_grid_panel(self) -> None:
         toolbar = ttk.Frame(self.grid_panel, style="Paper.TFrame")
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self.grid_toolbar = toolbar
+        self._grid_toolbar_reflow_after: str | None = None
+        self._grid_toolbar_compact = False
         toolbar.columnconfigure(8, weight=1)
         ttk.Label(toolbar, text="全部", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
         self.grid_count_label = ttk.Label(toolbar, text="0 张", style="Toolbar.TLabel")
@@ -1393,7 +1418,7 @@ class EventCullApp(TkinterDnD.Tk):
         self.rating_filter_menu.bind("<<ComboboxSelected>>", self.filter_results)
         self.rating_filter_tooltip = ToolTip(
             self.rating_filter_menu,
-            lambda: "只筛选当前列表显示，不会改变照片的推荐星级。",
+            lambda: "1★ 为初选复核：已进入保留池，但建议人工确认；筛选不会改变推荐星级。",
         )
         ttk.Label(toolbar, text="备用评级", style="Toolbar.TLabel").grid(row=0, column=4, sticky="w", padx=(13, 6))
         self.backup_star_menu = ttk.Combobox(toolbar, textvariable=self.backup_star, values=("2★", "3★", "4★"), state="readonly", width=4)
@@ -1413,6 +1438,7 @@ class EventCullApp(TkinterDnD.Tk):
         )
         ttk.Label(toolbar, text="排序：拍摄时间（新→旧）", style="Toolbar.TLabel").grid(row=0, column=8, sticky="w", padx=(17, 0))
         view_controls = tk.Frame(toolbar, bg=self._workbench_colors["paper"])
+        self.grid_view_controls = view_controls
         view_controls.grid(row=0, column=9, sticky="e", padx=(16, 0))
         tk.Label(
             view_controls,
@@ -1459,6 +1485,7 @@ class EventCullApp(TkinterDnD.Tk):
         self.import_badge = ttk.Label(toolbar, textvariable=self.import_notice, style="Toolbar.TLabel")
         self.import_badge.grid(row=1, column=7, sticky="e", pady=(8, 0))
         self.import_badge.grid_remove()
+        toolbar.bind("<Configure>", self._schedule_grid_toolbar_reflow, add="+")
         grid_shell = ttk.Frame(self.grid_panel, style="Paper.TFrame")
         grid_shell.grid(row=1, column=0, sticky="nsew")
         grid_shell.columnconfigure(0, weight=1)
@@ -1472,6 +1499,47 @@ class EventCullApp(TkinterDnD.Tk):
         self._photo_grid_window = self.photo_grid_canvas.create_window((0, 0), window=self.photo_grid_inner, anchor="nw")
         self.photo_grid_inner.bind("<Configure>", lambda _event: self.photo_grid_canvas.configure(scrollregion=self.photo_grid_canvas.bbox("all")))
         self.photo_grid_canvas.bind("<Configure>", self._on_grid_canvas_resize)
+
+    @staticmethod
+    def _grid_toolbar_is_compact(width: int) -> bool:
+        """Wrap view controls before a narrow workbench would clip them."""
+        return width < 960
+
+    def _thumbnail_scale_text(self, percent: int) -> str:
+        if getattr(self, "_grid_toolbar_compact", False):
+            return f"{percent}%"
+        return f"缩略图 {percent}%"
+
+    def _schedule_grid_toolbar_reflow(self, event) -> None:
+        self._grid_toolbar_width = max(0, int(event.width))
+        if self._grid_toolbar_reflow_after is None:
+            self._grid_toolbar_reflow_after = self.after_idle(self._reflow_grid_toolbar)
+
+    def _reflow_grid_toolbar(self) -> None:
+        """Keep size and view controls inside a reduced review workspace."""
+        self._grid_toolbar_reflow_after = None
+        if not hasattr(self, "grid_view_controls"):
+            return
+        compact = self._grid_toolbar_is_compact(getattr(self, "_grid_toolbar_width", 0))
+        if compact:
+            self.grid_view_controls.grid_configure(
+                row=1, column=0, columnspan=10, sticky="w", padx=(0, 0), pady=(8, 0)
+            )
+            self.grid_hint.grid_configure(row=2, column=0, columnspan=7, pady=(8, 0))
+            self.import_badge.grid_configure(row=2, column=7, columnspan=3, pady=(8, 0))
+            self.thumbnail_scale.configure(width=78)
+        else:
+            self.grid_view_controls.grid_configure(
+                row=0, column=9, columnspan=1, sticky="e", padx=(16, 0), pady=0
+            )
+            self.grid_hint.grid_configure(row=1, column=0, columnspan=7, pady=(8, 0))
+            self.import_badge.grid_configure(row=1, column=7, columnspan=1, pady=(8, 0))
+            self.thumbnail_scale.configure(width=104)
+        self._grid_toolbar_compact = compact
+        self.thumbnail_scale_label.set(
+            self._thumbnail_scale_text(self.thumbnail_scale_percent.get())
+        )
+        self._draw_thumbnail_scale()
 
     def _build_table_panel(self) -> None:
         header = ttk.Frame(self.table_panel, style="Paper.TFrame")
@@ -1499,7 +1567,7 @@ class EventCullApp(TkinterDnD.Tk):
         self.calibration_panel.grid(row=0, column=0, sticky="nsew")
         self.calibration_panel.columnconfigure(0, weight=1)
         self.calibration_panel.columnconfigure(1, weight=1)
-        ttk.Label(self.calibration_panel, text="个人校准", style="TaskTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(self.calibration_panel, text="选片偏好校准", style="TaskTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(
             self.calibration_panel,
             text="让软件逐步学会你在不同拍摄题材中，真正留下哪一张。所有比对与训练均在本机完成。",
@@ -1526,7 +1594,7 @@ class EventCullApp(TkinterDnD.Tk):
             ttk.Label(item, text=copy, style="PanelMuted.TLabel", justify="left", wraplength=180).pack(anchor="w", fill="x")
         evidence = ttk.Frame(self.calibration_panel, style="Paper.TFrame", padding=(0, 24, 12, 0))
         evidence.grid(row=3, column=0, sticky="nsew")
-        ttk.Label(evidence, text="下一次更新个人校准", style="PanelTitle.TLabel").pack(anchor="w")
+        ttk.Label(evidence, text="下一次更新选片偏好校准", style="PanelTitle.TLabel").pack(anchor="w")
         ttk.Label(evidence, text="选择 Lightroom 最终交付文件夹后，软件会自动关联当前任务的本地筛选日志。", style="PanelMuted.TLabel", justify="left", wraplength=390).pack(anchor="w", pady=(7, 14))
         task_ready = "本次任务筛选日志：已就绪" if self.current_log_path else "本次任务筛选日志：完成一次分析后自动生成"
         self.calibration_task_status = ttk.Label(evidence, text=task_ready, style="Stats.TLabel")
@@ -1588,6 +1656,12 @@ class EventCullApp(TkinterDnD.Tk):
         ttk.Label(right, text="本张决策", style="PanelTitle.TLabel").pack(anchor="w")
         self.preview_label = ttk.Label(right, text=self.t["empty_preview"], style="DropHint.TLabel", justify="center", anchor="center")
         self.preview_label.pack(fill="x", pady=(10, 9), ipady=54)
+        self.preview_label.configure(cursor="hand2")
+        self.preview_label.bind("<Button-1>", self._open_preview_zoom, add="+")
+        self.preview_zoom_tooltip = ToolTip(
+            self.preview_label,
+            lambda: "点击放大预览；在放大窗口滚轮缩放，双击可适应窗口。",
+        )
         self.detail = ttk.Label(right, text=self.t["empty_detail"], style="Decision.TLabel", justify="left", wraplength=280)
         self.detail.pack(fill="x", pady=(0, 11), ipadx=10, ipady=9)
         ttk.Label(right, text="手动评级", style="PanelTitle.TLabel").pack(anchor="w", pady=(1, 8))
@@ -1860,7 +1934,7 @@ class EventCullApp(TkinterDnD.Tk):
         if percent == self.thumbnail_scale_percent.get():
             return
         self.thumbnail_scale_percent.set(percent)
-        self.thumbnail_scale_label.set(f"缩略图 {percent}%")
+        self.thumbnail_scale_label.set(self._thumbnail_scale_text(percent))
         if hasattr(self, "thumbnail_scale"):
             self._draw_thumbnail_scale()
         self._schedule_thumbnail_reflow()
@@ -2611,10 +2685,16 @@ class EventCullApp(TkinterDnD.Tk):
         ttk.Button(actions, text="确认挑图规则", style="PickerPrimary.TButton", command=confirm_rules).pack(side="right", pady=12)
 
     def _build_menubar(self) -> None:
-        """Provide explicit localized labels instead of Tk's English defaults."""
-        # macOS must receive one attached, non-tear-off native menu bar.  A
-        # root Menu with Tk's default tear-off behavior, or a child called
-        # ``apple``, can surface as empty floating windows in a frozen app.
+        """Set up shortcuts without allowing Tk to create detachable macOS menus."""
+        # Recent Tk builds can turn *every* ``tk.Menu`` child into a detached
+        # desktop window on macOS (titled ``!menu``, ``!menu2``, ...), even
+        # when ``tearoff=False`` is supplied.  The workbench already exposes
+        # every action in-window, so omit the native Tk menu entirely there.
+        if sys.platform == "darwin":
+            self.configure(menu="")
+            self._bind_menu_shortcuts()
+            return
+
         menu_bar = tk.Menu(self, tearoff=False)
         app_menu = tk.Menu(menu_bar, tearoff=False)
         app_menu.add_command(label=self.t["menu_about"], command=self.show_about)
@@ -2663,6 +2743,9 @@ class EventCullApp(TkinterDnD.Tk):
         menu_bar.add_cascade(label=self.t["menu_help"], menu=help_menu)
         self.menu_bar = menu_bar
         self.configure(menu=menu_bar)
+        self._bind_menu_shortcuts()
+
+    def _bind_menu_shortcuts(self) -> None:
         self.bind_all("<Command-Key-1>", lambda _event: self.show_culling_workspace())
         self.bind_all("<Command-Key-2>", lambda _event: self.show_export_workspace())
         self.bind_all("<Command-Key-3>", lambda _event: self.show_calibration_workspace())
@@ -2692,12 +2775,30 @@ class EventCullApp(TkinterDnD.Tk):
         if not hasattr(self, "license_button"):
             return
         try:
-            self.license_button.configure(text=license_label(self.license_controller.decision))
+            decision = self.license_controller.decision
+            self.license_button.configure(text=license_label(decision))
+            if hasattr(self, "license_caption"):
+                lease = decision.lease
+                if lease is not None and lease.team_name:
+                    self.license_caption.configure(text="团队永久版")
+                elif decision.plan.value == "lifetime":
+                    self.license_caption.configure(text="永久版")
+                elif decision.plan.value == "developer":
+                    self.license_caption.configure(text="内部测试版")
+                else:
+                    self.license_caption.configure(text="试用版")
         except Exception:
             self.license_button.configure(text="授权与订阅")
 
     def show_license_dialog(self) -> None:
+        lease = self.license_controller.lease
+        if lease is not None and lease.team_name:
+            TeamAuthorizationDialog(self, self.license_controller, self._refresh_license_entry)
+            return
         LicenseDialog(self, self.license_controller, self._refresh_license_entry)
+
+    def show_team_authorization(self) -> None:
+        TeamAuthorizationDialog(self, self.license_controller, self._refresh_license_entry)
 
     def show_task_history(self) -> None:
         """Show the compact, local-only index of imports and completed culls."""
@@ -3161,9 +3262,12 @@ end run
         self.active_import_path = None
         self.grid_visible_limit = 72
         self.preview = None
+        self._active_preview_path = None
+        self._close_preview_zoom()
         self._preview_generation += 1
         with self._preview_lock:
             self._preview_memory.clear()
+            self._zoom_preview_memory.clear()
         self._grid_thumbnail_cache.clear()
         self.table.delete(*self.table.get_children())
         self.preview_label.configure(image="", text=self.t["empty_preview"])
@@ -3523,11 +3627,305 @@ end run
         """Show a cached 320px preview without blocking on a full RAW decode."""
         try:
             image = self._preview_image(path)
+            self._active_preview_path = path
             self.preview = ImageTk.PhotoImage(image)
             self.preview_label.configure(image=self.preview, text="")
+            if self._preview_zoom_is_open():
+                self._set_preview_zoom_path(path, fallback=image)
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def _clamp_preview_zoom(scale: float) -> float:
+        """Keep a magnified preview useful without allocating huge Tk images."""
+        return max(0.10, min(4.0, scale))
+
+    @staticmethod
+    def _preview_fit_scale(
+        image_size: tuple[int, int], viewport_size: tuple[int, int]
+    ) -> float:
+        """Return the scale that shows a complete image in its viewport."""
+        image_width, image_height = image_size
+        viewport_width, viewport_height = viewport_size
+        if min(image_width, image_height, viewport_width, viewport_height) <= 0:
+            return 1.0
+        return EventCullApp._clamp_preview_zoom(
+            min(viewport_width / image_width, viewport_height / image_height)
+        )
+
+    def _preview_zoom_is_open(self) -> bool:
+        window = self._preview_zoom_window
+        try:
+            return window is not None and bool(window.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _open_preview_zoom(self, _event=None) -> str:
+        """Open the selected photo in a separate, high-resolution review view."""
+        path = self._active_preview_path
+        if path is None:
+            return "break"
+        if not self._preview_zoom_is_open():
+            window = tk.Toplevel(self)
+            self._preview_zoom_window = window
+            window.title("放大预览")
+            window.configure(bg="#111214")
+            window.minsize(520, 420)
+            screen_width = self.winfo_screenwidth()
+            screen_height = self.winfo_screenheight()
+            width = min(1120, max(620, screen_width - 220))
+            height = min(860, max(480, screen_height - 180))
+            x = max(24, (screen_width - width) // 2)
+            y = max(32, (screen_height - height) // 2)
+            window.geometry(f"{width}x{height}+{x}+{y}")
+            window.protocol("WM_DELETE_WINDOW", self._close_preview_zoom)
+            window.bind("<Escape>", lambda _event: self._close_preview_zoom())
+
+            toolbar = tk.Frame(window, bg="#1b1d1f", padx=14, pady=10)
+            toolbar.pack(fill="x")
+            self.preview_zoom_name = tk.Label(
+                toolbar,
+                bg="#1b1d1f",
+                fg="#f1f0ec",
+                anchor="w",
+                font=("Helvetica Neue", 12, "bold"),
+            )
+            self.preview_zoom_name.pack(side="left", fill="x", expand=True)
+            self.preview_zoom_percent = tk.Label(
+                toolbar,
+                text="",
+                bg="#1b1d1f",
+                fg="#b7b3aa",
+                font=("Helvetica Neue", 10),
+            )
+            self.preview_zoom_percent.pack(side="left", padx=(10, 8))
+            for text, command, tooltip in (
+                ("−", lambda: self._change_preview_zoom(1 / 1.25), "缩小"),
+                ("适应", self._fit_preview_zoom, "适应窗口"),
+                ("100%", self._actual_preview_zoom, "按原始预览大小显示"),
+                ("＋", lambda: self._change_preview_zoom(1.25), "放大"),
+            ):
+                button = ttk.Button(toolbar, text=text, command=command, style="ViewMode.TButton")
+                button.pack(side="left", padx=(0, 4))
+                ToolTip(button, lambda copy=tooltip: copy)
+
+            canvas = tk.Canvas(
+                window,
+                bg="#101112",
+                bd=0,
+                highlightthickness=0,
+                cursor="fleur",
+            )
+            canvas.pack(fill="both", expand=True)
+            self._preview_zoom_canvas = canvas
+            canvas.bind("<Configure>", self._on_preview_zoom_canvas_resize, add="+")
+            canvas.bind("<ButtonPress-1>", lambda event: canvas.scan_mark(event.x, event.y))
+            canvas.bind("<B1-Motion>", lambda event: canvas.scan_dragto(event.x, event.y, gain=1))
+            canvas.bind("<Double-Button-1>", self._fit_preview_zoom)
+            canvas.bind("<MouseWheel>", self._zoom_preview_from_wheel)
+            canvas.bind("<Button-4>", self._zoom_preview_from_wheel)
+            canvas.bind("<Button-5>", self._zoom_preview_from_wheel)
+        else:
+            self._preview_zoom_window.deiconify()
+            self._preview_zoom_window.lift()
+            self._preview_zoom_window.focus_force()
+
+        fallback = None
+        try:
+            fallback = self._preview_image(path)
+        except Exception:
+            pass
+        self._set_preview_zoom_path(path, fallback=fallback)
+        return "break"
+
+    def _close_preview_zoom(self) -> str:
+        window = self._preview_zoom_window
+        self._preview_zoom_window = None
+        self._preview_zoom_canvas = None
+        self._preview_zoom_source = None
+        self._preview_zoom_photo = None
+        self._preview_zoom_path = None
+        self._preview_zoom_generation += 1
+        if window is not None:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+        return "break"
+
+    def _set_preview_zoom_path(self, path: Path, *, fallback: Image.Image | None) -> None:
+        """Display an immediate lightweight frame while the sharper preview loads."""
+        if not self._preview_zoom_is_open():
+            return
+        self._preview_zoom_path = path
+        self._preview_zoom_generation += 1
+        generation = self._preview_zoom_generation
+        self._preview_zoom_fit = True
+        if fallback is not None:
+            self._preview_zoom_source = fallback.copy()
+            self._render_preview_zoom()
+        self.preview_zoom_name.configure(text=path.name)
+        try:
+            key = path.resolve()
+        except OSError:
+            key = path
+        with self._preview_lock:
+            cached = self._zoom_preview_memory.get(key)
+            if cached is not None:
+                self._zoom_preview_memory.move_to_end(key)
+                image = cached.copy()
+            else:
+                image = None
+        if image is not None:
+            self._receive_zoom_preview(generation, path, image)
+            return
+
+        def prepare_high_resolution_preview() -> None:
+            try:
+                image = self._zoom_preview_image(path)
+            except Exception:
+                return
+            self.ui_events.put(("zoom_preview_ready", (generation, path, image)))
+
+        threading.Thread(
+            target=prepare_high_resolution_preview,
+            name="event-cull-zoom-preview",
+            daemon=True,
+        ).start()
+
+    def _remember_zoom_preview(self, path: Path, image: Image.Image) -> None:
+        try:
+            key = path.resolve()
+        except OSError:
+            key = path
+        with self._preview_lock:
+            self._zoom_preview_memory[key] = image.copy()
+            self._zoom_preview_memory.move_to_end(key)
+            while len(self._zoom_preview_memory) > ZOOM_PREVIEW_MEMORY_CACHE_LIMIT:
+                self._zoom_preview_memory.popitem(last=False)
+
+    def _zoom_preview_image(self, path: Path) -> Image.Image:
+        """Read one larger, disposable preview off the UI thread for close review."""
+        try:
+            key = path.resolve()
+        except OSError:
+            key = path
+        with self._preview_lock:
+            cached = self._zoom_preview_memory.get(key)
+            if cached is not None:
+                self._zoom_preview_memory.move_to_end(key)
+                return cached.copy()
+        if path.suffix.lower() not in RAW_EXTENSIONS:
+            with Image.open(path) as source:
+                image = ImageOps.exif_transpose(source).convert("RGB").copy()
+        else:
+            frame = _load_preview(path, maximum_dimension=ZOOM_PREVIEW_MAX_DIMENSION)
+            if frame is None or frame.size == 0:
+                raise RuntimeError("No high-resolution display preview was generated")
+            image = Image.fromarray(frame[:, :, ::-1].copy())
+        image.thumbnail(
+            (ZOOM_PREVIEW_MAX_DIMENSION, ZOOM_PREVIEW_MAX_DIMENSION),
+            Image.Resampling.LANCZOS,
+        )
+        self._remember_zoom_preview(path, image)
+        return image.copy()
+
+    def _receive_zoom_preview(
+        self, generation: int, path: Path, image: Image.Image
+    ) -> None:
+        if (
+            generation != self._preview_zoom_generation
+            or path != self._preview_zoom_path
+            or not self._preview_zoom_is_open()
+        ):
+            return
+        self._preview_zoom_source = image.copy()
+        self._render_preview_zoom()
+
+    def _on_preview_zoom_canvas_resize(self, _event=None) -> None:
+        if self._preview_zoom_fit:
+            self._render_preview_zoom()
+
+    def _change_preview_zoom(self, multiplier: float) -> None:
+        if self._preview_zoom_source is None:
+            return
+        current = self._preview_effective_scale()
+        self._preview_zoom_scale = self._clamp_preview_zoom(current * multiplier)
+        self._preview_zoom_fit = False
+        self._render_preview_zoom()
+
+    def _actual_preview_zoom(self) -> None:
+        if self._preview_zoom_source is None:
+            return
+        self._preview_zoom_scale = 1.0
+        self._preview_zoom_fit = False
+        self._render_preview_zoom()
+
+    def _fit_preview_zoom(self, _event=None) -> str:
+        self._preview_zoom_fit = True
+        self._render_preview_zoom()
+        return "break"
+
+    def _zoom_preview_from_wheel(self, event: tk.Event) -> str:
+        delta = int(getattr(event, "delta", 0) or 0)
+        if delta == 0 and getattr(event, "num", None) in {4, 5}:
+            delta = 1 if event.num == 4 else -1
+        if delta:
+            self._change_preview_zoom(1.15 if delta > 0 else 1 / 1.15)
+        return "break"
+
+    def _preview_effective_scale(self) -> float:
+        source = self._preview_zoom_source
+        canvas = self._preview_zoom_canvas
+        if source is None or canvas is None:
+            return 1.0
+        if self._preview_zoom_fit:
+            return self._preview_fit_scale(
+                source.size, (canvas.winfo_width(), canvas.winfo_height())
+            )
+        return self._preview_zoom_scale
+
+    def _render_preview_zoom(self) -> None:
+        canvas = self._preview_zoom_canvas
+        source = self._preview_zoom_source
+        if canvas is None or source is None:
+            return
+        try:
+            viewport_width = max(1, canvas.winfo_width())
+            viewport_height = max(1, canvas.winfo_height())
+            scale = self._preview_effective_scale()
+            rendered_width = max(1, int(round(source.width * scale)))
+            rendered_height = max(1, int(round(source.height * scale)))
+            rendered = source.resize(
+                (rendered_width, rendered_height), Image.Resampling.LANCZOS
+            )
+            self._preview_zoom_photo = ImageTk.PhotoImage(rendered)
+            canvas.delete("preview")
+            offset_x = max(0, (viewport_width - rendered_width) // 2)
+            offset_y = max(0, (viewport_height - rendered_height) // 2)
+            canvas.create_image(
+                offset_x, offset_y, anchor="nw", image=self._preview_zoom_photo,
+                tags="preview",
+            )
+            canvas.configure(
+                scrollregion=(
+                    0,
+                    0,
+                    max(viewport_width, rendered_width),
+                    max(viewport_height, rendered_height),
+                )
+            )
+            if rendered_width > viewport_width or rendered_height > viewport_height:
+                canvas.xview_moveto(0.5)
+                canvas.yview_moveto(0.5)
+            else:
+                canvas.xview_moveto(0)
+                canvas.yview_moveto(0)
+            if hasattr(self, "preview_zoom_percent"):
+                self.preview_zoom_percent.configure(text=f"{round(scale * 100)}%")
+        except tk.TclError:
+            return
 
     @staticmethod
     def _preview_cache_path(path: Path) -> Path:
@@ -3620,9 +4018,12 @@ end run
         self.analysis_completed_at = None
         self.current_log_path = None
         self.preview = None
+        self._active_preview_path = None
+        self._close_preview_zoom()
         self._preview_generation += 1
         with self._preview_lock:
             self._preview_memory.clear()
+            self._zoom_preview_memory.clear()
         self._grid_thumbnail_cache.clear()
         self.table.delete(*self.table.get_children())
         self.preview_label.configure(image="", text=self.t["empty_preview"])
@@ -3915,6 +4316,9 @@ end run
                         and path == self.active_import_path
                     ):
                         self._set_preview_from_path(source)
+                elif event == "zoom_preview_ready":
+                    generation, path, image = payload
+                    self._receive_zoom_preview(generation, path, image)
                 elif event == "update_available":
                     self._offer_update(payload)
                 elif event == "update_downloaded":
@@ -4068,6 +4472,10 @@ end run
         previous_tier = self.rating_filters.get(self.rating_filter.get())
         if self.language == "zh":
             self.legend_text.set(f"1★ 初选复核　{backup}★ 优质备用　{featured}★ 精选推荐　— 未入选")
+            rating_hint = (
+                f"评级说明：1★ 初选复核（已选，建议人工确认） · "
+                f"{backup}★ 优质备用 · {featured}★ 精选推荐"
+            )
             filters = {
                 self.t["filter_all"]: None,
                 self.t["filter_one"]: 1,
@@ -4077,6 +4485,10 @@ end run
             }
         else:
             self.legend_text.set(f"1★ Review  ·  {backup}★ Strong backup  ·  {featured}★ Best  ·  — Not selected")
+            rating_hint = (
+                f"Ratings: 1★ review (selected; confirm manually) · "
+                f"{backup}★ backup · {featured}★ best"
+            )
             filters = {
                 self.t["filter_all"]: None,
                 self.t["filter_one"]: 1,
@@ -4086,6 +4498,8 @@ end run
             }
         self.rating_filters = filters
         self.rating_filter_menu.configure(values=tuple(filters))
+        if hasattr(self, "grid_hint"):
+            self.grid_hint.configure(text=rating_hint)
         selected_label = next(
             (label for label, tier in filters.items() if tier == previous_tier),
             self.t["filter_all"],

@@ -28,6 +28,18 @@ def test_mousewheel_normalization_supports_trackpads_and_notched_wheels():
     assert EventCullApp._wheel_units(0) == 0
 
 
+def test_preview_zoom_stays_within_safe_rendering_limits():
+    assert EventCullApp._clamp_preview_zoom(0.01) == 0.10
+    assert EventCullApp._clamp_preview_zoom(1.25) == 1.25
+    assert EventCullApp._clamp_preview_zoom(9) == 4.0
+    assert EventCullApp._preview_fit_scale((1600, 1000), (800, 800)) == 0.5
+
+
+def test_view_controls_wrap_before_a_narrow_toolbar_can_clip_them():
+    assert EventCullApp._grid_toolbar_is_compact(959)
+    assert not EventCullApp._grid_toolbar_is_compact(960)
+
+
 def test_virtual_grid_row_height_reserves_one_consistent_review_track():
     assert EventCullApp._grid_row_height(144, analyzed=False) == 214
     assert EventCullApp._grid_row_height(144, analyzed=True) == 360
@@ -38,6 +50,10 @@ def test_result_filter_can_show_all_or_one_exact_rating():
     assert EventCullApp._matches_rating_filter(3, 3)
     assert not EventCullApp._matches_rating_filter(2, 3)
     assert EventCullApp._matches_rating_filter(0, 0)
+
+
+def test_chinese_filter_names_make_the_one_star_review_tier_explicit():
+    assert TEXT["zh"]["filter_one"] == "仅 1★ 初选复核"
 
 
 def test_output_star_mapping_keeps_engine_tiers_but_supports_four_and_five_stars():
@@ -324,7 +340,8 @@ def test_log_record_keeps_rating_quality_and_review_reason():
     assert record["reasons"] == "本组优选"
 
 
-def test_personal_calibration_copy_uses_final_filenames_without_metadata():
+def test_selection_preference_copy_uses_final_filenames_without_metadata():
     assert TEXT["zh"]["calibration_export_item"] == "人工最终选出的 JPG / 原片文件夹（只读取文件名）"
-    assert TEXT["zh"]["calibration_update"] == "更新个人校准"
+    assert TEXT["zh"]["calibration"] == "选片偏好校准"
+    assert TEXT["zh"]["calibration_update"] == "更新选片偏好校准"
     assert TEXT["zh"]["title"] == "照片智能筛选器"

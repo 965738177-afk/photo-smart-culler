@@ -9,7 +9,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 import event_cull.licensing as licensing
 
 
-def _lease(*, plan=licensing.LicensePlan.MONTHLY, expires_in_days=30, offline_hours=24):
+def _lease(*, plan=licensing.LicensePlan.MONTHLY, expires_in_days=30, offline_hours=24, team_name=None):
     moment = datetime.now(UTC)
     return licensing.LicenseLease(
         account_id="buyer@example.com",
@@ -18,6 +18,7 @@ def _lease(*, plan=licensing.LicensePlan.MONTHLY, expires_in_days=30, offline_ho
         issued_at=moment,
         offline_until=moment + timedelta(hours=offline_hours),
         subscription_until=None if plan is licensing.LicensePlan.LIFETIME else moment + timedelta(days=expires_in_days),
+        team_name=team_name,
     )
 
 
@@ -35,6 +36,31 @@ def test_policy_allows_lifetime_lease_until_server_offline_window_expires():
 
     assert decision.allows_analysis
     assert decision.plan is licensing.LicensePlan.LIFETIME
+
+
+def test_team_lifetime_lease_has_a_clear_sidebar_label():
+    decision = licensing.evaluate_lease(
+        _lease(plan=licensing.LicensePlan.LIFETIME, team_name="秒选摄影团队")
+    )
+
+    assert decision.allows_analysis
+    assert licensing.license_label(decision) == "团队授权"
+
+
+def test_three_day_trial_copy_and_remaining_time_are_not_described_as_a_subscription():
+    moment = datetime.now(UTC)
+    lease = licensing.LicenseLease(
+        account_id="trial+opaque@device.local",
+        device_id="device-0000000001",
+        plan=licensing.LicensePlan.MONTHLY,
+        issued_at=moment,
+        offline_until=moment + timedelta(hours=4),
+        subscription_until=moment + timedelta(days=licensing.TRIAL_DAYS),
+    )
+
+    assert licensing.TRIAL_DAYS == 3
+    assert "3 天试用" in licensing.evaluate_lease(None).message
+    assert licensing.license_label(licensing.evaluate_lease(lease)).startswith("试用剩余")
 
 
 def test_signed_lease_is_verified_and_tampering_is_rejected(monkeypatch):
@@ -61,6 +87,58 @@ def test_signed_lease_is_verified_and_tampering_is_rejected(monkeypatch):
     payload["plan"] = "lifetime"
     with pytest.raises(licensing.LicenseError):
         licensing.verify_lease(payload)
+
+
+def test_signed_team_lease_preserves_the_server_selected_team_name(monkeypatch):
+    private = ed25519.Ed25519PrivateKey.generate()
+    public = private.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    monkeypatch.setattr(licensing, "LICENSE_SIGNING_PUBLIC_KEY", public)
+    moment = datetime.now(UTC)
+    payload = {
+        "account_id": "member@example.com",
+        "device_id": "device-0000000001",
+        "plan": "lifetime",
+        "issued_at": moment.isoformat(),
+        "offline_until": (moment + timedelta(hours=24)).isoformat(),
+        "subscription_until": None,
+        "team_name": "秒选摄影团队",
+    }
+    payload["signature"] = base64.b64encode(
+        private.sign(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    ).decode("ascii")
+
+    assert licensing.verify_lease(payload).team_name == "秒选摄影团队"
+
+
+def test_team_activation_uses_only_a_verified_team_email_code(monkeypatch):
+    service = licensing.LicenseService(api_url="https://licenses.example.test")
+    calls = []
+    accepted = {}
+    expected = _lease(plan=licensing.LicensePlan.LIFETIME, team_name="秒选摄影团队")
+    monkeypatch.setattr(service, "device_id", lambda: "device-0000000001")
+    monkeypatch.setattr(service, "_device_name", lambda: "QA Mac · Darwin")
+    monkeypatch.setattr(
+        service,
+        "_post",
+        lambda path, payload: calls.append((path, payload)) or {"lease": {}, "device_token": "x" * 36},
+    )
+    monkeypatch.setattr(service, "_accept_activation", lambda **kwargs: accepted.update(kwargs) or expected)
+
+    service.request_team_activation_code(email="member@example.com")
+    assert service.activate_team(email="member@example.com", code="123456") is expected
+    assert calls == [
+        ("/v1/team/activation/request-code", {"email": "member@example.com"}),
+        (
+            "/v1/team/activation/complete",
+            {
+                "email": "member@example.com", "code": "123456",
+                "device_id": "device-0000000001", "device_name": "QA Mac · Darwin",
+            },
+        ),
+    ]
+    assert accepted["email"] == "member@example.com"
 
 
 def test_checkout_response_never_interprets_provider_data_as_an_entitlement(monkeypatch):

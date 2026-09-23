@@ -67,7 +67,7 @@ class CalibrationProfile:
     @classmethod
     def from_dict(cls, value: object) -> "CalibrationProfile":
         if not isinstance(value, dict) or value.get("version") not in {1, PROFILE_VERSION}:
-            raise CalibrationError("个人校准文件版本不兼容。")
+            raise CalibrationError("选片偏好校准文件版本不兼容。")
         try:
             mean = tuple(float(item) for item in value["mean"])
             scale = tuple(float(item) for item in value["scale"])
@@ -84,9 +84,9 @@ class CalibrationProfile:
                 feature_pipeline=str(value.get("feature_pipeline") or HANDCRAFTED_PIPELINE_ID),
             )
         except (KeyError, TypeError, ValueError) as exc:
-            raise CalibrationError("个人校准文件不完整。") from exc
+            raise CalibrationError("选片偏好校准文件不完整。") from exc
         if not mean or len(mean) != len(scale) or len(mean) != len(weights):
-            raise CalibrationError("个人校准特征维度无效。")
+            raise CalibrationError("选片偏好校准特征维度无效。")
         return profile
 
     def probability(self, image: np.ndarray) -> float:
@@ -95,7 +95,7 @@ class CalibrationProfile:
 
     def probability_for_feature(self, values: np.ndarray) -> float:
         if len(values) != len(self.weights):
-            raise CalibrationError("个人校准特征与当前版本不匹配。请重新导入一次校准结果。")
+            raise CalibrationError("选片偏好校准特征与当前版本不匹配。请重新导入一次校准结果。")
         normalized = (values - np.asarray(self.mean)) / np.asarray(self.scale)
         return _sigmoid(float(normalized @ np.asarray(self.weights) + self.bias))
 
@@ -251,11 +251,11 @@ def _feature_matrix(images: list[np.ndarray], pipeline: str) -> np.ndarray:
     if pipeline == HANDCRAFTED_PIPELINE_ID:
         return handcrafted
     if pipeline != DEEP_PIPELINE_ID:
-        raise CalibrationError("个人校准特征版本不兼容。请重新导入一次校准结果。")
+        raise CalibrationError("选片偏好校准特征版本不兼容。请重新导入一次校准结果。")
     try:
         deep_values, _backend = encode_images(images)
     except DeepFeatureUnavailable as exc:
-        raise CalibrationError("深度评分组件不可用；请重新更新个人校准。") from exc
+        raise CalibrationError("深度评分组件不可用；请重新更新选片偏好校准。") from exc
     if len(deep_values) != len(handcrafted):
         raise CalibrationError("深度评分没有返回完整的画面特征。")
     return np.hstack((handcrafted, deep_values)).astype(np.float32)
@@ -352,7 +352,7 @@ def train_profile(
     validation = _roc_auc(labels[held_out], validation_values @ weights + bias)
     if validation < MIN_VALIDATION_AUC:
         raise CalibrationError(
-            f"这批资料的分组验证区分度只有 {validation:.0%}，不足以安全启用个人校准。"
+            f"这批资料的分组验证区分度只有 {validation:.0%}，不足以安全启用选片偏好校准。"
         )
     mean, scale, weights, bias = _fit_classifier(features, labels)
     return CalibrationProfile(
@@ -466,10 +466,10 @@ def apply_profile(
         if item.suggested_rating == 3 and item.path not in featured_paths:
             item.suggested_rating = 2
             item.reasons = [reason for reason in item.reasons if reason not in {"本组最佳", "Best in group"}]
-            item.reasons.append("个人校准后保留为优质备用" if profile.featured_rating else "Personal calibration kept this as a backup")
+            item.reasons.append("选片偏好校准后保留为优质备用" if profile.featured_rating else "Selection preference tuning kept this as a backup")
         elif item.path in featured_paths:
             item.suggested_rating = 3
             item.reasons = [reason for reason in item.reasons if reason not in {"本组最佳", "Best in group"}]
             confidence = probabilities[item.path]
-            item.reasons.append(f"个人校准 3★ 置信度 {confidence:.0%}")
+            item.reasons.append(f"选片偏好校准 3★ 置信度 {confidence:.0%}")
     return len(featured_paths)
