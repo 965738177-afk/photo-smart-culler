@@ -7,6 +7,136 @@ import pytest
 from event_cull.engine import AnalysisCancelled, AnalysisOptions, PhotoResult, analyze_folder
 
 
+def test_contextual_eye_policy_only_penalizes_reliable_single_or_duo_portraits():
+    import event_cull.engine as engine
+
+    wedding = AnalysisOptions(scene_type="婚礼")
+
+    assert engine._eye_policy(wedding, 0, 0.0, 0, None).penalty == 0
+    assert engine._eye_policy(wedding, 1, 0.04, 0, None).mode == "scene_small_face"
+    assert engine._eye_policy(wedding, 2, 0.20, 0, 1.2).mode == "scene_intimate"
+    assert engine._eye_policy(wedding, 2, 0.20, 0, 2.0).penalty == 24
+    assert engine._eye_policy(wedding, 6, 0.30, 4, 2.0).penalty == 0
+    assert engine._eye_policy(wedding, 6, 0.30, 0, 2.0).penalty == 8
+
+
+def test_wedding_whitelist_reads_all_supplied_rows_and_their_priority():
+    import event_cull.engine as engine
+
+    rules = engine._wedding_must_keep_shots()
+    ceremony_kiss = next(rule for rule in rules if rule.identifier == "C9")
+
+    assert len(rules) == 59
+    assert ceremony_kiss.name == "仪式之吻"
+    assert ceremony_kiss.priority == "S"
+
+
+def test_wedding_whitelist_keeps_explicitly_labelled_moment_beyond_target():
+    import event_cull.engine as engine
+
+    normal = PhotoResult(Path("普通场景.jpg"), score=100, sharpness=100, perceptual_hash=1)
+    ceremony_kiss = PhotoResult(
+        Path("仪式/C9 仪式之吻.jpg"), score=70, sharpness=100, perceptual_hash=2
+    )
+
+    engine._assign_tiered_ratings(
+        [[normal], [ceremony_kiss]],
+        AnalysisOptions(scene_type="婚礼", target_keep_count=1),
+    )
+
+    assert ceremony_kiss.must_keep_id == "C9"
+    assert ceremony_kiss.suggested_rating > 0
+    assert any("必选镜头：仪式 · 仪式之吻" in reason for reason in ceremony_kiss.reasons)
+
+
+def test_wedding_whitelist_overrides_eye_penalty_for_an_explicit_eye_exempt_moment():
+    import event_cull.engine as engine
+
+    ceremony_kiss = PhotoResult(
+        Path("仪式/C9 仪式之吻.jpg"),
+        eye_detection_mode="scene_portrait",
+        eye_penalty=24,
+        reasons=["未检测到睁眼，可能是低头或侧脸，请复核"],
+    )
+
+    engine._apply_must_keep_rule(ceremony_kiss, AnalysisOptions(scene_type="婚礼"))
+
+    assert ceremony_kiss.eye_detection_mode == "scene_whitelist_eye_exempt"
+    assert ceremony_kiss.eye_penalty == 0
+    assert not any("未检测到睁眼" in reason for reason in ceremony_kiss.reasons)
+
+
+def test_wedding_whitelist_never_rescues_a_technical_hard_fault():
+    import event_cull.engine as engine
+
+    bad_kiss = PhotoResult(
+        Path("仪式/C9 仪式之吻.jpg"), score=100, sharpness=5, perceptual_hash=1
+    )
+
+    engine._assign_tiered_ratings(
+        [[bad_kiss]],
+        AnalysisOptions(scene_type="婚礼", target_keep_count=1),
+    )
+
+    assert bad_kiss.must_keep_id == "C9"
+    assert bad_kiss.suggested_rating == 0
+
+
+def test_general_and_other_scene_whitelists_load_only_the_active_scene_rules():
+    import event_cull.engine as engine
+
+    assert len(engine._must_keep_shots("通用")) == 10
+    assert len(engine._must_keep_shots("人像写真")) == 15
+    assert len(engine._must_keep_shots("活动纪实")) == 16
+    assert len(engine._must_keep_shots("儿童与家庭")) == 16
+    assert len(engine._must_keep_shots("毕业照")) == 15
+    assert len(engine._must_keep_shots("证件照")) == 10
+    assert len(engine._must_keep_shots("美食")) == 12
+
+
+def test_scene_specific_eye_policies_cover_food_family_and_id_photos():
+    import event_cull.engine as engine
+
+    assert engine._eye_policy(AnalysisOptions(scene_type="美食"), 1, 0.2, 0, None).penalty == 0
+    assert engine._eye_policy(AnalysisOptions(scene_type="儿童与家庭"), 1, 0.2, 0, None).penalty == 0
+    invalid_id = engine._eye_policy(AnalysisOptions(scene_type="证件照"), 1, 0.2, 0, None)
+    valid_id = engine._eye_policy(AnalysisOptions(scene_type="证件照"), 1, 0.2, 1, None)
+
+    assert invalid_id.mode == "id_eye_invalid"
+    assert invalid_id.penalty > 0
+    assert valid_id.mode == "id_valid"
+
+
+def test_graduation_whitelist_keeps_explicitly_labelled_moment_beyond_target():
+    import event_cull.engine as engine
+
+    normal = PhotoResult(Path("普通.jpg"), score=100, sharpness=100, perceptual_hash=1)
+    cap_throw = PhotoResult(Path("毕业/G4 抛学士帽.jpg"), score=65, sharpness=100, perceptual_hash=2)
+
+    engine._assign_tiered_ratings(
+        [[normal], [cap_throw]], AnalysisOptions(scene_type="毕业照", target_keep_count=1)
+    )
+
+    assert cap_throw.must_keep_id == "G4"
+    assert cap_throw.suggested_rating > 0
+
+
+def test_id_photo_requires_a_clear_open_eyed_single_face():
+    import event_cull.engine as engine
+
+    invalid = PhotoResult(
+        Path("id.jpg"), sharpness=100, perceptual_hash=1,
+        frontal_face_count=1, open_eye_face_count=0, face_coverage=.2,
+    )
+    valid = PhotoResult(
+        Path("id.jpg"), sharpness=100, perceptual_hash=1,
+        frontal_face_count=1, open_eye_face_count=1, face_coverage=.2,
+    )
+
+    assert engine._has_hard_fault(invalid, AnalysisOptions(scene_type="证件照"))
+    assert not engine._has_hard_fault(valid, AnalysisOptions(scene_type="证件照"))
+
+
 def test_target_count_keeps_one_lead_per_group_before_filling_global_slots(monkeypatch, tmp_path: Path):
     paths = []
     for number in range(4):
@@ -713,7 +843,7 @@ def test_target_count_creates_cumulative_rating_tiers():
         rating: sum(item.suggested_rating == rating for group in groups for item in group)
         for rating in range(4)
     }
-    assert counts == {0: 700, 1: 200, 2: 70, 3: 30}
+    assert counts == {0: 700, 1: 200, 2: 40, 3: 60}
 
 
 def test_target_floor_is_not_reduced_by_a_per_group_selection_cap():
@@ -772,6 +902,32 @@ def test_only_one_three_star_is_selected_from_each_similar_group():
     )
 
     assert all(sum(item.suggested_rating == 3 for item in group) <= 1 for group in groups)
+
+
+def test_featured_tier_surfaces_one_fifth_of_selected_candidates():
+    import event_cull.engine as engine
+
+    groups = [
+        [PhotoResult(Path(f"SCENE_{index}.jpg"), score=100 - index, perceptual_hash=index)]
+        for index in range(10)
+    ]
+
+    engine._assign_tiered_ratings(groups, AnalysisOptions(target_keep_count=10))
+
+    assert sum(item.suggested_rating == 3 for group in groups for item in group) == 2
+
+
+def test_featured_tier_keeps_higher_ranked_candidates_ahead_of_one_star_reviews():
+    import event_cull.engine as engine
+
+    groups = [
+        [PhotoResult(Path(f"SCENE_{index}.jpg"), score=score, perceptual_hash=index)]
+        for index, score in enumerate((100, 90, 80, 70, 60))
+    ]
+
+    engine._assign_tiered_ratings(groups, AnalysisOptions(target_keep_count=10))
+
+    assert [group[0].suggested_rating for group in groups] == [3, 3, 2, 2, 1]
 
 
 def test_analysis_reports_each_processed_photo(monkeypatch, tmp_path: Path):

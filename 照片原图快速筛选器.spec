@@ -13,6 +13,9 @@ APP_VERSION = version_match.group(1)
 
 datas = [
     ('event_cull/models/emotion-ferplus-8.onnx', 'event_cull/models'),
+    ('event_cull/data/wedding_must_keep_shots.csv', 'event_cull/data'),
+    ('event_cull/data/general_must_keep_shots.csv', 'event_cull/data'),
+    ('event_cull/data/other_must_keep_shots.csv', 'event_cull/data'),
     ('assets/branding/miaoxuan-logo.png', 'assets/branding'),
 ]
 binaries = []

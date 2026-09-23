@@ -62,8 +62,10 @@ JPEG_EXTENSIONS = {".jpg", ".jpeg"}
 DISPLAY_PREVIEW_MAX_DIMENSION = 320
 MEMORY_PREVIEW_CACHE_LIMIT = 64
 GRID_THUMBNAIL_CACHE_LIMIT = 120
+GRID_CARD_GUTTER = 3
 PRODUCT_TITLE_ZH = "秒选 — 照片智能筛选器"
 BRAND_LOGO_RESOURCE = Path("assets/branding/miaoxuan-logo.png")
+SCENE_TYPES = ("通用", "婚礼", "人像写真", "活动纪实", "儿童与家庭", "毕业照", "证件照", "美食")
 
 
 def app_resource_path(relative_path: Path) -> Path:
@@ -323,13 +325,16 @@ class ToolTip:
 class EventCullApp(TkinterDnD.Tk):
     def __init__(self) -> None:
         super().__init__()
+        # Tear-off menus are never useful in this app.  On macOS, leaving the
+        # Tk option at its default can materialize menu internals as empty
+        # floating windows (for example ``!menu``) in a bundled build.
+        self.option_add("*tearOff", "0")
         self.language = os.environ.get("EVENT_CULL_LANGUAGE", "zh").lower()
         self.language = "zh" if self.language not in TEXT else self.language
         self.t = TEXT[self.language]
         self.product_title = PRODUCT_TITLE_ZH if self.language == "zh" else self.t["title"]
         self.title(self.product_title)
-        self.geometry("1700x1050")
-        self.minsize(980, 680)
+        self._fit_main_window_to_display()
         self.configure(bg="#101112")
         self.results: list[PhotoResult] = []
         self.imported_files: list[Path] = []
@@ -392,7 +397,7 @@ class EventCullApp(TkinterDnD.Tk):
         self.blur_sensitivity = tk.StringVar(value="标准")
         self.exposure_sensitivity = tk.StringVar(value="标准")
         self.duplicate_similarity = tk.StringVar(value="标准")
-        self.keep_per_duplicate = tk.StringVar(value="1")
+        self.keep_per_duplicate = tk.StringVar(value="2")
         # Each imported batch must have an explicit rule confirmation before
         # AI work can start.  Appending photos invalidates that confirmation:
         # the source changed, so the photographer reviews the rules again.
@@ -410,6 +415,7 @@ class EventCullApp(TkinterDnD.Tk):
         self._virtual_grid_range: tuple[int, int] | None = None
         self._virtual_grid_rows: dict[int, list[tk.Widget]] = {}
         self._virtual_grid_render_after: str | None = None
+        self._mousewheel_bound = False
         self.grid_visible_limit = 72
         self.thumbnail_scale_percent = tk.IntVar(value=100)
         self.thumbnail_scale_label = tk.StringVar(value="缩略图 100%")
@@ -441,16 +447,56 @@ class EventCullApp(TkinterDnD.Tk):
         self.analysis_started_at: float | None = None
         self.analysis_pause_started_at: float | None = None
         self.analysis_paused_seconds = 0.0
+        self.analysis_progress_current = 0
+        self.analysis_progress_total = 0
         self.analysis_completed_at: str | None = None
         self.current_log_path: Path | None = None
         self.running_metadata_editors: tuple[str, ...] = ()
         self.calibration_profile: CalibrationProfile | None = load_profile()
         self.calibration_running = False
         self._build()
+        self.after_idle(self._dismiss_startup_menu_tearoffs)
         self._register_drop_targets(self)
         self.after(50, self.process_ui_events)
         self.after(250, self.refresh_lightroom_guard)
         self.after(1600, self._check_for_updates_in_background)
+
+    @staticmethod
+    def _main_window_size_for_screen(screen_width: int, screen_height: int) -> tuple[int, int]:
+        """Choose a large review surface without opening off-screen."""
+        width = min(1700, max(980, screen_width - 48))
+        height = min(1050, max(680, screen_height - 84))
+        return width, height
+
+    def _fit_main_window_to_display(self) -> None:
+        """Centre the first window and keep every persistent region reachable."""
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        width, height = self._main_window_size_for_screen(screen_width, screen_height)
+        x = max(12, (screen_width - width) // 2)
+        y = max(24, (screen_height - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.minsize(min(1180, width), min(720, height))
+
+    def _dismiss_startup_menu_tearoffs(self) -> None:
+        """Unpost any Tk menu left mapped by an earlier bundled launch state."""
+        for widget in self.winfo_children():
+            if not isinstance(widget, tk.Menu):
+                continue
+            try:
+                widget.configure(tearoff=False)
+                if widget.winfo_ismapped():
+                    widget.unpost()
+            except tk.TclError:
+                continue
+
+    @staticmethod
+    def _wheel_units(delta: int) -> int:
+        """Normalize macOS trackpads and notched mouse wheels to canvas units."""
+        if delta == 0:
+            return 0
+        magnitude = max(1, round(abs(delta) / 120)) if abs(delta) >= 120 else 1
+        return -magnitude if delta > 0 else magnitude
 
     def _build(self) -> None:
         # The active interface is a photographer-first workbench.  The former
@@ -973,6 +1019,7 @@ class EventCullApp(TkinterDnD.Tk):
         # some macOS installations.
         style.configure("SideTitle.TLabel", background=colors["sidebar"], foreground="#fffaf0", font=("Songti SC", 26, "bold"))
         style.configure("TaskTitle.TLabel", background=colors["canvas"], foreground=colors["ink"], font=("Songti SC", 22, "bold"))
+        style.configure("TaskStatus.TLabel", background=colors["canvas"], foreground="#c9c4ba", font=("Helvetica Neue", 11, "bold"))
         style.configure("Step.TLabel", background=colors["canvas"], foreground=colors["muted"], font=("Helvetica Neue", 12))
         style.configure("StepActive.TLabel", background=colors["canvas"], foreground=colors["ink"], font=("Helvetica Neue", 12, "bold"))
         style.configure("Toolbar.TLabel", background=colors["paper"], foreground=colors["muted"], font=("Helvetica Neue", 11))
@@ -1158,22 +1205,25 @@ class EventCullApp(TkinterDnD.Tk):
         ttk.Label(sidebar, text=f"v{APP_VERSION}", style="SideMuted.TLabel").pack(anchor="w", padx=28, pady=(0, 26))
         self._refresh_license_entry()
 
-        body = ttk.Frame(shell, style="Workbench.TFrame", padding=(30, 26, 24, 18))
+        body = ttk.Frame(shell, style="Workbench.TFrame", padding=(30, 18, 24, 18))
         body.grid(row=0, column=1, sticky="nsew")
         body.columnconfigure(0, weight=1)
         body.rowconfigure(2, weight=1)
         header = ttk.Frame(body, style="Workbench.TFrame")
         header.grid(row=0, column=0, sticky="ew")
-        # The header carries task identity only.  Task actions remain in the
-        # sidebar so this line has real breathing room.
+        # The header keeps task identity on the left and uses the right edge
+        # for contextual status after an import, rather than duplicating more
+        # permanent actions that already live in the sidebar and workflow.
         header.columnconfigure(0, weight=1)
         self.task_title = tk.StringVar(value="新建筛选任务 · 等待导入")
         ttk.Label(header, textvariable=self.task_title, style="TaskTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(
+        self.task_status_label = ttk.Label(
             header,
             textvariable=self.task_import_summary,
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(5, 0))
+            style="TaskStatus.TLabel",
+            justify="right",
+        )
+        self.task_status_label.grid(row=0, column=1, sticky="e", padx=(24, 0))
 
         # The workflow owns a dedicated band instead of competing with the
         # import and analysis actions above it.  This makes its current stage
@@ -1184,7 +1234,7 @@ class EventCullApp(TkinterDnD.Tk):
             highlightbackground=colors["line"],
             highlightthickness=1,
         )
-        workflow_band.grid(row=1, column=0, sticky="ew", pady=(22, 20))
+        workflow_band.grid(row=1, column=0, sticky="ew", pady=(12, 20))
         workflow_band.columnconfigure(0, weight=1)
         steps = ttk.Frame(workflow_band, style="Soft.TFrame", padding=(22, 16, 22, 10))
         steps.grid(row=0, column=0, sticky="ew")
@@ -1252,6 +1302,7 @@ class EventCullApp(TkinterDnD.Tk):
         self.stop_button.pack(side="left")
         self.pause_tooltip = ToolTip(self.pause_button, lambda: self.t["resume"] if self.is_paused else self.t["pause"])
         self.stop_tooltip = ToolTip(self.stop_button, lambda: self.t["stop"])
+        self._set_analysis_controls_visible(False)
         self.progress = ttk.Progressbar(workflow_band, style="Culling.Horizontal.TProgressbar", mode="determinate", maximum=1, value=0)
         self.progress.grid(row=2, column=0, sticky="ew", padx=18)
         ttk.Label(workflow_band, textvariable=self.progress_text, style="Muted.TLabel").grid(row=3, column=0, sticky="w", padx=18, pady=(6, 12))
@@ -1278,6 +1329,7 @@ class EventCullApp(TkinterDnD.Tk):
         self._build_calibration_workspace(workspace)
         self.calibration_panel.grid_remove()
         self._build_decision_panel(workspace)
+        self._install_mousewheel_routing()
 
         footer = ttk.Frame(body, style="Workbench.TFrame")
         footer.grid(row=3, column=0, sticky="ew", pady=(9, 0))
@@ -1331,22 +1383,37 @@ class EventCullApp(TkinterDnD.Tk):
     def _build_grid_panel(self) -> None:
         toolbar = ttk.Frame(self.grid_panel, style="Paper.TFrame")
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        toolbar.columnconfigure(5, weight=1)
+        toolbar.columnconfigure(8, weight=1)
         ttk.Label(toolbar, text="全部", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
         self.grid_count_label = ttk.Label(toolbar, text="0 张", style="Toolbar.TLabel")
         self.grid_count_label.grid(row=0, column=1, sticky="w", padx=(9, 22))
+        ttk.Label(toolbar, text="显示照片", style="Toolbar.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 6))
         self.rating_filter_menu = ttk.Combobox(toolbar, textvariable=self.rating_filter, state="readonly", width=11)
-        self.rating_filter_menu.grid(row=0, column=2, sticky="w")
+        self.rating_filter_menu.grid(row=0, column=3, sticky="w")
         self.rating_filter_menu.bind("<<ComboboxSelected>>", self.filter_results)
+        self.rating_filter_tooltip = ToolTip(
+            self.rating_filter_menu,
+            lambda: "只筛选当前列表显示，不会改变照片的推荐星级。",
+        )
+        ttk.Label(toolbar, text="备用评级", style="Toolbar.TLabel").grid(row=0, column=4, sticky="w", padx=(13, 6))
         self.backup_star_menu = ttk.Combobox(toolbar, textvariable=self.backup_star, values=("2★", "3★", "4★"), state="readonly", width=4)
-        self.backup_star_menu.grid(row=0, column=3, sticky="w", padx=(13, 0))
+        self.backup_star_menu.grid(row=0, column=5, sticky="w")
         self.backup_star_menu.bind("<<ComboboxSelected>>", self._on_star_mapping_changed)
+        self.backup_star_tooltip = ToolTip(
+            self.backup_star_menu,
+            lambda: "把内部“优质备用”层级写入 Lightroom 时使用的星级。",
+        )
+        ttk.Label(toolbar, text="精选评级", style="Toolbar.TLabel").grid(row=0, column=6, sticky="w", padx=(9, 6))
         self.featured_star_menu = ttk.Combobox(toolbar, textvariable=self.featured_star, values=("3★", "4★", "5★"), state="readonly", width=4)
-        self.featured_star_menu.grid(row=0, column=4, sticky="w", padx=(5, 0))
+        self.featured_star_menu.grid(row=0, column=7, sticky="w")
         self.featured_star_menu.bind("<<ComboboxSelected>>", self._on_star_mapping_changed)
-        ttk.Label(toolbar, text="排序：拍摄时间（新→旧）", style="Toolbar.TLabel").grid(row=0, column=5, sticky="w", padx=(17, 0))
+        self.featured_star_tooltip = ToolTip(
+            self.featured_star_menu,
+            lambda: "把内部“精选推荐”层级写入 Lightroom 时使用的星级。",
+        )
+        ttk.Label(toolbar, text="排序：拍摄时间（新→旧）", style="Toolbar.TLabel").grid(row=0, column=8, sticky="w", padx=(17, 0))
         view_controls = tk.Frame(toolbar, bg=self._workbench_colors["paper"])
-        view_controls.grid(row=0, column=6, sticky="e", padx=(16, 0))
+        view_controls.grid(row=0, column=9, sticky="e", padx=(16, 0))
         tk.Label(
             view_controls,
             textvariable=self.thumbnail_scale_label,
@@ -1405,7 +1472,6 @@ class EventCullApp(TkinterDnD.Tk):
         self._photo_grid_window = self.photo_grid_canvas.create_window((0, 0), window=self.photo_grid_inner, anchor="nw")
         self.photo_grid_inner.bind("<Configure>", lambda _event: self.photo_grid_canvas.configure(scrollregion=self.photo_grid_canvas.bbox("all")))
         self.photo_grid_canvas.bind("<Configure>", self._on_grid_canvas_resize)
-        self.photo_grid_canvas.bind("<MouseWheel>", lambda event: self.photo_grid_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units"))
 
     def _build_table_panel(self) -> None:
         header = ttk.Frame(self.table_panel, style="Paper.TFrame")
@@ -1492,11 +1558,33 @@ class EventCullApp(TkinterDnD.Tk):
         shell.grid_propagate(False)
         shell.rowconfigure(0, weight=1)
         shell.columnconfigure(0, weight=1)
-        # The review rail is deliberately a fixed, glanceable decision panel.
-        # Detailed Lightroom guidance opens in its own dialog so this rail never
-        # reserves an empty scrollbar or hides a core write action below a fold.
+        # The decision rail may be shorter than its controls on compact
+        # displays.  Keeping it independently scrollable means that write and
+        # restore actions remain reachable instead of being clipped below the
+        # window edge.
+        self.decision_canvas = tk.Canvas(
+            shell,
+            bg=self._workbench_colors["paper"],
+            bd=0,
+            highlightthickness=0,
+            yscrollincrement=12,
+        )
+        self.decision_canvas.grid(row=0, column=0, sticky="nsew")
+        self.decision_scroll = ttk.Scrollbar(shell, orient="vertical", command=self.decision_canvas.yview)
+        self.decision_scroll.grid(row=0, column=1, sticky="ns")
+        self.decision_canvas.configure(yscrollcommand=self.decision_scroll.set)
         right = ttk.Frame(shell, style="Paper.TFrame", padding=(17, 13, 17, 16))
-        right.grid(row=0, column=0, sticky="nsew")
+        self._decision_window = self.decision_canvas.create_window((0, 0), window=right, anchor="nw")
+
+        def update_decision_scroll_region(_event=None) -> None:
+            self.decision_canvas.configure(scrollregion=self.decision_canvas.bbox("all"))
+
+        def fit_decision_content(event) -> None:
+            self.decision_canvas.itemconfigure(self._decision_window, width=event.width)
+            update_decision_scroll_region()
+
+        right.bind("<Configure>", update_decision_scroll_region)
+        self.decision_canvas.bind("<Configure>", fit_decision_content)
         ttk.Label(right, text="本张决策", style="PanelTitle.TLabel").pack(anchor="w")
         self.preview_label = ttk.Label(right, text=self.t["empty_preview"], style="DropHint.TLabel", justify="center", anchor="center")
         self.preview_label.pack(fill="x", pady=(10, 9), ipady=54)
@@ -1640,6 +1728,44 @@ class EventCullApp(TkinterDnD.Tk):
             task_ready = "本次任务筛选日志：已就绪" if self.current_log_path else "本次任务筛选日志：完成一次分析后自动生成"
             self.calibration_task_status.configure(text=task_ready)
             self.calibration_report.configure(text=self._calibration_report_text())
+
+    @staticmethod
+    def _pointer_is_over_widget(event: tk.Event, widget: tk.Widget) -> bool:
+        """Check the pointer in screen coordinates so card children also scroll."""
+        try:
+            left = widget.winfo_rootx()
+            top = widget.winfo_rooty()
+            return (
+                left <= event.x_root < left + widget.winfo_width()
+                and top <= event.y_root < top + widget.winfo_height()
+            )
+        except tk.TclError:
+            return False
+
+    def _route_mousewheel(self, event: tk.Event) -> str | None:
+        """Let the pointer's active review surface own wheel and trackpad input."""
+        delta = int(getattr(event, "delta", 0) or 0)
+        if delta == 0 and getattr(event, "num", None) in {4, 5}:
+            delta = 1 if event.num == 4 else -1
+        units = self._wheel_units(delta)
+        if units == 0:
+            return None
+        if hasattr(self, "photo_grid_canvas") and self._pointer_is_over_widget(event, self.photo_grid_canvas):
+            self.photo_grid_canvas.yview_scroll(units, "units")
+            return "break"
+        if hasattr(self, "decision_canvas") and self._pointer_is_over_widget(event, self.decision_canvas):
+            self.decision_canvas.yview_scroll(units, "units")
+            return "break"
+        return None
+
+    def _install_mousewheel_routing(self) -> None:
+        """Install one root-level route so wheel input works over every grid card."""
+        if self._mousewheel_bound:
+            return
+        self._mousewheel_bound = True
+        self.bind_all("<MouseWheel>", self._route_mousewheel, add="+")
+        self.bind_all("<Button-4>", lambda event: self._route_mousewheel(event), add="+")
+        self.bind_all("<Button-5>", lambda event: self._route_mousewheel(event), add="+")
 
     def _on_grid_canvas_resize(self, event) -> None:
         self.photo_grid_canvas.itemconfigure(self._photo_grid_window, width=event.width)
@@ -1810,6 +1936,11 @@ class EventCullApp(TkinterDnD.Tk):
             for primary, companions in self._logical_import_rows(self.imported_files)
         ]
 
+    @staticmethod
+    def _grid_row_height(thumbnail_height: int, *, analyzed: bool) -> int:
+        """Keep every review row on one consistent visual rhythm."""
+        return thumbnail_height + (216 if analyzed else 70)
+
     def _render_photo_grid(self) -> None:
         self._grid_render_scheduled = False
         self._grid_render_after = None
@@ -1853,7 +1984,7 @@ class EventCullApp(TkinterDnD.Tk):
         card_width = max(150, int(base_card_width * scale))
         thumbnail_height = max(100, int(144 * scale))
         columns = max(2, available // (card_width + 12))
-        row_height = thumbnail_height + (238 if self.results else 82)
+        row_height = self._grid_row_height(thumbnail_height, analyzed=bool(self.results))
         total_height = max(
             self.photo_grid_canvas.winfo_height(),
             math.ceil(len(entries) / columns) * row_height + 10,
@@ -1914,23 +2045,28 @@ class EventCullApp(TkinterDnD.Tk):
             card = tk.Frame(self.photo_grid_inner, bg=self._workbench_colors["paper"], highlightbackground=border, highlightcolor=border, highlightthickness=2 if selected else 1, bd=0)
             cards.append(card)
             if virtual_row_height is None:
-                card.grid(row=row, column=column, sticky="nsew", padx=5, pady=5)
+                card.grid(row=row, column=column, sticky="nsew", padx=GRID_CARD_GUTTER, pady=GRID_CARD_GUTTER)
+                card_content_width = card_width - GRID_CARD_GUTTER * 2
             else:
                 cell_width = max(1, self.photo_grid_canvas.winfo_width() // columns)
                 card.place(
-                    x=column * cell_width + 5,
-                    y=row * virtual_row_height + 5,
-                    width=max(1, cell_width - 10),
-                    height=max(1, virtual_row_height - 10),
+                    x=column * cell_width + GRID_CARD_GUTTER,
+                    y=row * virtual_row_height + GRID_CARD_GUTTER,
+                    width=max(1, cell_width - GRID_CARD_GUTTER * 2),
+                    height=max(1, virtual_row_height - GRID_CARD_GUTTER * 2),
                 )
+                card_content_width = cell_width - GRID_CARD_GUTTER * 2
             source = self._preview_source(path, companions)
-            thumbnail = self._grid_thumbnail(source, card_width - 12, thumbnail_height)
+            thumbnail_slot = tk.Frame(card, bg="#2a2d30", height=thumbnail_height)
+            thumbnail_slot.pack(fill="x", padx=5, pady=(5, 4))
+            thumbnail_slot.pack_propagate(False)
+            thumbnail = self._grid_thumbnail(source, max(100, card_content_width - 12), thumbnail_height)
             photo = (
-                tk.Label(card, image=thumbnail, bg="#2a2d30")
+                tk.Label(thumbnail_slot, image=thumbnail, bg="#2a2d30")
                 if thumbnail is not None
-                else tk.Label(card, text="正在准备预览", bg="#2a2d30", fg=self._workbench_colors["muted"], width=max(15, card_width // 9), height=8, font=("Helvetica Neue", 10))
+                else tk.Label(thumbnail_slot, text="正在准备预览", bg="#2a2d30", fg=self._workbench_colors["muted"], font=("Helvetica Neue", 10))
             )
-            photo.pack(fill="x", padx=5, pady=(5, 4))
+            photo.place(relx=0.5, rely=0.5, anchor="center")
             name_row = tk.Frame(card, bg=self._workbench_colors["paper"])
             name_row.pack(fill="x", padx=7)
             tk.Label(name_row, text=name, bg=self._workbench_colors["paper"], fg=self._workbench_colors["ink"], anchor="w", font=("Helvetica Neue", 10, "bold")).pack(side="left", fill="x", expand=True)
@@ -1952,7 +2088,7 @@ class EventCullApp(TkinterDnD.Tk):
                     track.pack(side="left", fill="x", expand=True, padx=(3, 4), pady=5)
                     tk.Frame(track, bg="#a98c66", height=3).place(relwidth=max(0.03, min(value, 100) / 100), relheight=1)
                     tk.Label(metric_row, text=str(value), bg=self._workbench_colors["paper"], fg=self._workbench_colors["muted"], font=("Helvetica Neue", 8)).pack(side="right")
-                tk.Label(card, text=("；".join(reasons[-2:]) or self.t["best"]), bg=self._workbench_colors["paper"], fg=self._workbench_colors["muted"], justify="left", anchor="w", wraplength=card_width - 14, font=("Helvetica Neue", 8)).pack(fill="x", padx=7, pady=(5, 7))
+                tk.Label(card, text=("；".join(reasons[-2:]) or self.t["best"]), bg=self._workbench_colors["paper"], fg=self._workbench_colors["muted"], justify="left", anchor="w", wraplength=max(100, card_content_width - 14), font=("Helvetica Neue", 8)).pack(fill="x", padx=7, pady=(5, 7))
             else:
                 tk.Label(card, text="等待 AI 分析", bg=self._workbench_colors["paper"], fg=self._workbench_colors["muted"], anchor="w", font=("Helvetica Neue", 9)).pack(fill="x", padx=7, pady=(4, 8))
             select = (
@@ -1960,7 +2096,7 @@ class EventCullApp(TkinterDnD.Tk):
                 if index is not None
                 else (lambda _event, primary=path, pair_paths=companions: self._select_imported_photo(primary, pair_paths))
             )
-            for widget in (card, photo, name_row, *card.winfo_children()):
+            for widget in (card, thumbnail_slot, photo, name_row, *card.winfo_children()):
                 widget.bind("<Button-1>", select, add="+")
         return cards
 
@@ -2076,13 +2212,16 @@ class EventCullApp(TkinterDnD.Tk):
         target_max: int,
         duplicate_keep_limit: int,
     ) -> AnalysisOptions:
-        similarity = self._picker_threshold(self.duplicate_similarity.get(), weak=10, standard=18, strong=26)
-        # The duplicate control uses words that make sense to photographers,
-        # while the engine uses a hash-distance threshold.
-        if self.duplicate_similarity.get() == "重复":
-            similarity = 10
-        elif self.duplicate_similarity.get() == "相似":
-            similarity = 26
+        # The picker uses human-facing grouping language while the engine
+        # compares perceptual-hash distance.  Keep the old labels as a
+        # compatibility fallback for an already-open legacy settings window.
+        similarity = {
+            "严格": 10,
+            "标准": 18,
+            "宽松": 26,
+            "重复": 10,
+            "相似": 26,
+        }.get(self.duplicate_similarity.get(), 18)
         return AnalysisOptions(
             picks_per_group=picks_min,
             max_picks_per_group=picks_max,
@@ -2099,6 +2238,7 @@ class EventCullApp(TkinterDnD.Tk):
             prefer_people=self.priority_more_faces.get(),
             max_duplicate_picks_per_group=duplicate_keep_limit,
             fill_with_similar=self.fill_with_similar.get(),
+            scene_type=self.scene_type.get(),
             language=self.language,
         )
 
@@ -2130,7 +2270,7 @@ class EventCullApp(TkinterDnD.Tk):
         self.blur_sensitivity.set("标准")
         self.exposure_sensitivity.set("标准")
         self.duplicate_similarity.set("标准")
-        self.keep_per_duplicate.set("1")
+        self.keep_per_duplicate.set("2")
         self.picker_settings_confirmed = False
         self._refresh_picker_confirmation_ui()
 
@@ -2187,221 +2327,271 @@ class EventCullApp(TkinterDnD.Tk):
             self.analyze_button.configure(state="disabled")
 
     def show_picker_settings(self) -> None:
-        """Show a spacious, high-contrast confirmation surface for AI rules."""
+        """Show the selected single-column rules layout before AI work begins."""
+        palette = {
+            "window": "#17191b",
+            "header": "#202326",
+            "surface": "#1c1f21",
+            "line": "#3b4043",
+            "ink": "#fffaf0",
+            "muted": "#b7b9b8",
+            "copper": "#df9b2d",
+            "copper_dark": "#9e6b25",
+            "control": "#f7f5f0",
+            "control_ink": "#191919",
+        }
         dialog = tk.Toplevel(self)
-        dialog.title("AI 挑图设置")
-        dialog.configure(bg="#1c1d1f")
+        dialog.title("秒选 · AI 挑图设置")
+        dialog.configure(bg=palette["window"])
         dialog.transient(self)
         dialog.grab_set()
-        dialog.geometry("920x800")
-        dialog.minsize(820, 720)
+        screen_width, screen_height = self.winfo_screenwidth(), self.winfo_screenheight()
+        # Prefer the generous one-page reference layout, but never let a
+        # smaller desktop push the footer or any controls off-screen.
+        width = min(1240, max(960, screen_width - 56))
+        height = min(1000, max(720, screen_height - 64))
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        dialog.minsize(min(960, width), min(720, height))
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(1, weight=1)
 
         picker_style = ttk.Style(dialog)
-        picker_style.configure("Picker.TCombobox", fieldbackground="#faf9f6", background="#faf9f6", foreground="#151515", arrowcolor="#151515", padding=(8, 6))
-        picker_style.map("Picker.TCombobox", fieldbackground=[("readonly", "#faf9f6")], foreground=[("readonly", "#151515")])
-        dialog.option_add("*TCombobox*Listbox.background", "#faf9f6")
-        dialog.option_add("*TCombobox*Listbox.foreground", "#151515")
-        dialog.option_add("*TCombobox*Listbox.selectBackground", "#d99a38")
-        dialog.option_add("*TCombobox*Listbox.selectForeground", "#151515")
+        picker_style.configure("Picker.TCombobox", fieldbackground=palette["control"], background=palette["control"], foreground=palette["control_ink"], arrowcolor=palette["control_ink"], padding=(8, 6))
+        picker_style.map("Picker.TCombobox", fieldbackground=[("readonly", palette["control"])], foreground=[("readonly", palette["control_ink"])])
+        picker_style.configure("PickerPrimary.TButton", background=palette["copper"], foreground="#1b1309", borderwidth=0, padding=(22, 12), font=("Helvetica Neue", 12, "bold"))
+        picker_style.map("PickerPrimary.TButton", background=[("active", "#efb35a")])
+        picker_style.configure("PickerQuiet.TButton", background="#303438", foreground=palette["ink"], borderwidth=1, padding=(20, 12), font=("Helvetica Neue", 11, "bold"))
+        picker_style.map("PickerQuiet.TButton", background=[("active", "#3d4246")])
+        dialog.option_add("*TCombobox*Listbox.background", palette["control"])
+        dialog.option_add("*TCombobox*Listbox.foreground", palette["control_ink"])
+        dialog.option_add("*TCombobox*Listbox.selectBackground", palette["copper"])
+        dialog.option_add("*TCombobox*Listbox.selectForeground", "#17120c")
 
-        header = tk.Frame(dialog, bg="#25282a", highlightbackground="#42464a", highlightthickness=1)
+        header = tk.Frame(dialog, bg=palette["header"], highlightbackground=palette["line"], highlightthickness=1)
         header.grid(row=0, column=0, sticky="ew")
-        tk.Label(header, text="AI 挑图设置", bg="#25282a", fg="#fff8eb", font=("Helvetica Neue", 17, "bold")).pack(side="left", padx=24, pady=16)
-        tk.Label(header, text="确认后才会开始本次 AI 分析", bg="#25282a", fg="#b7b7b3", font=("Helvetica Neue", 10)).pack(side="left", padx=(0, 10))
-        tk.Button(header, text="×", command=dialog.destroy, bg="#25282a", fg="#c9c6bf", activebackground="#373b3e", activeforeground="#fff", bd=0, highlightthickness=0, padx=8, pady=0, font=("Helvetica Neue", 20)).pack(side="right", padx=18)
+        tk.Label(header, text="秒选", bg=palette["header"], fg=palette["ink"], font=("Songti SC", 25, "bold")).pack(side="left", padx=(28, 12), pady=17)
+        tk.Label(header, text="|", bg=palette["header"], fg="#888b8c", font=("Helvetica Neue", 19)).pack(side="left")
+        tk.Label(header, text="AI 挑图设置", bg=palette["header"], fg=palette["ink"], font=("Helvetica Neue", 20, "bold")).pack(side="left", padx=14)
+        tk.Label(header, text="设置完成后将开始本次 AI 分析", bg=palette["header"], fg=palette["muted"], font=("Helvetica Neue", 10)).pack(side="right", padx=28)
 
-        content = tk.Frame(dialog, bg="#1c1d1f", padx=18, pady=16)
-        content.grid(row=1, column=0, sticky="nsew")
-        content.columnconfigure(0, weight=1, uniform="picker")
-        content.columnconfigure(1, weight=1, uniform="picker")
+        # The header and actions deliberately stay pinned.  The form itself
+        # scrolls only when the available display height is less than the
+        # full reference layout, so a shorter laptop never hides duplicate
+        # handling or the confirmation actions.
+        form_shell = tk.Frame(dialog, bg=palette["window"])
+        form_shell.grid(row=1, column=0, sticky="nsew")
+        form_shell.columnconfigure(0, weight=1)
+        form_shell.rowconfigure(0, weight=1)
+        form_canvas = tk.Canvas(
+            form_shell,
+            bg=palette["window"],
+            bd=0,
+            highlightthickness=0,
+            yscrollincrement=12,
+        )
+        form_scroll = ttk.Scrollbar(form_shell, orient="vertical", command=form_canvas.yview)
+        form_canvas.configure(yscrollcommand=form_scroll.set)
+        form_canvas.grid(row=0, column=0, sticky="nsew")
+        form_scroll.grid(row=0, column=1, sticky="ns")
+        content = tk.Frame(form_canvas, bg=palette["window"], padx=32, pady=20)
+        content_window = form_canvas.create_window((0, 0), window=content, anchor="nw")
 
-        def section(parent: tk.Frame, title: str, subtitle: str = "") -> tk.Frame:
-            frame = tk.Frame(parent, bg="#2d3033", highlightbackground="#43474a", highlightthickness=1, padx=16, pady=14)
-            tk.Label(frame, text=title, bg="#2d3033", fg="#fff8eb", font=("Helvetica Neue", 12, "bold")).pack(anchor="w")
-            if subtitle:
-                tk.Label(frame, text=subtitle, bg="#2d3033", fg="#aaa9a4", font=("Helvetica Neue", 9), justify="left", wraplength=350).pack(anchor="w", pady=(4, 7))
-            return frame
+        def sync_form_scroll_region(_event=None) -> None:
+            form_canvas.configure(scrollregion=form_canvas.bbox("all"))
 
-        def row(parent: tk.Frame, label: str, description: str = "") -> tk.Frame:
-            line = tk.Frame(parent, bg="#2d3033")
-            line.pack(fill="x", pady=(12, 0))
-            text = tk.Frame(line, bg="#2d3033")
-            text.pack(side="left", fill="x", expand=True)
-            tk.Label(text, text=label, bg="#2d3033", fg="#ece9e2", font=("Helvetica Neue", 10, "bold")).pack(anchor="w")
-            if description:
-                tk.Label(text, text=description, bg="#2d3033", fg="#aaa9a4", font=("Helvetica Neue", 9), justify="left", wraplength=255).pack(anchor="w", pady=(3, 0))
-            return line
+        def resize_form_content(event) -> None:
+            form_canvas.itemconfigure(content_window, width=event.width)
 
-        def switch(parent: tk.Frame, variable: tk.BooleanVar) -> tk.Canvas:
-            """Draw a toggle ourselves: macOS Tk ignores Button background colours."""
-            control = tk.Canvas(parent, width=82, height=30, bg="#2d3033", bd=0, highlightthickness=0)
+        def scroll_form(event) -> str:
+            raw_delta = getattr(event, "delta", 0)
+            if raw_delta:
+                units = self._wheel_units(raw_delta)
+            else:
+                units = -1 if getattr(event, "num", 0) == 5 else 1
+            form_canvas.yview_scroll(units, "units")
+            return "break"
 
-            def refresh() -> None:
-                active = variable.get()
-                control.delete("all")
-                track = "#d99a38" if active else "#575b5e"
-                foreground = "#1b140b" if active else "#d9d7d1"
-                control.create_oval(2, 4, 28, 26, fill=track, outline=track)
-                control.create_rectangle(15, 4, 66, 26, fill=track, outline=track)
-                control.create_oval(54, 4, 80, 26, fill=track, outline=track)
-                knob_x = 67 if active else 15
-                control.create_oval(knob_x - 8, 7, knob_x + 8, 23, fill="#1d1f21" if active else "#e7e4dc", outline="")
-                control.create_text(41, 15, text="开启" if active else "关闭", fill=foreground, font=("Helvetica Neue", 9, "bold"))
+        content.bind("<Configure>", sync_form_scroll_region)
+        form_canvas.bind("<Configure>", resize_form_content)
+        form_canvas.bind("<MouseWheel>", scroll_form)
+        form_canvas.bind("<Button-4>", scroll_form)
+        form_canvas.bind("<Button-5>", scroll_form)
 
-            def toggle(_event=None) -> None:
-                variable.set(not variable.get())
-                refresh()
+        def section(title: str, subtitle: str) -> tk.Frame:
+            block = tk.Frame(content, bg=palette["window"])
+            tk.Label(block, text=title, bg=palette["window"], fg=palette["ink"], font=("Songti SC", 20, "bold")).pack(anchor="w")
+            tk.Label(block, text=subtitle, bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 10), justify="left").pack(anchor="w", pady=(4, 10))
+            return block
 
-            control.bind("<Button-1>", toggle)
-            refresh()
-            control.pack(side="right", padx=(12, 0))
-            return control
+        def divider(parent: tk.Widget) -> None:
+            tk.Frame(parent, bg=palette["line"], height=1).pack(fill="x", pady=(10, 0))
 
-        def check(parent: tk.Frame, text: str, variable: tk.BooleanVar) -> tk.Canvas:
-            control = tk.Canvas(parent, height=34, bg="#2d3033", bd=0, highlightthickness=0, cursor="hand2")
+        def row(parent: tk.Widget, label: str, description: str) -> tuple[tk.Frame, tk.Frame]:
+            line = tk.Frame(parent, bg=palette["window"])
+            line.pack(fill="x", pady=(9, 0))
+            copy = tk.Frame(line, bg=palette["window"])
+            copy.pack(side="left", fill="x", expand=True)
+            tk.Label(copy, text=label, bg=palette["window"], fg="#f2efe9", font=("Helvetica Neue", 12, "bold")).pack(anchor="w")
+            tk.Label(copy, text=description, bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 9)).pack(anchor="w", pady=(2, 0))
+            controls = tk.Frame(line, bg=palette["window"])
+            controls.pack(side="right", padx=(20, 0))
+            return line, controls
+
+        def spin(parent: tk.Widget, variable: tk.StringVar, *, width: int = 5, minimum: int = 1, maximum: int = 50000) -> tk.Spinbox:
+            return tk.Spinbox(
+                parent,
+                from_=minimum,
+                to=maximum,
+                textvariable=variable,
+                width=width,
+                justify="center",
+                bg=palette["control"],
+                fg=palette["control_ink"],
+                buttonbackground="#e5e2da",
+                insertbackground=palette["control_ink"],
+                relief="flat",
+                highlightthickness=1,
+                highlightbackground="#d5d1c8",
+                highlightcolor=palette["copper"],
+                font=("Helvetica Neue", 12, "bold"),
+            )
+
+        def toggle(parent: tk.Widget, variable: tk.BooleanVar, *, side: str = "left") -> tk.Canvas:
+            """Render a compact, single-purpose rounded switch."""
+            control = tk.Canvas(parent, width=60, height=30, bg=palette["window"], bd=0, highlightthickness=0, cursor="hand2")
 
             def redraw(_event=None) -> None:
-                selected = variable.get()
-                width = max(control.winfo_width(), 330)
+                active = variable.get()
+                track = palette["copper"] if active else "#53585b"
                 control.delete("all")
-                control.create_rectangle(0, 0, width, 34, fill="#493922" if selected else "#393c3f", outline="")
-                control.create_text(13, 17, text="✓" if selected else "□", fill="#ffd887" if selected else "#d4d2cc", font=("Helvetica Neue", 13, "bold"), anchor="w")
-                control.create_text(38, 17, text=text, fill="#fff0ca" if selected else "#e0ddd7", font=("Helvetica Neue", 10), anchor="w")
+                control.create_oval(2, 3, 28, 27, fill=track, outline=track)
+                control.create_rectangle(15, 3, 45, 27, fill=track, outline=track)
+                control.create_oval(32, 3, 58, 27, fill=track, outline=track)
+                knob_x = 45 if active else 15
+                control.create_oval(knob_x - 9, 6, knob_x + 9, 24, fill="#1c1e20" if active else "#e9e6df", outline="")
 
-            def toggle(_event=None) -> None:
+            def choose(_event=None) -> None:
                 variable.set(not variable.get())
                 redraw()
 
-            control.bind("<Configure>", redraw)
-            control.bind("<Button-1>", toggle)
-            control.pack(fill="x", pady=(7, 0))
-            control.after_idle(redraw)
+            control.bind("<Button-1>", choose)
+            redraw()
+            control.pack(side=side)
             return control
 
-        def segments(parent: tk.Frame, values: tuple[str, ...], variable: tk.StringVar) -> None:
-            item_width = 62
-            control = tk.Canvas(parent, width=item_width * len(values), height=30, bg="#2d3033", bd=0, highlightthickness=0, cursor="hand2")
+        def segments(parent: tk.Widget, values: tuple[str, ...], variable: tk.StringVar, *, item_width: int = 74) -> tk.Canvas:
+            control = tk.Canvas(parent, width=item_width * len(values), height=34, bg=palette["window"], bd=0, highlightthickness=0, cursor="hand2")
 
             def redraw(_event=None) -> None:
                 control.delete("all")
                 for index, choice in enumerate(values):
                     selected = variable.get() == choice
                     left = index * item_width
-                    control.create_rectangle(left, 2, left + item_width - 3, 28, fill="#d99a38" if selected else "#4c5053", outline="")
-                    control.create_text(left + (item_width - 3) / 2, 15, text=choice, fill="#1b140b" if selected else "#e8e5de", font=("Helvetica Neue", 9, "bold"))
+                    fill = palette["copper"] if selected else "#34383b"
+                    control.create_rectangle(left, 2, left + item_width - 2, 32, fill=fill, outline=palette["line"])
+                    control.create_text(left + (item_width - 2) / 2, 17, text=choice, fill="#1c140a" if selected else "#f2efe9", font=("Helvetica Neue", 10, "bold"))
 
-            def select(event) -> None:
+            def choose(event) -> None:
                 index = min(len(values) - 1, max(0, event.x // item_width))
                 variable.set(values[index])
                 redraw()
 
-            control.bind("<Button-1>", select)
+            control.bind("<Button-1>", choose)
             redraw()
-            control.pack(side="right")
+            control.pack(side="left")
+            return control
 
-        strategy = section(
-            content,
-            "挑图策略",
-            "决定每组保留的照片数量和优先偏好；无相似连拍的合格独立场景会保留 1 张供复核。",
+        def preference(parent: tk.Widget, text: str, variable: tk.BooleanVar) -> tk.Frame:
+            """Render one scan-friendly preference row with its own switch."""
+            setting = tk.Frame(parent, bg=palette["window"])
+            setting.pack(fill="x")
+            setting_content = tk.Frame(setting, bg=palette["window"])
+            setting_content.pack(fill="x", pady=2)
+            tk.Label(
+                setting_content,
+                text=text,
+                bg=palette["window"],
+                fg="#f2efe9",
+                anchor="w",
+                font=("Helvetica Neue", 11, "bold"),
+            ).pack(side="left", fill="x", expand=True, pady=7)
+            toggle(setting_content, variable, side="right")
+            tk.Frame(setting, bg=palette["line"], height=1).pack(fill="x", pady=(3, 0))
+            return setting
+
+        target_section = section("目标图片数量", "至少保留此数量；达到建议数量后，仍会为场景完整性保留必要照片。")
+        target_section.pack(fill="x")
+        _, target_controls = row(target_section, "交付目标", "把本次交付的最少数量和建议数量一次设清楚。")
+        tk.Label(target_controls, text="至少", bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 10)).pack(side="left", padx=(0, 7))
+        spin(target_controls, self.target).pack(side="left")
+        tk.Label(target_controls, text="～", bg=palette["window"], fg=palette["ink"], font=("Helvetica Neue", 15, "bold")).pack(side="left", padx=10)
+        tk.Label(target_controls, text="建议", bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 10)).pack(side="left", padx=(0, 7))
+        spin(target_controls, self.target_max).pack(side="left")
+        tk.Label(target_controls, text="张", bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 10)).pack(side="left", padx=(7, 0))
+        divider(target_section)
+        _, picks_controls = row(target_section, "每组优选张数", "从每组相似图中优先挑出值得复核的照片。")
+        spin(picks_controls, self.picks, width=4, maximum=9).pack(side="left")
+        tk.Label(picks_controls, text="张 / 每组", bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 10)).pack(side="left", padx=(8, 20))
+        tk.Frame(picks_controls, bg=palette["line"], width=1, height=28).pack(side="left", padx=(0, 20))
+        tk.Label(picks_controls, text="图片场景", bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 10)).pack(side="left", padx=(0, 8))
+        ttk.Combobox(picks_controls, textvariable=self.scene_type, values=SCENE_TYPES, state="readonly", width=14, style="Picker.TCombobox").pack(side="left")
+        preferences = tk.Frame(target_section, bg=palette["window"])
+        preferences.pack(fill="x", pady=(10, 0))
+        preference(preferences, "启用 AI 精选", self.ai_selection_enabled)
+        preference(preferences, "优先保留表情自然的人像照片", self.priority_more_faces)
+        preference(preferences, "数量不足时用重复照片补足", self.fill_with_similar)
+        preference(preferences, "保留已手动设置的星级", self.keep_existing_labels)
+
+        quality_section = section("画面质量检测", "自动识别并过滤不符合要求的照片，提升成片质量。")
+        quality_section.pack(fill="x", pady=(20, 0))
+        for index, (label, description, variable, sensitivity) in enumerate((
+            ("闭眼检测", "人像中检测到多数人合眼时，会标记为不佳照片。", self.detect_closed_eyes, None),
+            ("欠曝 / 过曝检测", "检测画面过暗或过亮的照片。", self.detect_exposure, self.exposure_sensitivity),
+            ("模糊检测", "检测因抖动、对焦不准等造成的模糊照片。", self.detect_blur, self.blur_sensitivity),
+        )):
+            _, controls = row(quality_section, label, description)
+            toggle(controls, variable)
+            if sensitivity is not None:
+                tk.Frame(controls, bg=palette["line"], width=1, height=26).pack(side="left", padx=(13, 15))
+                tk.Label(controls, text="敏感度", bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 9)).pack(side="left", padx=(0, 10))
+                segments(controls, ("弱", "标准", "强"), sensitivity)
+            if index < 2:
+                divider(quality_section)
+
+        duplicate_section = section("相似图处理", "识别相似的连拍或重复照片，并保留最值得复核的几张。")
+        duplicate_section.pack(fill="x", pady=(20, 0))
+        _, duplicate_controls = row(duplicate_section, "相似图聚类", "按连拍相似度自动分组，再保留最佳候选。")
+        toggle(duplicate_controls, self.detect_duplicates)
+        divider(duplicate_section)
+        _, similarity_controls = row(
+            duplicate_section,
+            "分组严格度",
+            "严格只合并几乎同一画面的连拍；宽松会把姿势或构图略有变化的连拍也归为一组。",
         )
-        strategy.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 12))
-        scene_line = row(strategy, "图片场景")
-        ttk.Combobox(scene_line, textvariable=self.scene_type, values=("通用", "婚礼", "人像写真", "活动纪实", "儿童与家庭"), state="readonly", width=15, style="Picker.TCombobox").pack(side="right")
-        ai_line = row(strategy, "启用 AI 精选", "根据画面质量和相似度提供优选建议。")
-        switch(ai_line, self.ai_selection_enabled)
-        target_line = row(
-            strategy,
-            "目标图片数量",
-            "至少保留此数量；达到建议数量后，仍会为场景完整性保留必要照片。",
-        )
-        target_inputs = tk.Frame(target_line, bg="#2d3033")
-        target_inputs.pack(side="right", padx=(10, 0))
-        tk.Label(target_inputs, text="至少", bg="#2d3033", fg="#bdb9b1", font=("Helvetica Neue", 9)).pack(side="left", padx=(0, 4))
-        tk.Entry(
-            target_inputs,
-            textvariable=self.target,
-            width=5,
-            bg="#faf9f6",
-            fg="#151515",
-            insertbackground="#151515",
-            highlightthickness=1,
-            highlightbackground="#c9c6bf",
-            highlightcolor="#d99a38",
-            relief="flat",
-            justify="center",
-            font=("Helvetica Neue", 10),
-        ).pack(side="left")
-        tk.Label(target_inputs, text="～", bg="#2d3033", fg="#e8e5de", font=("Helvetica Neue", 11, "bold")).pack(side="left", padx=4)
-        tk.Entry(
-            target_inputs,
-            textvariable=self.target_max,
-            width=5,
-            bg="#faf9f6",
-            fg="#151515",
-            insertbackground="#151515",
-            highlightthickness=1,
-            highlightbackground="#c9c6bf",
-            highlightcolor="#d99a38",
-            relief="flat",
-            justify="center",
-            font=("Helvetica Neue", 10),
-        ).pack(side="left")
-        tk.Label(target_inputs, text="张", bg="#2d3033", fg="#bdb9b1", font=("Helvetica Neue", 9)).pack(side="left", padx=(4, 0))
-        picks_line = row(strategy, "每组优选张数")
-        ttk.Combobox(picks_line, textvariable=self.picks, values=tuple(str(value) for value in range(1, 10)), state="readonly", width=4, style="Picker.TCombobox").pack(side="right")
-        tk.Label(picks_line, text="张 / 每组", bg="#2d3033", fg="#bdb9b1", font=("Helvetica Neue", 10)).pack(side="right", padx=(0, 7))
-        check(strategy, "优先保留表情自然的人像照片", self.priority_more_faces)
-        check(strategy, "精选数量不足时用重复照片补足", self.fill_with_similar)
-        check(strategy, "保留已手动设置的星级", self.keep_existing_labels)
+        segments(similarity_controls, ("严格", "标准", "宽松"), self.duplicate_similarity, item_width=90)
+        divider(duplicate_section)
+        _, keep_controls = row(duplicate_section, "每组重复图片精选张数", "每组相似图中保留供复核的最佳照片数量。")
+        spin(keep_controls, self.keep_per_duplicate, width=4, maximum=99).pack(side="left")
+        tk.Label(keep_controls, text="张（可输入 1–99）", bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 10)).pack(side="left", padx=(8, 0))
 
-        detect = section(content, "检测规则", "开启的项目会参与本次 AI 分析，未开启的项目交给人工复核。")
-        detect.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 12))
-        eye_line = row(detect, "闭眼检测", "大笑和多人合影会保留给人工复核。")
-        switch(eye_line, self.detect_closed_eyes)
-        exposure_line = row(detect, "欠曝 / 过曝检测")
-        switch(exposure_line, self.detect_exposure)
-        exposure_picker = tk.Frame(detect, bg="#2d3033")
-        exposure_picker.pack(fill="x", pady=(6, 0))
-        tk.Label(exposure_picker, text="敏感度", bg="#2d3033", fg="#bdb9b1", font=("Helvetica Neue", 9)).pack(side="left")
-        segments(exposure_picker, ("弱", "标准", "强"), self.exposure_sensitivity)
-        blur_line = row(detect, "模糊检测", "至少一张人脸清晰时，不会因同组其他照片模糊而误判。")
-        switch(blur_line, self.detect_blur)
-        blur_picker = tk.Frame(detect, bg="#2d3033")
-        blur_picker.pack(fill="x", pady=(6, 0))
-        tk.Label(blur_picker, text="敏感度", bg="#2d3033", fg="#bdb9b1", font=("Helvetica Neue", 9)).pack(side="left")
-        segments(blur_picker, ("弱", "标准", "强"), self.blur_sensitivity)
+        # Events target the embedded frame's labels and controls, rather than
+        # the surrounding canvas.  Bind them recursively so the wheel works
+        # wherever the pointer is in the settings form, including on a switch
+        # or an input field.
+        def bind_form_wheel(widget: tk.Widget) -> None:
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                widget.bind(sequence, scroll_form, add="+")
+            for child in widget.winfo_children():
+                bind_form_wheel(child)
 
-        duplicate = section(content, "重复照片", "相似图会先聚类，再保留最值得复核的几张。")
-        duplicate.grid(row=1, column=0, columnspan=2, sticky="ew")
-        duplicate_line = row(duplicate, "相似图聚类")
-        switch(duplicate_line, self.detect_duplicates)
-        similarity_line = tk.Frame(duplicate, bg="#2d3033")
-        similarity_line.pack(fill="x", pady=(8, 0))
-        tk.Label(similarity_line, text="相似度", bg="#2d3033", fg="#bdb9b1", font=("Helvetica Neue", 9)).pack(side="left")
-        segments(similarity_line, ("重复", "标准", "相似"), self.duplicate_similarity)
-        keep_line = row(duplicate, "每组重复图片精选数")
-        ttk.Combobox(
-            keep_line,
-            textvariable=self.keep_per_duplicate,
-            values=("1", "2", "3"),
-            state="normal",
-            width=4,
-            style="Picker.TCombobox",
-        ).pack(side="right")
-        tk.Label(
-            keep_line,
-            text="张（可输入 1–99）",
-            bg="#2d3033",
-            fg="#bdb9b1",
-            font=("Helvetica Neue", 9),
-        ).pack(side="right", padx=(0, 7))
+        bind_form_wheel(content)
 
-        actions = tk.Frame(dialog, bg="#25282a", highlightbackground="#42464a", highlightthickness=1)
+        actions = tk.Frame(dialog, bg=palette["header"], highlightbackground=palette["line"], highlightthickness=1)
         actions.grid(row=2, column=0, sticky="ew")
-        ttk.Button(actions, text="恢复默认", command=self._reset_picker_settings).pack(side="left", padx=18, pady=14)
-        ttk.Button(actions, text="取消", command=dialog.destroy).pack(side="right", padx=(6, 18), pady=14)
+        ttk.Button(actions, text="恢复默认", style="PickerQuiet.TButton", command=self._reset_picker_settings).pack(side="left", padx=28, pady=12)
+        ttk.Button(actions, text="取消", style="PickerQuiet.TButton", command=dialog.destroy).pack(side="right", padx=(8, 28), pady=12)
 
         def confirm_rules() -> None:
             try:
@@ -2418,7 +2608,7 @@ class EventCullApp(TkinterDnD.Tk):
             self._refresh_picker_confirmation_ui()
             dialog.destroy()
 
-        ttk.Button(actions, text="确认挑图规则", style="Primary.TButton", command=confirm_rules).pack(side="right", pady=14)
+        ttk.Button(actions, text="确认挑图规则", style="PickerPrimary.TButton", command=confirm_rules).pack(side="right", pady=12)
 
     def _build_menubar(self) -> None:
         """Provide explicit localized labels instead of Tk's English defaults."""
@@ -2822,6 +3012,46 @@ class EventCullApp(TkinterDnD.Tk):
         )
 
     @staticmethod
+    def _analysis_header_status_text(
+        current: int,
+        total: int,
+        eta: str,
+        *,
+        language: str,
+    ) -> str:
+        """Keep task progress concise enough for the top-right status slot."""
+        progress = (
+            f"AI 分析 {current} / {total}"
+            if language == "zh"
+            else f"AI analysis {current} / {total}"
+        )
+        return f"{progress} · {eta}" if eta else progress
+
+    def _refresh_analysis_header_status(self) -> None:
+        """Reflect current analysis progress in the contextual task header."""
+        self.task_import_summary.set(
+            self._analysis_header_status_text(
+                self.analysis_progress_current,
+                self.analysis_progress_total,
+                self.eta_text.get(),
+                language=self.language,
+            )
+        )
+
+    def _set_analysis_controls_visible(self, visible: bool) -> None:
+        """Only expose pause and stop while there is an analysis to control."""
+        if not hasattr(self, "pause_button") or not hasattr(self, "stop_button"):
+            return
+        if visible:
+            if not self.pause_button.winfo_manager():
+                self.pause_button.pack(side="left", padx=(8, 4))
+            if not self.stop_button.winfo_manager():
+                self.stop_button.pack(side="left")
+            return
+        self.pause_button.pack_forget()
+        self.stop_button.pack_forget()
+
+    @staticmethod
     def _merge_unique_paths(existing: list[Path], added: list[Path]) -> tuple[list[Path], int]:
         """Append real file paths in order while suppressing repeat imports."""
         merged = list(existing)
@@ -2954,6 +3184,8 @@ end run
         self.progress.configure(mode="determinate", maximum=1, value=0)
         self.progress_text.set("")
         self.eta_text.set("")
+        self.analysis_progress_current = 0
+        self.analysis_progress_total = 0
         self.xmp_notice.set(self.lr_instructions)
         self._set_xmp_result()
         self.status.set(self.t["safe_note"])
@@ -2962,6 +3194,7 @@ end run
         self.restore_button.configure(state="disabled")
         self.export_log_button.configure(state="disabled")
         self.task_title.set("新建筛选任务 · 等待导入")
+        self._set_analysis_controls_visible(False)
         self._refresh_picker_confirmation_ui()
         self._schedule_grid_render()
         self.refresh_lightroom_guard(schedule_next=False)
@@ -3485,12 +3718,16 @@ end run
         self.analysis_completed_at = None
         self.current_log_path = None
         self.eta_text.set(self.t["eta_estimating"])
+        self.analysis_progress_current = 0
+        self.analysis_progress_total = len(self.imported_files)
+        self._refresh_analysis_header_status()
         self.analyze_button.configure(state="disabled")
         self.picker_settings_button.configure(state="disabled")
         self.new_task_button.configure(state="disabled")
         self.choose_files_button.configure(state="disabled")
         self.choose_button.configure(state="disabled")
         self.calibration_button.configure(state="disabled")
+        self._set_analysis_controls_visible(True)
         self.pause_button.configure(image=self.pause_icon, state="normal")
         self.stop_button.configure(state="normal")
         self.progress.configure(mode="indeterminate", maximum=100, value=0)
@@ -3517,6 +3754,7 @@ end run
             self.is_paused = False
             self.pause_button.configure(image=self.pause_icon)
             self.status.set(self.t["analyzing"])
+            self._refresh_analysis_header_status()
         else:
             self.pause_event.set()
             self.is_paused = True
@@ -3524,6 +3762,14 @@ end run
             self.pause_button.configure(image=self.resume_icon)
             self.status.set(self.t["paused"])
             self.eta_text.set(self.t["eta_paused"])
+            if self.language == "zh":
+                self.task_import_summary.set(
+                    f"AI 分析已暂停 · {self.analysis_progress_current} / {self.analysis_progress_total}"
+                )
+            else:
+                self.task_import_summary.set(
+                    f"AI analysis paused · {self.analysis_progress_current} / {self.analysis_progress_total}"
+                )
 
     def stop_analysis(self) -> None:
         self.cancel_event.set()
@@ -3531,6 +3777,14 @@ end run
         self.pause_button.configure(state="disabled")
         self.stop_button.configure(state="disabled")
         self.status.set(self.t["stopping"])
+        if self.language == "zh":
+            self.task_import_summary.set(
+                f"正在停止分析 · {self.analysis_progress_current} / {self.analysis_progress_total}"
+            )
+        else:
+            self.task_import_summary.set(
+                f"Stopping analysis · {self.analysis_progress_current} / {self.analysis_progress_total}"
+            )
 
     @staticmethod
     def _restore_manual_ratings(
@@ -3696,8 +3950,17 @@ end run
         self._refresh_picker_confirmation_ui()
         self.pause_button.configure(state="disabled")
         self.stop_button.configure(state="disabled")
+        self._set_analysis_controls_visible(False)
         self.status.set(self.t["cancelled"])
         self.eta_text.set("")
+        if self.language == "zh":
+            self.task_import_summary.set(
+                f"分析已中止 · {self.analysis_progress_current} / {self.analysis_progress_total}"
+            )
+        else:
+            self.task_import_summary.set(
+                f"Analysis stopped · {self.analysis_progress_current} / {self.analysis_progress_total}"
+            )
 
     @staticmethod
     def _remaining_seconds(elapsed_seconds: float, current: int, total: int) -> int | None:
@@ -3733,6 +3996,9 @@ end run
         self.progress.configure(mode="determinate", maximum=max(total, 1), value=current)
         self.progress_text.set(self.t["progress"].format(current=current, total=total, name=path.name))
         self._update_eta(current, total)
+        self.analysis_progress_current = current
+        self.analysis_progress_total = total
+        self._refresh_analysis_header_status()
 
     def update_calibration_progress(self, current: int, total: int, path: Path, *, apply: bool) -> None:
         self.progress.stop()
@@ -3894,6 +4160,13 @@ end run
         self._refresh_picker_confirmation_ui()
         self.pause_button.configure(state="disabled")
         self.stop_button.configure(state="disabled")
+        self._set_analysis_controls_visible(False)
+        selected = counts[1] + counts[2] + counts[3]
+        featured = self._output_rating(3)
+        if self.language == "zh":
+            self.task_import_summary.set(f"已选 {selected} 张 · {featured}★ 精选 {counts[3]} 张")
+        else:
+            self.task_import_summary.set(f"Selected {selected} · {counts[3]} featured {featured}★")
         self.export_log_button.configure(state="normal")
         self.refresh_lightroom_guard(schedule_next=False)
         if results:
@@ -3913,6 +4186,11 @@ end run
             "frontal_faces": item.frontal_face_count,
             "smiling_faces": item.smiling_face_count,
             "open_eye_faces": item.open_eye_face_count,
+            "face_coverage": round(item.face_coverage, 4),
+            "closest_face_distance": None if item.closest_face_distance is None else round(item.closest_face_distance, 3),
+            "eye_detection_mode": item.eye_detection_mode,
+            "eye_penalty": round(item.eye_penalty, 2),
+            "must_keep_id": item.must_keep_id,
             "median_luminance": None if item.median_luminance is None else round(item.median_luminance, 2),
             "relative_exposure_ev": None if item.relative_exposure_ev is None else round(item.relative_exposure_ev, 2),
             "calibration_confidence": None if item.calibration_confidence is None else round(item.calibration_confidence, 4),
@@ -3933,8 +4211,8 @@ end run
         }
         target_text = self.target.get().strip()
         return {
-            "version": 4,
-            "selection_policy": "scene-minimum-3plus-dynamic-density-v5-personal-calibration",
+            "version": 5,
+            "selection_policy": "scene-minimum-3plus-dynamic-density-v7-scene-rules",
             "task": {
                 "id": self.current_task_id,
                 "name": self.current_task_name,
@@ -3950,6 +4228,7 @@ end run
                     "min": int(target_text) if target_text else None,
                     "max": int(self.target_max.get()) if self.target_max.get().strip() else None,
                 },
+                "scene_type": self.scene_type.get(),
             },
             "source_folders": sorted({str(path.parent) for path in self.imported_files}),
             "counts": counts,
@@ -3998,7 +4277,8 @@ end run
         fieldnames = [
             "index", "folder", "file", "group", "rating", "xmp_rating", "score",
             "frame_sharpness", "subject_sharpness", "frontal_faces",
-            "smiling_faces", "open_eye_faces", "median_luminance",
+            "smiling_faces", "open_eye_faces", "face_coverage", "closest_face_distance",
+            "eye_detection_mode", "eye_penalty", "must_keep_id", "median_luminance",
             "relative_exposure_ev", "calibration_confidence", "scene_softness_protected", "scene_coverage_protected", "reasons",
         ]
         try:

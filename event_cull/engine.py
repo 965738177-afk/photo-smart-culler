@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import os
+import csv
 import json
 import math
+import re
 import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 from uuid import uuid4
@@ -26,10 +29,20 @@ except ImportError:  # pragma: no cover - setup validation covers this
 
 RAW_EXTENSIONS = {".arw", ".cr2", ".cr3", ".dng", ".nef", ".orf", ".raf", ".rw2"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".heic", ".heif", *RAW_EXTENSIONS}
-ANALYSIS_CACHE_VERSION = 9
+ANALYSIS_CACHE_VERSION = 12
 MAX_ANALYSIS_WORKERS = 8
 _DETECTORS = threading.local()
 _EMOTION_MODEL = Path("event_cull/models/emotion-ferplus-8.onnx")
+_MUST_KEEP_RESOURCES = {
+    "婚礼": Path("event_cull/data/wedding_must_keep_shots.csv"),
+    "通用": Path("event_cull/data/general_must_keep_shots.csv"),
+    "人像写真": Path("event_cull/data/general_must_keep_shots.csv"),
+    "活动纪实": Path("event_cull/data/general_must_keep_shots.csv"),
+    "儿童与家庭": Path("event_cull/data/general_must_keep_shots.csv"),
+    "毕业照": Path("event_cull/data/other_must_keep_shots.csv"),
+    "证件照": Path("event_cull/data/other_must_keep_shots.csv"),
+    "美食": Path("event_cull/data/other_must_keep_shots.csv"),
+}
 MESSAGES = {
     "zh": {
         "blur": "明显虚焦或抖动",
@@ -39,6 +52,13 @@ MESSAGES = {
         "relative_under": "相邻连拍中突然欠曝约 {ev} EV",
         "flash_miss": "相邻连拍中人物肤色突然变暗约 {ev} EV，疑似闪光灯漏闪",
         "closed": "未检测到睁眼，可能是低头或侧脸，请复核",
+        "eye_skip": "人脸过小或角度不明，闭眼不参与评分",
+        "eye_intimate": "亲密互动镜头：闭眼不扣分，优先保留情绪",
+        "eye_group_tolerated": "多人合影：少量闭眼不扣分",
+        "eye_group_closed": "多人合影多数闭眼，建议复核",
+        "must_keep": "必选镜头：{stage} · {name}",
+        "id_face": "证件照：未检测到合格的单人正面脸",
+        "id_eye": "证件照：双眼需清晰睁开并正视镜头",
         "people": "多人正面表情优先：{faces} 张清晰正面脸，{smiles} 张疑似笑脸",
         "people_focus": "人物清晰度低于前景，疑似对焦到前方物体",
         "expression": "多人表情不完整，不作为 3★ 首选",
@@ -59,6 +79,13 @@ MESSAGES = {
         "relative_under": "About {ev} EV darker than adjacent burst frames",
         "flash_miss": "Subject skin is about {ev} EV darker than adjacent burst frames; possible flash misfire",
         "closed": "Open eyes not detected; the subject may be looking down or sideways",
+        "eye_skip": "Face is too small or the angle is uncertain; eye state does not affect scoring",
+        "eye_intimate": "Intimate interaction: closed eyes are not penalized; preserve the emotion",
+        "eye_group_tolerated": "Group portrait: a few closed eyes are not penalized",
+        "eye_group_closed": "Most eyes appear closed in this group portrait; review recommended",
+        "must_keep": "Must-keep shot: {stage} · {name}",
+        "id_face": "ID portrait: one clear frontal face is required",
+        "id_eye": "ID portrait: both eyes must be open and looking at the camera",
         "people": "People priority: {faces} clear frontal faces, {smiles} possible smiles",
         "people_focus": "People appear softer than the foreground; focus may be in front",
         "expression": "Group expressions are incomplete; not a first-choice 3-star frame",
@@ -72,6 +99,26 @@ MESSAGES = {
         "failed": "Could not analyze: {error}",
     },
 }
+
+
+@dataclass(frozen=True)
+class MustKeepShot:
+    """A photographer-labelled scene moment that must survive selection."""
+
+    identifier: str
+    stage: str
+    name: str
+    priority: str
+    special_rule: str
+
+
+@dataclass(frozen=True)
+class EyePolicy:
+    """Confidence-aware eye handling, separate from technical image quality."""
+
+    mode: str
+    penalty: float = 0.0
+    reason_key: str | None = None
 
 
 def _analysis_worker_count(logical_cpus: int | None = None) -> int:
@@ -108,6 +155,7 @@ class AnalysisOptions:
     prefer_people: bool = True
     max_duplicate_picks_per_group: int | None = None
     fill_with_similar: bool = False
+    scene_type: str = "通用"
     language: str = "zh"
 
 
@@ -127,12 +175,17 @@ class PhotoResult:
     frontal_face_count: int = 0
     smiling_face_count: int = 0
     open_eye_face_count: int = 0
+    face_coverage: float = 0.0
+    closest_face_distance: float | None = None
+    eye_detection_mode: str = "standard"
+    eye_penalty: float = 0.0
     median_luminance: float | None = None
     subject_luminance: float | None = None
     relative_exposure_ev: float | None = None
     calibration_confidence: float | None = None
     scene_protected: bool = False
     coverage_protected: bool = False
+    must_keep_id: str | None = None
 
     @property
     def display_name(self) -> str:
@@ -303,12 +356,162 @@ def _message(options: AnalysisOptions, key: str, **values: str) -> str:
     return MESSAGES.get(options.language, MESSAGES["en"])[key].format(**values)
 
 
+_CONTEXTUAL_EYE_SCENES = {
+    "通用", "婚礼", "人像写真", "活动纪实", "儿童与家庭", "毕业照"
+}
+
+
+def _has_scene_rules(options: AnalysisOptions) -> bool:
+    return options.scene_type in _MUST_KEEP_RESOURCES
+
+
+def _uses_contextual_eye_policy(options: AnalysisOptions) -> bool:
+    return options.scene_type in _CONTEXTUAL_EYE_SCENES
+
+
+def _scene_blur_floor(options: AnalysisOptions) -> float:
+    """Respect the subject-specific sharpness tolerance of the selected scene."""
+    if options.scene_type == "美食":
+        # Macro food shots and steam naturally soften non-subject areas.
+        return options.blur_floor * 0.72
+    if options.scene_type == "证件照":
+        return options.blur_floor * 1.18
+    return options.blur_floor
+
+
+def _resource_path(resource: Path) -> Path:
+    """Locate a packaged resource both from source and a frozen app bundle."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    return base / resource
+
+
+@lru_cache(maxsize=None)
+def _must_keep_shots(scene_type: str) -> tuple[MustKeepShot, ...]:
+    """Load only the whitelist for the active scene from app-bundled data."""
+    resource = _MUST_KEEP_RESOURCES.get(scene_type)
+    if resource is None:
+        return ()
+    try:
+        with _resource_path(resource).open(
+            encoding="utf-8-sig", newline=""
+        ) as stream:
+            rows = csv.reader(stream)
+            next(rows, None)
+            # The supplied keywords deliberately include ordinary commas.  The
+            # stable fields are the first three and final two columns; retaining
+            # that shape keeps the whitelist usable without silently assigning
+            # a keyword fragment as a priority.
+            return tuple(
+                MustKeepShot(
+                    identifier=row[0].strip(),
+                    stage=row[1].strip(),
+                    name=row[2].strip(),
+                    priority=row[-2].strip().upper(),
+                    special_rule=row[-1].strip(),
+                )
+                for row in rows
+                if len(row) >= 5
+                and row[0].strip()
+                and row[2].strip()
+                and (resource.name == "wedding_must_keep_shots.csv" or row[1].strip() == scene_type)
+            )
+    except (OSError, UnicodeDecodeError, csv.Error, KeyError):
+        # The core culler must remain usable when a custom build accidentally
+        # omits this optional policy resource.
+        return ()
+
+
+def _must_keep_match(path: Path, options: AnalysisOptions) -> MustKeepShot | None:
+    """Match deliberate folder/file labels, never guess semantic content from a name.
+
+    Camera counters do not reveal whether a frame is a dish, a kiss, or a
+    diploma handover.
+    A rule therefore activates only when the imported path already carries the
+    photographer's stage/shot label (for example ``C9 仪式之吻``). Unlabelled
+    folders still receive the active scene's confidence-aware base policy.
+    """
+    label = path.as_posix().casefold()
+    for rule in _must_keep_shots(options.scene_type):
+        if rule.name.casefold() in label:
+            return rule
+        identifier = re.escape(rule.identifier.casefold())
+        if re.search(rf"(?<![a-z0-9]){identifier}(?![a-z0-9])", label):
+            return rule
+    return None
+
+
+def _wedding_must_keep_shots() -> tuple[MustKeepShot, ...]:
+    """Compatibility seam for historical integrations and focused tests."""
+    return _must_keep_shots("婚礼")
+
+
+def _eye_policy(
+    options: AnalysisOptions,
+    face_count: int,
+    face_coverage: float,
+    open_eye_count: int,
+    closest_face_distance: float | None,
+) -> EyePolicy:
+    """Apply eye detection only where the measurement is trustworthy.
+
+    Tiny/distant faces, profile-like evidence, intimate interactions, and group
+    shots are not judged as if they were a single frontal portrait. It never
+    converts an eye finding into a technical hard reject except in the explicit
+    certificate-photo mode, where open eyes are a stated validity requirement.
+    """
+    if not options.detect_closed_eyes:
+        return EyePolicy("disabled")
+
+    if options.scene_type == "美食":
+        return EyePolicy("food_no_eye_check")
+
+    if options.scene_type == "证件照":
+        if face_count != 1 or face_coverage < 0.07 or face_coverage > 0.65:
+            return EyePolicy("id_face_invalid", penalty=60.0, reason_key="id_face")
+        if open_eye_count != 1:
+            return EyePolicy("id_eye_invalid", penalty=60.0, reason_key="id_eye")
+        return EyePolicy("id_valid")
+
+    if options.scene_type == "儿童与家庭":
+        # Children naturally blink, laugh with closed eyes, and look away;
+        # expression is useful, but eye state must not suppress the moment.
+        return EyePolicy("family_eye_tolerant")
+
+    if not _uses_contextual_eye_policy(options):
+        if face_count == 1 and open_eye_count == 0:
+            return EyePolicy("standard", penalty=12.0, reason_key="closed")
+        if face_count >= 2 and 0 < open_eye_count < face_count:
+            return EyePolicy("standard", reason_key="expression")
+        return EyePolicy("standard")
+
+    mode_prefix = "scene"
+    if face_count == 0:
+        return EyePolicy(f"{mode_prefix}_no_face")
+    if face_coverage < 0.05:
+        return EyePolicy(f"{mode_prefix}_small_face", reason_key="eye_skip")
+    if closest_face_distance is not None and closest_face_distance < 1.5:
+        return EyePolicy(f"{mode_prefix}_intimate", reason_key="eye_intimate")
+    if face_count >= 3:
+        if open_eye_count == 0:
+            return EyePolicy(f"{mode_prefix}_group_all_closed", penalty=8.0, reason_key="eye_group_closed")
+        if open_eye_count < face_count:
+            return EyePolicy(f"{mode_prefix}_group", reason_key="eye_group_tolerated")
+        return EyePolicy(f"{mode_prefix}_group")
+    if open_eye_count == 0:
+        # One or two large, frontal faces with no eye evidence are the one
+        # contextual case where the detector is strong enough to matter.
+        return EyePolicy(f"{mode_prefix}_portrait", penalty=24.0, reason_key="closed")
+    return EyePolicy(f"{mode_prefix}_portrait")
+
+
 def _face_metrics(
     gray: np.ndarray,
     options: AnalysisOptions,
     global_sharpness: float | None = None,
-) -> tuple[list[str], float | None, int, int, int, float | None]:
-    """Return eye hints, subject detail, expression counts, and face luminance."""
+) -> tuple[
+    list[str], float | None, int, int, int, float | None, float, float | None, EyePolicy
+]:
+    """Return face evidence plus a confidence-aware eye policy."""
     if not hasattr(_DETECTORS, "faces"):
         _DETECTORS.faces = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
         _DETECTORS.eyes = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml")
@@ -387,6 +590,22 @@ def _face_metrics(
         for rect, sharpness in zip(distinct, sharpness_values)
         if sharpness >= options.blur_floor * 0.7
     ]
+    image_area = max(1, gray.shape[0] * gray.shape[1])
+    face_coverage = sum(width * height for _x, _y, width, height in distinct) / image_area
+    closest_face_distance: float | None = None
+    clear_rectangles = [rect for rect, _sharpness in clear_faces]
+    for index, (left_x, left_y, left_width, left_height) in enumerate(clear_rectangles):
+        left_center = (left_x + left_width / 2, left_y + left_height / 2)
+        for right_x, right_y, right_width, right_height in clear_rectangles[index + 1 :]:
+            right_center = (right_x + right_width / 2, right_y + right_height / 2)
+            centre_distance = math.hypot(
+                left_center[0] - right_center[0], left_center[1] - right_center[1]
+            )
+            face_width = max(1.0, (left_width + right_width) / 2)
+            ratio = centre_distance / face_width
+            closest_face_distance = (
+                ratio if closest_face_distance is None else min(closest_face_distance, ratio)
+            )
     smiling_face_count = 0
     open_eye_face_count = 0
     smile_candidates = sorted(
@@ -421,15 +640,26 @@ def _face_metrics(
         emotion_smile = not haar_smile and happiness_probability(face_crop) >= 0.85
         if haar_smile or emotion_smile:
             smiling_face_count += 1
+    if _uses_contextual_eye_policy(options) and distinct and len(clear_faces) != len(distinct):
+        # A partial/profile-like or soft detection cannot reliably distinguish
+        # a blink from an obscured eye. Let quality and manual review decide.
+        eye_policy = EyePolicy("scene_uncertain", reason_key="eye_skip")
+    else:
+        eye_policy = _eye_policy(
+            options,
+            len(clear_faces),
+            face_coverage,
+            open_eye_face_count,
+            closest_face_distance,
+        )
     reasons: list[str] = []
-    if options.detect_closed_eyes and len(distinct) == 1 and open_eye_face_count == 0:
-        reasons.append(_message(options, "closed"))
-    if (
-        options.detect_closed_eyes
-        and len(clear_faces) >= 2
-        and 0 < open_eye_face_count < len(clear_faces)
+    # No-face scenes are expected for rings, flowers, venues, and wide shots;
+    # avoid filling every card with an unnecessary explanation.  A detected
+    # but too-small face remains visible so the photographer can audit it.
+    if eye_policy.reason_key and not (
+        eye_policy.reason_key == "eye_skip" and len(clear_faces) == 0
     ):
-        reasons.append(_message(options, "expression"))
+        reasons.append(_message(options, eye_policy.reason_key))
     return (
         reasons,
         subject_sharpness,
@@ -437,6 +667,9 @@ def _face_metrics(
         smiling_face_count,
         open_eye_face_count,
         subject_luminance,
+        face_coverage,
+        closest_face_distance,
+        eye_policy,
     )
 
 
@@ -507,6 +740,7 @@ def _cache_signature(source: Path, options: AnalysisOptions) -> dict:
         "detect_closed_eyes": options.detect_closed_eyes,
         "detect_blur": options.detect_blur,
         "detect_exposure": options.detect_exposure,
+        "scene_type": options.scene_type,
         "language": options.language,
     }
 
@@ -539,6 +773,14 @@ def _result_from_cache(photo: Path, pairs: list[Path], record: dict, signature: 
             frontal_face_count=int(record.get("frontal_face_count", 0)),
             smiling_face_count=int(record.get("smiling_face_count", 0)),
             open_eye_face_count=int(record.get("open_eye_face_count", 0)),
+            face_coverage=float(record.get("face_coverage", 0.0)),
+            closest_face_distance=(
+                float(record["closest_face_distance"])
+                if record.get("closest_face_distance") is not None
+                else None
+            ),
+            eye_detection_mode=str(record.get("eye_detection_mode") or "standard"),
+            eye_penalty=float(record.get("eye_penalty", 0.0)),
             median_luminance=(
                 float(record["median_luminance"])
                 if record.get("median_luminance") is not None
@@ -547,6 +789,11 @@ def _result_from_cache(photo: Path, pairs: list[Path], record: dict, signature: 
             subject_luminance=(
                 float(record["subject_luminance"])
                 if record.get("subject_luminance") is not None
+                else None
+            ),
+            must_keep_id=(
+                str(record["must_keep_id"])
+                if record.get("must_keep_id")
                 else None
             ),
         )
@@ -567,9 +814,55 @@ def _cache_record(result: PhotoResult, signature: dict) -> dict:
         "frontal_face_count": result.frontal_face_count,
         "smiling_face_count": result.smiling_face_count,
         "open_eye_face_count": result.open_eye_face_count,
+        "face_coverage": result.face_coverage,
+        "closest_face_distance": result.closest_face_distance,
+        "eye_detection_mode": result.eye_detection_mode,
+        "eye_penalty": result.eye_penalty,
         "median_luminance": result.median_luminance,
         "subject_luminance": result.subject_luminance,
+        "must_keep_id": result.must_keep_id,
     }
+
+
+def _apply_must_keep_rule(item: PhotoResult, options: AnalysisOptions) -> None:
+    """Attach a whitelist rule when an imported path carries its shot label."""
+    if not _has_scene_rules(options):
+        return
+    rule = _must_keep_match(item.path, options)
+    if rule is None:
+        return
+    item.must_keep_id = rule.identifier
+    if _must_keep_rule_exempts_eye_penalty(rule):
+        item.eye_detection_mode = "scene_whitelist_eye_exempt"
+        item.eye_penalty = 0.0
+        eye_reasons = {
+            _message(options, "closed"),
+            _message(options, "expression"),
+            _message(options, "eye_skip"),
+            _message(options, "eye_intimate"),
+            _message(options, "eye_group_tolerated"),
+            _message(options, "eye_group_closed"),
+        }
+        item.reasons = [reason for reason in item.reasons if reason not in eye_reasons]
+    reason = _message(options, "must_keep", stage=rule.stage, name=rule.name)
+    if reason not in item.reasons:
+        item.reasons.append(reason)
+
+
+def _must_keep_priority(item: PhotoResult, options: AnalysisOptions) -> int:
+    rule = next(
+        (candidate for candidate in _must_keep_shots(options.scene_type) if candidate.identifier == item.must_keep_id),
+        None,
+    )
+    return {"S": 3, "A": 2, "B": 1}.get(rule.priority if rule else "", 0)
+
+
+def _must_keep_rule_exempts_eye_penalty(rule: MustKeepShot) -> bool:
+    """Return whether the supplied rule explicitly makes eye state unreliable."""
+    return any(
+        phrase in rule.special_rule
+        for phrase in ("闭眼豁免", "不扣分", "闭眼正常", "跳过闭眼", "不跑闭眼", "容忍")
+    )
 
 
 def _analyze(path: Path, pairs: list[Path], options: AnalysisOptions) -> PhotoResult:
@@ -581,6 +874,7 @@ def _analyze(path: Path, pairs: list[Path], options: AnalysisOptions) -> PhotoRe
     sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     highlights = float(np.mean(gray >= 250))
     shadows = float(np.mean(gray <= 5))
+    metrics = _face_metrics(gray, options, sharpness)
     (
         face_reasons,
         subject_sharpness,
@@ -588,11 +882,26 @@ def _analyze(path: Path, pairs: list[Path], options: AnalysisOptions) -> PhotoRe
         smiling_faces,
         open_eye_faces,
         subject_luminance,
-    ) = _face_metrics(gray, options, sharpness)
+    ) = metrics[:6]
+    # Focused performance tests and third-party integrations historically
+    # stubbed the six original values.  Keep that seam working while the
+    # built-in detector supplies richer confidence evidence.
+    if len(metrics) >= 9:
+        face_coverage, closest_face_distance, eye_policy = metrics[6:9]
+    else:
+        face_coverage = 1.0 if frontal_faces else 0.0
+        closest_face_distance = None
+        eye_policy = _eye_policy(
+            options,
+            frontal_faces,
+            face_coverage,
+            open_eye_faces,
+            closest_face_distance,
+        )
     median_luminance = float(np.median(gray))
     effective_sharpness = _effective_sharpness(sharpness, subject_sharpness)
     reasons: list[str] = []
-    if options.detect_blur and effective_sharpness < options.blur_floor:
+    if options.detect_blur and effective_sharpness < _scene_blur_floor(options):
         reasons.append(_message(options, "blur"))
     severe_overexposure = highlights >= options.severe_clip_fraction and (
         median_luminance >= 205
@@ -618,7 +927,28 @@ def _analyze(path: Path, pairs: list[Path], options: AnalysisOptions) -> PhotoRe
     quality += (1 - min(highlights + shadows, 0.5) / 0.5) * 25
     if options.prefer_people:
         quality += _people_priority_bonus(frontal_faces, smiling_faces)
-    return PhotoResult(path, pairs, score=quality, reasons=reasons, sharpness=sharpness, highlight_clip=highlights, shadow_clip=shadows, perceptual_hash=_dhash(gray), subject_sharpness=subject_sharpness, frontal_face_count=frontal_faces, smiling_face_count=smiling_faces, open_eye_face_count=open_eye_faces, median_luminance=median_luminance, subject_luminance=subject_luminance)
+    result = PhotoResult(
+        path,
+        pairs,
+        score=quality,
+        reasons=reasons,
+        sharpness=sharpness,
+        highlight_clip=highlights,
+        shadow_clip=shadows,
+        perceptual_hash=_dhash(gray),
+        subject_sharpness=subject_sharpness,
+        frontal_face_count=frontal_faces,
+        smiling_face_count=smiling_faces,
+        open_eye_face_count=open_eye_faces,
+        face_coverage=face_coverage,
+        closest_face_distance=closest_face_distance,
+        eye_detection_mode=eye_policy.mode,
+        eye_penalty=eye_policy.penalty,
+        median_luminance=median_luminance,
+        subject_luminance=subject_luminance,
+    )
+    _apply_must_keep_rule(result, options)
+    return result
 
 
 def _analyze_cached(
@@ -732,10 +1062,12 @@ def _people_focus_issue(item: PhotoResult, options: AnalysisOptions) -> bool:
     )
 
 
-def _group_expression_issue(item: PhotoResult) -> bool:
+def _group_expression_issue(item: PhotoResult, options: AnalysisOptions | None = None) -> bool:
     # Treat a confirmed mixed result as risky.  When the eye cascade finds no
     # eyes at all, keep it ambiguous so low-head and atmospheric frames survive.
     # A natural smile is a positive moment even when someone else looks away.
+    if item.eye_detection_mode.startswith("scene_"):
+        return False
     return (
         item.frontal_face_count >= 2
         and item.smiling_face_count == 0
@@ -746,7 +1078,19 @@ def _group_expression_issue(item: PhotoResult) -> bool:
 def _focus_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
     return options.detect_blur and item.sharpness is not None and _effective_sharpness(
         item.sharpness, item.subject_sharpness
-    ) < options.blur_floor
+    ) < _scene_blur_floor(options)
+
+
+def _id_photo_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
+    """Reject the measurable hard requirements of a certificate-photo frame."""
+    if options.scene_type != "证件照":
+        return False
+    return (
+        item.frontal_face_count != 1
+        or item.face_coverage < 0.07
+        or item.face_coverage > 0.65
+        or item.open_eye_face_count != 1
+    )
 
 
 def _protect_coherent_soft_scene(
@@ -785,7 +1129,7 @@ def _has_hard_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
     focus_fault = _focus_fault(item, options) and not (
         item.scene_protected or item.coverage_protected
     )
-    return focus_fault or _has_exposure_fault(item, options)
+    return focus_fault or _has_exposure_fault(item, options) or _id_photo_fault(item, options)
 
 
 def _has_exposure_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
@@ -866,15 +1210,16 @@ def _protect_scene_minimum(
 
 
 def _ranking_score(item: PhotoResult, options: AnalysisOptions) -> float:
-    """Rank on image quality; a missing-eye hint is informational only."""
+    """Rank on image quality; wedding eye penalties require reliable evidence."""
     focus_penalty = 35.0 if _people_focus_issue(item, options) else 0.0
-    expression_penalty = 18.0 if _group_expression_issue(item) else 0.0
-    return item.score - focus_penalty - expression_penalty
+    expression_penalty = 18.0 if _group_expression_issue(item, options) else 0.0
+    eye_penalty = item.eye_penalty if _has_scene_rules(options) else 0.0
+    return item.score - focus_penalty - expression_penalty - eye_penalty
 
 
 def _review_priority(item: PhotoResult, options: AnalysisOptions) -> float:
     """Prefer an open-eyed alternative without hard-rejecting ambiguous poses."""
-    closed_eye_penalty = (
+    closed_eye_penalty = item.eye_penalty if _has_scene_rules(options) and item.eye_penalty else (
         12.0
         if item.frontal_face_count > 0 and _message(options, "closed") in item.reasons
         else 0.0
@@ -1101,6 +1446,7 @@ def _assign_tiered_ratings(
         for item in group:
             item.group_id = group_id
             item.suggested_rating = 0
+            _apply_must_keep_rule(item, options)
             if not _has_hard_fault(item, options):
                 eligible.append(item)
 
@@ -1148,17 +1494,41 @@ def _assign_tiered_ratings(
                 one_star_or_more.append(item)
                 selected_paths.add(item.path)
 
+    if _has_scene_rules(options):
+        # An explicitly labelled must-keep moment may lift the real total over
+        # the target. This is intentional: target counts guide delivery size,
+        # while the whitelist guards irreplaceable scene beats. Technical
+        # hard faults were removed from ``eligible`` above and remain excluded.
+        selected_paths = {item.path for item in one_star_or_more}
+        for item in sorted(
+            (item for item in eligible if item.must_keep_id),
+            key=lambda candidate: (
+                _must_keep_priority(candidate, options),
+                _review_priority(candidate, options),
+            ),
+            reverse=True,
+        ):
+            if item.path not in selected_paths:
+                one_star_or_more.append(item)
+                selected_paths.add(item.path)
+
     selected_by_group: dict[int, list[PhotoResult]] = {}
     for item in one_star_or_more:
         selected_by_group.setdefault(item.group_id, []).append(item)
 
-    three_target = min((target + 9) // 10, len(one_star_or_more))
+    # Three stars are the photographer's fast first-pass shortlist.  Ten per
+    # cent made that list too sparse to be useful on a real event: many strong
+    # review picks never reached the shortlist even though they were visibly
+    # better than the floor of the selected set.  One fifth leaves room for
+    # 1★/2★ review while surfacing enough genuinely strong candidates.
+    tier_target = max(target, len(one_star_or_more))
+    three_target = min((tier_target + 4) // 5, len(one_star_or_more))
     best_per_group: dict[int, PhotoResult] = {}
     three_candidates = [
         item
         for item in one_star_or_more
         if not _people_focus_issue(item, options)
-        and not _group_expression_issue(item)
+        and not _group_expression_issue(item, options)
     ]
     for item in sorted(
         three_candidates,
@@ -1179,7 +1549,7 @@ def _assign_tiered_ratings(
     ]
     mandatory_two = list({item.path: item for item in [*three_star, *burst_leads]}.values())
     two_target = min(
-        max((target + 2) // 3, len(mandatory_two)),
+        max((tier_target + 2) // 3, len(mandatory_two)),
         len(one_star_or_more),
     )
     two_star_or_more = mandatory_two

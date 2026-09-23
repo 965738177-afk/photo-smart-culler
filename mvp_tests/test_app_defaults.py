@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from event_cull.app import EventCullApp, TEXT
+from event_cull.app import EventCullApp, SCENE_TYPES, TEXT
 from event_cull.engine import PhotoResult
 
 
@@ -10,6 +10,27 @@ def test_default_target_is_one_third_rounded_up_to_tens():
     assert EventCullApp._default_target_count(301) == 110
     assert EventCullApp._default_target_count(1) == 10
     assert EventCullApp._default_target_count(0) == 0
+
+
+def test_scene_picker_includes_every_supported_scene_rule_set():
+    assert SCENE_TYPES == ("通用", "婚礼", "人像写真", "活动纪实", "儿童与家庭", "毕业照", "证件照", "美食")
+
+
+def test_main_window_uses_available_display_space_without_exceeding_release_size():
+    assert EventCullApp._main_window_size_for_screen(1728, 1117) == (1680, 1033)
+    assert EventCullApp._main_window_size_for_screen(2560, 1600) == (1700, 1050)
+
+
+def test_mousewheel_normalization_supports_trackpads_and_notched_wheels():
+    assert EventCullApp._wheel_units(1) == -1
+    assert EventCullApp._wheel_units(-1) == 1
+    assert EventCullApp._wheel_units(240) == -2
+    assert EventCullApp._wheel_units(0) == 0
+
+
+def test_virtual_grid_row_height_reserves_one_consistent_review_track():
+    assert EventCullApp._grid_row_height(144, analyzed=False) == 214
+    assert EventCullApp._grid_row_height(144, analyzed=True) == 360
 
 
 def test_result_filter_can_show_all_or_one_exact_rating():
@@ -113,6 +134,15 @@ def test_task_header_says_what_was_added_and_the_current_total():
     assert text == "本次新增 5 张 · JPG 2 张 · RAW 3 张 · 当前合计 32 张照片"
 
 
+def test_task_header_uses_its_right_status_slot_for_analysis_progress():
+    assert EventCullApp._analysis_header_status_text(
+        218, 752, "预计剩余时间：2分14秒", language="zh"
+    ) == "AI 分析 218 / 752 · 预计剩余时间：2分14秒"
+    assert EventCullApp._analysis_header_status_text(
+        12, 24, "", language="en"
+    ) == "AI analysis 12 / 24"
+
+
 def test_custom_duplicate_limit_accepts_direct_numeric_entry():
     class Value:
         def __init__(self, value: str):
@@ -125,6 +155,70 @@ def test_custom_duplicate_limit_accepts_direct_numeric_entry():
     app.keep_per_duplicate = Value("12")
 
     assert app._duplicate_keep_limit() == 12
+
+
+def test_reset_picker_settings_defaults_duplicate_limit_to_two():
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def set(self, value):
+            self.value = value
+
+    app = object.__new__(EventCullApp)
+    app.scene_type = Value("婚礼")
+    app.ai_selection_enabled = Value(False)
+    app.priority_more_faces = Value(False)
+    app.fill_with_similar = Value(True)
+    app.keep_existing_labels = Value(False)
+    app.detect_closed_eyes = Value(False)
+    app.detect_blur = Value(False)
+    app.detect_exposure = Value(False)
+    app.detect_duplicates = Value(False)
+    app.blur_sensitivity = Value("强")
+    app.exposure_sensitivity = Value("弱")
+    app.duplicate_similarity = Value("宽松")
+    app.keep_per_duplicate = Value("1")
+    app._refresh_picker_confirmation_ui = lambda: None
+
+    EventCullApp._reset_picker_settings(app)
+
+    assert app.keep_per_duplicate.value == "2"
+    assert app.ai_selection_enabled.value is True
+    assert app.duplicate_similarity.value == "标准"
+
+
+def test_picker_passes_the_selected_scene_type_to_the_culling_engine():
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    app = object.__new__(EventCullApp)
+    app.scene_type = Value("婚礼")
+    app.blur_sensitivity = Value("标准")
+    app.exposure_sensitivity = Value("标准")
+    app.duplicate_similarity = Value("标准")
+    app.detect_closed_eyes = Value(True)
+    app.detect_blur = Value(True)
+    app.detect_exposure = Value(True)
+    app.detect_duplicates = Value(True)
+    app.ai_selection_enabled = Value(True)
+    app.priority_more_faces = Value(True)
+    app.fill_with_similar = Value(False)
+    app.language = "zh"
+
+    options = app._analysis_options_from_picker(
+        picks_min=2,
+        picks_max=3,
+        target_min=200,
+        target_max=300,
+        duplicate_keep_limit=2,
+    )
+
+    assert options.scene_type == "婚礼"
 
 
 def test_reanalysis_restores_only_manual_ratings_when_requested():
