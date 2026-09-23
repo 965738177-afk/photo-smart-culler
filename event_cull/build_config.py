@@ -1,14 +1,24 @@
-"""Build-time product flags.
+"""Build-time product flags for the separately packaged internal app.
 
-Public packages remain fail-closed.  The private build uses a PyInstaller
-runtime hook to set this environment flag before the application imports any
-licensing code, so source files never need to be manually flipped before a
-release.
+The public app must never accept a user-controlled environment variable as
+proof that it is an internal build.  Only the private packaging target bundles
+the marker file below.
 """
 
 from __future__ import annotations
 
-import os
+import sys
+from pathlib import Path
 
 
-INTERNAL_DEVELOPER_BUILD = os.environ.get("MIAOXUAN_INTERNAL_DEVELOPER_BUILD", "") == "1"
+def is_internal_developer_build(
+    *, frozen: bool | None = None, bundle_root: Path | None = None
+) -> bool:
+    if frozen is None:
+        frozen = bool(getattr(sys, "frozen", False))
+    if bundle_root is None:
+        bundle_root = Path(getattr(sys, "_MEIPASS", ""))
+    return frozen and (bundle_root / "event_cull" / "internal_build_marker.txt").is_file()
+
+
+INTERNAL_DEVELOPER_BUILD = is_internal_developer_build()

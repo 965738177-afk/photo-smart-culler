@@ -40,9 +40,10 @@ from event_cull.build_info import APP_VERSION
 from event_cull.deep_features import status_label as deep_status_label
 from event_cull.history import load_history, task_name as history_task_name, upsert_task
 from event_cull.licensing import LicenseController, license_label
-from event_cull.license_ui import LicenseDialog, TeamAuthorizationDialog
+from event_cull.license_ui import LicenseDialog
 from event_cull.updater import UpdateInfo, check_for_update, download_update
 from event_cull.engine import (
+    HEIC_EXTENSIONS,
     RAW_EXTENSIONS,
     AnalysisCancelled,
     AnalysisOptions,
@@ -51,7 +52,19 @@ from event_cull.engine import (
     analyze_folder,
     analyze_paths,
 )
-from event_cull.xmp import restore_managed_ratings, write_ratings
+from event_cull.export_selected import (
+    EXPORT_MARKER,
+    ExportCancelled,
+    collect_selected_files,
+    export_selected_files,
+)
+from event_cull.xmp import (
+    EMBEDDED_EXTENSIONS,
+    legacy_managed_embedded_photos,
+    migrate_legacy_embedded_ratings,
+    restore_managed_ratings,
+    write_ratings,
+)
 
 
 SUPPORTED_EXTENSIONS = {
@@ -82,6 +95,11 @@ TEXT = {
 }
 
 TEXT["zh"].update({
+    "safe_note": "分析阶段只读；确认后才写入星级元数据",
+    "export_selected": "导出已选图片",
+    "export_cancel": "取消导出",
+    "confirm_detail": "将为 {count} 张照片写入星级：相机 RAW 使用旁车 XMP；JPG、DNG、TIFF、HEIC 使用文件内 XMP。文件内写入前会完整备份原文件，已有非零星级默认跳过。",
+    "restore_confirm_detail": "只撤回本 App 写入且之后未被 Lightroom 改动的星级。文件内写入的照片会从备份还原；请确认写入后没有继续编辑这些原文件。",
     "empty_preview": "请在任意位置拖入文件或文件夹",
     "raw_preview": "无法生成 RAW 缩略图；原片未被修改",
     "new_task": "新建任务",
@@ -113,7 +131,7 @@ TEXT["zh"].update({
     "menu_pause_resume": "暂停或继续分析",
     "menu_stop_analysis": "中止分析",
     "menu_write_ratings": "确认写入 XMP 星级",
-    "about_content": "照片智能筛选器\n本地 RAW 初筛、人工校准与只读预览\n不会移动、删除或改写原片。",
+    "about_content": "照片智能筛选器\n本地 RAW 初筛、人工校准与只读预览\n不会移动、删除照片；确认写入星级后，部分格式会更新文件内元数据。",
     "choose_files": "选择文件",
     "pick_files": "选择一组照片文件",
     "new_task_confirm": "开始新任务？",
@@ -186,6 +204,11 @@ TEXT["zh"].update({
     "calibration_apply_skipped": "选片偏好校准未应用到本次结果：{error}；已保留基础筛选结果。",
 })
 TEXT["en"].update({
+    "safe_note": "Read-only analysis; ratings are written only after confirmation",
+    "export_selected": "Export selected photos",
+    "export_cancel": "Cancel export",
+    "confirm_detail": "Write ratings for {count} photos: camera RAW uses XMP sidecars; JPEG, DNG, TIFF and HEIC use embedded XMP. Full originals are backed up before embedded writes. Existing nonzero ratings are skipped by default.",
+    "restore_confirm_detail": "Undo only app-written ratings that Lightroom has not changed. Embedded files are restored from backup; make sure the originals have not been edited since the write.",
     "empty_preview": "Drop files or folders anywhere",
     "raw_preview": "A RAW thumbnail could not be generated; the original is unchanged",
     "new_task": "New task",
@@ -217,7 +240,7 @@ TEXT["en"].update({
     "menu_pause_resume": "Pause or resume analysis",
     "menu_stop_analysis": "Stop analysis",
     "menu_write_ratings": "Confirm writing XMP ratings",
-    "about_content": "Photo Smart Culler\nLocal RAW culling, selection preferences, and read-only previews.\nNever moves, deletes, or rewrites originals.",
+    "about_content": "Photo Smart Culler\nLocal RAW culling, selection preferences, and read-only previews.\nNever moves or deletes photos; confirmed ratings update embedded metadata in some formats.",
     "choose_files": "Choose files",
     "pick_files": "Choose photo files",
     "new_task_confirm": "Start a new task?",
@@ -371,7 +394,7 @@ class EventCullApp(TkinterDnD.Tk):
             "   「仅显示目标照片的元数据」\n"
             "2. 右侧「元数据」面板改为「选定的照片」\n"
             "3. 关闭 Lightroom，开始使用本软件分析照片\n"
-            "4. 分析完毕后，确认写入 XMP 星级信息\n"
+            "4. 分析完毕后，确认写入星级（RAW 写入 XMP；HEIC 写入文件内 XMP）\n"
             "5. 打开 Lightroom，在「图库」→「网格视图」（快捷键 G）\n"
             "   全选本次分析的照片\n"
             "6. 右键 →「元数据」→「从文件中读取元数据」，\n"
@@ -453,6 +476,8 @@ class EventCullApp(TkinterDnD.Tk):
         self.eta_text = tk.StringVar(value="")
         self.pause_event = threading.Event()
         self.cancel_event = threading.Event()
+        self.export_cancel_event = threading.Event()
+        self.export_running = False
         self.ui_events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.is_paused = False
         self.analysis_running = False
@@ -475,9 +500,9 @@ class EventCullApp(TkinterDnD.Tk):
 
     @staticmethod
     def _main_window_size_for_screen(screen_width: int, screen_height: int) -> tuple[int, int]:
-        """Choose a large review surface without opening off-screen."""
-        width = min(1700, max(980, screen_width - 48))
-        height = min(1050, max(680, screen_height - 84))
+        """Open a roomy review surface while retaining a desktop-safe margin."""
+        width = min(1900, max(980, screen_width - 32))
+        height = min(1180, max(680, screen_height - 64))
         return width, height
 
     def _fit_main_window_to_display(self) -> None:
@@ -857,13 +882,13 @@ class EventCullApp(TkinterDnD.Tk):
         self.write_button.pack(fill="x")
         self.restore_button = ttk.Button(right, text=self.t.get("restore", "Restore app ratings"), command=self.confirm_restore, state="disabled")
         self.restore_button.pack(fill="x", pady=(6, 0))
-        self.export_log_button = ttk.Button(
+        self.export_selected_button = ttk.Button(
             right,
-            text=self.t["export_log"],
-            command=self.export_log,
+            text=self.t["export_selected"],
+            command=self.export_selected_photos,
             state="disabled",
         )
-        self.export_log_button.pack(fill="x", pady=(6, 0))
+        self.export_selected_button.pack(fill="x", pady=(6, 0))
         # Keep the Lightroom hand-off beside the write controls without
         # permanently occupying the narrow review column.  The detailed
         # checklist is intentionally opt-in; the action that matters stays
@@ -1043,6 +1068,8 @@ class EventCullApp(TkinterDnD.Tk):
         style.configure("Stats.TLabel", background=colors["paper"], foreground=colors["copper_deep"], font=("Helvetica Neue", 10, "bold"))
         style.configure("DropHint.TLabel", background=colors["paper"], foreground=colors["muted"], font=("Helvetica Neue", 14, "bold"))
         style.configure("Decision.TLabel", background=colors["soft"], foreground=colors["ink"], font=("Helvetica Neue", 10))
+        style.configure("Export.TCheckbutton", background=colors["paper"], foreground=colors["ink"], font=("Helvetica Neue", 12), padding=(6, 7))
+        style.map("Export.TCheckbutton", background=[("active", colors["paper"])], foreground=[("active", colors["ink"])])
         style.configure("XmpResult.TLabel", background="#3b2a20", foreground="#ffd49a", padding=(9, 7), font=("Helvetica Neue", 10, "bold"))
         style.configure("SyncTitle.TLabel", background=colors["paper"], foreground=colors["ink"], font=("Helvetica Neue", 12, "bold"))
         style.configure("SyncStep.TLabel", background=colors["paper"], foreground=colors["muted"], font=("Helvetica Neue", 9))
@@ -1216,14 +1243,7 @@ class EventCullApp(TkinterDnD.Tk):
         self.license_caption = ttk.Label(sidebar, text="试用版", style="SideMuted.TLabel")
         self.license_caption.pack(anchor="w", padx=28)
         self.license_button = ttk.Button(sidebar, style="SideBuy.TButton", command=self.show_license_dialog)
-        self.license_button.pack(fill="x", padx=25, pady=(6, 7))
-        self.team_authorization_button = ttk.Button(
-            sidebar,
-            text="团队授权与设备",
-            style="SideTeam.TButton",
-            command=self.show_team_authorization,
-        )
-        self.team_authorization_button.pack(fill="x", padx=25, pady=(0, 22))
+        self.license_button.pack(fill="x", padx=25, pady=(6, 22))
         ttk.Label(sidebar, text=f"v{APP_VERSION}", style="SideMuted.TLabel").pack(anchor="w", padx=28, pady=(0, 26))
         self._refresh_license_entry()
 
@@ -1356,7 +1376,7 @@ class EventCullApp(TkinterDnD.Tk):
         footer = ttk.Frame(body, style="Workbench.TFrame")
         footer.grid(row=3, column=0, sticky="ew", pady=(9, 0))
         ttk.Label(footer, textvariable=self.status, style="Muted.TLabel").pack(side="left")
-        ttk.Label(footer, text="本地处理 · 不会移动、删除或改写原图", style="Muted.TLabel").pack(side="right")
+        ttk.Label(footer, text="本地处理 · 确认后才写入星级元数据", style="Muted.TLabel").pack(side="right")
 
     def _build_brand_lockup(self, sidebar: ttk.Frame, colors: dict[str, str]) -> None:
         """Render the compact 秒选 mark and its two-line product name."""
@@ -1621,7 +1641,7 @@ class EventCullApp(TkinterDnD.Tk):
         )
 
     def _build_decision_panel(self, workspace: ttk.Frame) -> None:
-        shell = ttk.Frame(workspace, style="Paper.TFrame", width=335)
+        shell = ttk.Frame(workspace, style="Paper.TFrame", width=360)
         shell.grid(row=0, column=1, sticky="nsew")
         shell.grid_propagate(False)
         shell.rowconfigure(0, weight=1)
@@ -1641,7 +1661,7 @@ class EventCullApp(TkinterDnD.Tk):
         self.decision_scroll = ttk.Scrollbar(shell, orient="vertical", command=self.decision_canvas.yview)
         self.decision_scroll.grid(row=0, column=1, sticky="ns")
         self.decision_canvas.configure(yscrollcommand=self.decision_scroll.set)
-        right = ttk.Frame(shell, style="Paper.TFrame", padding=(17, 13, 17, 16))
+        right = ttk.Frame(shell, style="Paper.TFrame", padding=(15, 10, 15, 12))
         self._decision_window = self.decision_canvas.create_window((0, 0), window=right, anchor="nw")
 
         def update_decision_scroll_region(_event=None) -> None:
@@ -1655,7 +1675,10 @@ class EventCullApp(TkinterDnD.Tk):
         self.decision_canvas.bind("<Configure>", fit_decision_content)
         ttk.Label(right, text="本张决策", style="PanelTitle.TLabel").pack(anchor="w")
         self.preview_label = ttk.Label(right, text=self.t["empty_preview"], style="DropHint.TLabel", justify="center", anchor="center")
-        self.preview_label.pack(fill="x", pady=(10, 9), ipady=54)
+        # The image already defines the preview's height.  Extra internal
+        # padding used to add a large black band above and below every photo
+        # and pushed the rating/write controls below the visible rail.
+        self.preview_label.pack(fill="x", pady=(7, 6), ipady=4)
         self.preview_label.configure(cursor="hand2")
         self.preview_label.bind("<Button-1>", self._open_preview_zoom, add="+")
         self.preview_zoom_tooltip = ToolTip(
@@ -1663,8 +1686,8 @@ class EventCullApp(TkinterDnD.Tk):
             lambda: "点击放大预览；在放大窗口滚轮缩放，双击可适应窗口。",
         )
         self.detail = ttk.Label(right, text=self.t["empty_detail"], style="Decision.TLabel", justify="left", wraplength=280)
-        self.detail.pack(fill="x", pady=(0, 11), ipadx=10, ipady=9)
-        ttk.Label(right, text="手动评级", style="PanelTitle.TLabel").pack(anchor="w", pady=(1, 8))
+        self.detail.pack(fill="x", pady=(0, 8), ipadx=10, ipady=7)
+        ttk.Label(right, text="手动评级", style="PanelTitle.TLabel").pack(anchor="w", pady=(0, 6))
         stars = ttk.Frame(right, style="Paper.TFrame")
         stars.pack(fill="x")
         for column in range(4):
@@ -1674,7 +1697,7 @@ class EventCullApp(TkinterDnD.Tk):
             button = ttk.Button(stars, text=self.t["clear"] if rating == 0 else f"{self._output_rating(rating)}★", command=lambda value=rating: self.set_manual_rating(value))
             button.grid(row=0, column=rating, sticky="ew", padx=(0 if rating == 0 else 4, 0))
             self.manual_rating_buttons[rating] = button
-        ttk.Separator(right).pack(fill="x", pady=14)
+        ttk.Separator(right).pack(fill="x", pady=10)
         self.lr_guard_slot = ttk.Frame(right, style="Paper.TFrame")
         self.lr_guard_slot.pack(fill="x")
         self.lr_guard_label = ttk.Label(self.lr_guard_slot, text="", style="GuardWarning.TLabel", justify="left", wraplength=275)
@@ -1683,12 +1706,22 @@ class EventCullApp(TkinterDnD.Tk):
         self.write_mode_menu.pack(fill="x", pady=(0, 8))
         self.write_button = ttk.Button(right, text=self.t["write"], style="Primary.TButton", command=self.confirm_write, state="disabled")
         self.write_button.pack(fill="x")
+        self.repair_legacy_heic_button = ttk.Button(
+            right,
+            text="修复旧版照片星级",
+            style="Outline.TButton",
+            command=self.repair_legacy_heic_ratings,
+        )
+        self.repair_legacy_tooltip = ToolTip(
+            self.repair_legacy_heic_button,
+            lambda: "待处理数字表示照片张数，不是星级。仅将旧版写在旁车的星级迁移到照片文件内。",
+        )
         self.restore_button = ttk.Button(right, text=self.t.get("restore", "还原本次星级"), command=self.confirm_restore, state="disabled")
         self.restore_button.pack(fill="x", pady=(6, 0))
-        self.export_log_button = ttk.Button(right, text=self.t["export_log"], command=self.export_log, state="disabled")
-        self.export_log_button.pack(fill="x", pady=(6, 0))
+        self.export_selected_button = ttk.Button(right, text=self.t["export_selected"], command=self.export_selected_photos, state="disabled")
+        self.export_selected_button.pack(fill="x", pady=(6, 0))
         self.xmp_card = ttk.Frame(right, style="Paper.TFrame")
-        self.xmp_card.pack(fill="x", pady=(15, 0))
+        self.xmp_card.pack(fill="x", pady=(10, 0))
         self.xmp_result_label = ttk.Label(self.xmp_card, textvariable=self.xmp_result_notice, style="XmpResult.TLabel", justify="left", wraplength=275)
         self.sync_heading = ttk.Label(self.xmp_card, text="Lightroom 星级同步", style="SyncTitle.TLabel")
         self.sync_heading.pack(anchor="w", pady=(0, 7))
@@ -1711,6 +1744,7 @@ class EventCullApp(TkinterDnD.Tk):
             ttk.Label(row, text=str(number), style="SyncIndex.TLabel", width=2, anchor="center").pack(side="left")
             ttk.Label(row, text=step, style="SyncStep.TLabel", justify="left", wraplength=235).pack(side="left", fill="x", expand=True, padx=(8, 0))
         self._refresh_rating_presentation()
+        self._refresh_legacy_heic_repair_button()
 
     def set_workflow_stage(self, stage: int) -> None:
         self.workflow_stage = max(1, min(5, stage))
@@ -2324,12 +2358,12 @@ class EventCullApp(TkinterDnD.Tk):
         return value
 
     def _target_selection_range(self) -> tuple[int, int]:
-        """Read the required keep floor and the preferred selection quantity."""
+        """Read the required keep floor and the maximum selection quantity."""
         minimum = int(self.target.get().strip())
-        preferred = int(self.target_max.get().strip())
-        if minimum < 1 or preferred < minimum:
+        maximum = int(self.target_max.get().strip())
+        if minimum < 1 or maximum < minimum:
             raise ValueError("target selection range is invalid")
-        return minimum, preferred
+        return minimum, maximum
 
     def _reset_picker_settings(self) -> None:
         self.scene_type.set("通用")
@@ -2355,7 +2389,7 @@ class EventCullApp(TkinterDnD.Tk):
             range_text = f"{range_text}–{self.picks_max.get()}"
         target_text = self.target.get()
         if self.target_max.get() != self.target.get():
-            target_text = f"至少 {target_text}，建议 {self.target_max.get()}"
+            target_text = f"至少 {target_text}，最多 {self.target_max.get()}"
         enabled = []
         if self.detect_closed_eyes.get():
             enabled.append("闭眼")
@@ -2595,13 +2629,13 @@ class EventCullApp(TkinterDnD.Tk):
             tk.Frame(setting, bg=palette["line"], height=1).pack(fill="x", pady=(3, 0))
             return setting
 
-        target_section = section("目标图片数量", "至少保留此数量；达到建议数量后，仍会为场景完整性保留必要照片。")
+        target_section = section("目标图片数量", "AI 选片不超过最多张数；明确命中的必选镜头可例外保留。")
         target_section.pack(fill="x")
-        _, target_controls = row(target_section, "交付目标", "把本次交付的最少数量和建议数量一次设清楚。")
+        _, target_controls = row(target_section, "交付目标", "设置本次选片的最少和最多张数。")
         tk.Label(target_controls, text="至少", bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 10)).pack(side="left", padx=(0, 7))
         spin(target_controls, self.target).pack(side="left")
         tk.Label(target_controls, text="～", bg=palette["window"], fg=palette["ink"], font=("Helvetica Neue", 15, "bold")).pack(side="left", padx=10)
-        tk.Label(target_controls, text="建议", bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 10)).pack(side="left", padx=(0, 7))
+        tk.Label(target_controls, text="最多", bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 10)).pack(side="left", padx=(0, 7))
         spin(target_controls, self.target_max).pack(side="left")
         tk.Label(target_controls, text="张", bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 10)).pack(side="left", padx=(7, 0))
         divider(target_section)
@@ -2791,14 +2825,10 @@ class EventCullApp(TkinterDnD.Tk):
             self.license_button.configure(text="授权与订阅")
 
     def show_license_dialog(self) -> None:
-        lease = self.license_controller.lease
-        if lease is not None and lease.team_name:
-            TeamAuthorizationDialog(self, self.license_controller, self._refresh_license_entry)
-            return
+        # The authorization sheet now contains team verification inline. A
+        # second Tk modal window can crash macOS input methods while a cull is
+        # still rendering HEIC previews, so never open a nested dialog here.
         LicenseDialog(self, self.license_controller, self._refresh_license_entry)
-
-    def show_team_authorization(self) -> None:
-        TeamAuthorizationDialog(self, self.license_controller, self._refresh_license_entry)
 
     def show_task_history(self) -> None:
         """Show the compact, local-only index of imports and completed culls."""
@@ -3176,9 +3206,12 @@ class EventCullApp(TkinterDnD.Tk):
             try:
                 for parent, directories, filenames in os.walk(folder):
                     # Sidecar backups and other hidden work folders are not
-                    # photo sources and can be large on event jobs.
+                    # photo sources and can be large on event jobs.  A prior
+                    # 秒选 delivery must not be imported as fresh originals.
                     directories[:] = [
-                        name for name in directories if not name.startswith(".")
+                        name for name in directories
+                        if not name.startswith(".")
+                        and not (Path(parent, name) / EXPORT_MARKER).is_file()
                     ]
                     files.extend(
                         Path(parent, name)
@@ -3296,7 +3329,8 @@ end run
         self.set_workflow_stage(1)
         self.write_button.configure(state="disabled")
         self.restore_button.configure(state="disabled")
-        self.export_log_button.configure(state="disabled")
+        self._refresh_legacy_heic_repair_button()
+        self.export_selected_button.configure(state="disabled")
         self.task_title.set("新建筛选任务 · 等待导入")
         self._set_analysis_controls_visible(False)
         self._refresh_picker_confirmation_ui()
@@ -3304,11 +3338,16 @@ end run
         self.refresh_lightroom_guard(schedule_next=False)
 
     def new_task(self) -> None:
+        if self.__dict__.get("export_running", False):
+            messagebox.showinfo("正在导出", "请等待已选图片导出完成，或点击“取消导出”。")
+            return
         if not self._confirm_replace_task():
             return
         self._reset_task_state()
 
     def choose_folder(self) -> None:
+        if self.__dict__.get("export_running", False):
+            return
         if sys.platform == "darwin":
             selected = self._choose_folders_macos(
                 self.last_import_directory,
@@ -3436,6 +3475,7 @@ end run
         self._clear_results_for_source_change()
         added_paths = merged[len(self.imported_files):]
         self.imported_files = merged
+        self._refresh_legacy_heic_repair_button()
         self.picker_settings_confirmed = False
         self._ensure_task_identity(merged)
         self.set_workflow_stage(2)
@@ -3816,7 +3856,7 @@ end run
             if cached is not None:
                 self._zoom_preview_memory.move_to_end(key)
                 return cached.copy()
-        if path.suffix.lower() not in RAW_EXTENSIONS:
+        if path.suffix.lower() not in RAW_EXTENSIONS | HEIC_EXTENSIONS:
             with Image.open(path) as source:
                 image = ImageOps.exif_transpose(source).convert("RGB").copy()
         else:
@@ -4036,10 +4076,12 @@ end run
         self.eta_text.set("")
         self.write_button.configure(state="disabled")
         self.restore_button.configure(state="disabled")
-        self.export_log_button.configure(state="disabled")
+        self.export_selected_button.configure(state="disabled")
         self._schedule_grid_render()
 
     def choose_files(self) -> None:
+        if self.__dict__.get("export_running", False):
+            return
         selected = filedialog.askopenfilenames(
             title=self.t["pick_files"],
             initialdir=str(self.last_import_directory),
@@ -4054,7 +4096,7 @@ end run
             self._load_selected_files(paths)
 
     def accept_drop(self, event) -> str:
-        if self.analysis_running or self.calibration_running:
+        if self.analysis_running or self.calibration_running or self.__dict__.get("export_running", False):
             messagebox.showinfo(self.t["drop_busy_title"], self.t["drop_busy_detail"])
             return REFUSE_DROP
         paths = [Path(value) for value in self.tk.splitlist(event.data)]
@@ -4072,6 +4114,9 @@ end run
         return COPY
 
     def start_analysis(self) -> None:
+        if self.__dict__.get("export_running", False):
+            messagebox.showinfo("正在导出", "请等待已选图片导出完成，或点击“取消导出”。")
+            return
         if not self.imported_files:
             messagebox.showerror(self.t["pick_needed"], self.t["pick_error"])
             return
@@ -4135,7 +4180,7 @@ end run
         self.progress.start(12)
         self.progress_text.set(self.t["scanning"])
         self.write_button.configure(state="disabled")
-        self.export_log_button.configure(state="disabled")
+        self.export_selected_button.configure(state="disabled")
         source: list[Path] = self.imported_files[:]
         preserved_manual_ratings = (
             dict(self.manual_ratings) if self.keep_existing_labels.get() else {}
@@ -4326,13 +4371,34 @@ end run
                 elif event == "update_download_failed":
                     self.status.set("更新下载失败；当前版本仍可正常使用。")
                     messagebox.showerror("更新下载失败", str(payload))
+                elif event == "selected_export_progress":
+                    current, total, path = payload
+                    self.progress.configure(mode="determinate", maximum=total, value=current)
+                    self.progress_text.set(f"正在导出已选图片 {current}/{total} · {path.name}")
+                elif event == "selected_export_completed":
+                    self._finish_selected_export()
+                    folders = "\n".join(str(folder) for folder in payload.folders)
+                    message = f"已复制 {payload.photo_count} 张已选照片，共 {payload.file_count} 个原文件/旁车文件。"
+                    self.status.set(message)
+                    self.progress_text.set("已选图片导出完成")
+                    messagebox.showinfo("导出完成", f"{message}\n\n保存位置：\n{folders}")
+                elif event == "selected_export_cancelled":
+                    self._finish_selected_export()
+                    self.status.set("已取消导出；未更改原片，未保留未完成的导出文件夹。")
+                    self.progress_text.set("已取消导出")
+                elif event == "selected_export_failed":
+                    self._finish_selected_export()
+                    self.status.set("已选图片导出失败；原片未更改。")
+                    self.progress_text.set("导出失败")
+                    messagebox.showerror("导出已选图片失败", str(payload))
                 elif event == "completed":
                     self.analysis_completed_at = datetime.now().isoformat(timespec="seconds")
                     self.show_results(payload)
                     try:
                         self._write_automatic_log()
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        self.status.set("自动保存筛选日志失败；本次结果仍在界面中。")
+                        messagebox.showwarning("自动日志保存失败", str(exc))
                     self._write_task_history("已完成" if self.language == "zh" else "Completed")
                 elif event == "cancelled":
                     self.analysis_cancelled()
@@ -4581,7 +4647,7 @@ end run
             self.task_import_summary.set(f"已选 {selected} 张 · {featured}★ 精选 {counts[3]} 张")
         else:
             self.task_import_summary.set(f"Selected {selected} · {counts[3]} featured {featured}★")
-        self.export_log_button.configure(state="normal")
+        self.export_selected_button.configure(state="normal")
         self.refresh_lightroom_guard(schedule_next=False)
         if results:
             self._select_result_index(0)
@@ -4673,6 +4739,152 @@ end run
             encoding="utf-8",
         )
         os.replace(temporary, self.current_log_path)
+
+    def _choose_export_options(self) -> tuple[frozenset[int], Path | None] | None:
+        """Choose rating tiers and destination in one compact dialog."""
+        dialog = tk.Toplevel(self)
+        dialog.title("导出已选图片")
+        dialog.configure(bg=self._workbench_colors["paper"])
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        width, height = 430, 390
+        x = max(0, self.winfo_rootx() + (self.winfo_width() - width) // 2)
+        y = max(0, self.winfo_rooty() + (self.winfo_height() - height) // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        content = ttk.Frame(dialog, style="Paper.TFrame", padding=22)
+        content.pack(fill="both", expand=True)
+        ttk.Label(content, text="导出已选图片", style="PanelTitle.TLabel").pack(anchor="w")
+        ttk.Label(content, text="选择星级（可多选）", style="PanelMuted.TLabel").pack(anchor="w", pady=(5, 12))
+        counts = {
+            tier: sum(item.suggested_rating == tier for item in self.results)
+            for tier in (1, 2, 3)
+        }
+        choices = {tier: tk.BooleanVar(master=dialog, value=True) for tier in (1, 2, 3)}
+        summary = tk.StringVar(master=dialog)
+
+        def update_summary() -> None:
+            count = sum(counts[tier] for tier in choices if choices[tier].get())
+            summary.set(f"将导出 {count} 张照片" if count else "请至少勾选一种星级")
+
+        for tier, name in ((1, "初选复核"), (2, "优质备用"), (3, "精选推荐")):
+            ttk.Checkbutton(
+                content,
+                text=f"{self._output_rating(tier)}★  {name}  ·  {counts[tier]} 张",
+                variable=choices[tier],
+                command=update_summary,
+                style="Export.TCheckbutton",
+            ).pack(anchor="w", fill="x")
+        update_summary()
+        ttk.Label(content, textvariable=summary, style="Stats.TLabel").pack(anchor="w", pady=(8, 8))
+        ttk.Label(content, text="都会新建“秒选”文件夹；不会改动原片。", style="PanelMuted.TLabel").pack(anchor="w", pady=(0, 10))
+        chosen: list[tuple[frozenset[int], Path | None]] = []
+
+        def confirm(*, choose_directory: bool) -> None:
+            selected = frozenset(tier for tier, value in choices.items() if value.get())
+            if not selected:
+                update_summary()
+                return
+            if not any(counts[tier] for tier in selected):
+                summary.set("所选星级没有照片，请选择其他星级")
+                return
+            custom_parent = None
+            if choose_directory:
+                selected_parent = filedialog.askdirectory(
+                    parent=dialog,
+                    title="选择保存位置（将新建“秒选”文件夹）",
+                    initialdir=str(self.last_import_directory),
+                )
+                if not selected_parent:
+                    return
+                custom_parent = Path(selected_parent)
+            chosen.append((selected, custom_parent))
+            dialog.destroy()
+
+        ttk.Button(
+            content, text="导出到原照片所在文件夹", style="Primary.TButton",
+            command=lambda: confirm(choose_directory=False),
+        ).pack(fill="x", pady=(0, 7))
+        ttk.Button(
+            content, text="选择指定目录…",
+            command=lambda: confirm(choose_directory=True),
+        ).pack(fill="x")
+        ttk.Button(content, text="取消", command=dialog.destroy).pack(anchor="e", pady=(8, 0))
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.grab_set()
+        self.wait_window(dialog)
+        return chosen[0] if chosen else None
+
+    def export_selected_photos(self) -> None:
+        """Offer rating and destination choices for copied original photos."""
+        if self.__dict__.get("export_running", False):
+            self.export_cancel_event.set()
+            self.status.set("正在取消导出…")
+            return
+        if not self.results:
+            return
+        export_options = self._choose_export_options()
+        if export_options is None:
+            return
+        included_tiers, custom_parent = export_options
+        try:
+            selection = collect_selected_files(self.results, included_tiers)
+        except OSError as exc:
+            messagebox.showerror("无法准备导出", str(exc))
+            return
+        if selection.photo_count == 0:
+            messagebox.showinfo("没有匹配照片", "当前选择的星级没有照片，请返回选择其他星级。")
+            return
+        self.export_running = True
+        self.export_cancel_event.clear()
+        self._export_prior_states = [
+            (widget, widget.cget("state"))
+            for widget in (
+                self.new_task_button, self.choose_button, self.choose_files_button,
+                self.analyze_button, self.calibration_button, self.picker_settings_button,
+                self.write_button, self.restore_button, self.repair_legacy_heic_button,
+                *self.manual_rating_buttons.values(),
+            )
+        ]
+        for widget, _state in self._export_prior_states:
+            widget.configure(state="disabled")
+        self.export_selected_button.configure(text=self.t["export_cancel"], state="normal")
+        self.progress.configure(mode="determinate", maximum=selection.file_count, value=0)
+        self.progress_text.set(f"正在准备导出 {selection.photo_count} 张已选照片…")
+        self.status.set("正在复制已选原片；原文件保持不变。")
+
+        def copy_in_background() -> None:
+            try:
+                result = export_selected_files(
+                    selection,
+                    custom_parent=custom_parent,
+                    cancel_event=self.export_cancel_event,
+                    progress_callback=lambda current, total, path: self.ui_events.put(
+                        ("selected_export_progress", (current, total, path))
+                    ),
+                )
+                self.ui_events.put(("selected_export_completed", result))
+            except ExportCancelled:
+                self.ui_events.put(("selected_export_cancelled", None))
+            except (OSError, ValueError) as exc:
+                self.ui_events.put(("selected_export_failed", str(exc)))
+
+        threading.Thread(
+            target=copy_in_background,
+            name="event-cull-selected-export",
+            daemon=True,
+        ).start()
+
+    def _finish_selected_export(self) -> None:
+        self.export_running = False
+        self.export_cancel_event.clear()
+        for widget, state in self._export_prior_states:
+            widget.configure(state=state)
+        self._export_prior_states = []
+        self.export_selected_button.configure(
+            text=self.t["export_selected"],
+            state="normal" if self.results else "disabled",
+        )
 
     def export_log(self) -> None:
         if not self.results:
@@ -4810,6 +5022,8 @@ end run
         self.detail.configure(text=details)
 
     def set_manual_rating(self, rating: int) -> None:
+        if self.export_running:
+            return
         if self.selected is None:
             return
         self.selected.suggested_rating = rating
@@ -4818,11 +5032,13 @@ end run
         self.status.set(self.t["not_written"])
         try:
             self._write_automatic_log()
-        except OSError:
-            pass
+        except OSError as exc:
+            self.status.set(f"评级已在界面更新，但自动日志保存失败：{exc}")
         self._write_task_history("已人工调整" if self.language == "zh" else "Manually adjusted")
 
     def confirm_write(self) -> None:
+        if self.export_running:
+            return
         if not self.ensure_metadata_editors_closed():
             return
         mode = self.write_modes[self.write_mode.get()]
@@ -4853,22 +5069,36 @@ end run
                 else f"Overwrite existing ratings for {len(ratings)} photos with the current results.\n"
                 "This may replace manual Lightroom ratings. Existing XMP is backed up first."
             )
+        embedded_count = sum(path.suffix.lower() in EMBEDDED_EXTENSIONS for path in ratings)
+        if embedded_count:
+            detail += (
+                f"\n\n其中 {embedded_count} 张 JPG、DNG、TIFF 或 HEIC：为了让 Lightroom 读取星级，"
+                "软件会更新文件内的 XMP 元数据。写入前会完整备份每张照片到同目录的 "
+                ".event-cull-backups；照片像素不会重新编码。"
+                if self.language == "zh"
+                else f"\n\n{embedded_count} JPEG, DNG, TIFF or HEIC file(s) will receive embedded XMP Rating metadata so Lightroom can read it. "
+                "Each original is fully backed up in .event-cull-backups before writing; pixels are not re-encoded."
+            )
         if not messagebox.askyesno(self.t["confirm"], detail):
             return
         if mode == "force" and not messagebox.askyesno(
             "再次确认强制覆盖" if self.language == "zh" else "Confirm force overwrite",
-            "确定覆盖所有已有星级吗？此操作不会修改原图，但会改写 XMP 中的评级字段。"
+            "确定覆盖所有已有星级吗？相机 RAW 会改写旁车 XMP；JPG、DNG、TIFF、HEIC 会更新文件内元数据，并先自动完整备份。"
             if self.language == "zh"
-            else "Overwrite every existing rating? Originals stay unchanged, but XMP rating fields will be replaced.",
+            else "Overwrite every existing rating? Camera RAW sidecars and embedded JPEG, DNG, TIFF or HEIC ratings will be replaced after automatic backup.",
         ):
             return
-        outcomes = write_ratings(ratings, mode=mode)
-        updated = sum(value in {"created", "updated"} for value in outcomes.values())
+        try:
+            outcomes = write_ratings(ratings, mode=mode)
+        except (OSError, RuntimeError, ValueError) as exc:
+            messagebox.showerror("星级写入失败" if self.language == "zh" else "Rating write failed", str(exc))
+            return
+        updated = sum(value in {"created", "updated", "embedded-updated"} for value in outcomes.values())
         skipped = sum(value == "skipped-existing-rating" for value in outcomes.values())
         message = (
-            f"XMP 处理完成：更新星级 {updated} 张，保留已有星级 {skipped} 张。"
+            f"星级写入完成：更新 {updated} 张，保留已有星级 {skipped} 张。"
             if self.language == "zh"
-            else f"XMP complete: updated {updated}, preserved existing ratings {skipped}."
+            else f"Rating write complete: updated {updated}, preserved existing ratings {skipped}."
         )
         self.status.set(message)
         self._set_xmp_result(f"✓ {message}")
@@ -4876,7 +5106,56 @@ end run
         self.set_workflow_stage(5)
         self._write_task_history("已写入 XMP" if self.language == "zh" else "XMP written")
 
+    @staticmethod
+    def _legacy_repair_button_text(count: int) -> str:
+        return f"修复旧版星级 · 待处理 {count} 张照片"
+
+    def _refresh_legacy_heic_repair_button(self) -> None:
+        """Expose migration when a format has an obsolete app-managed sidecar."""
+        if not hasattr(self, "repair_legacy_heic_button"):
+            return
+        count = len(legacy_managed_embedded_photos(self.imported_files))
+        if count:
+            self.repair_legacy_heic_button.configure(
+                text=self._legacy_repair_button_text(count)
+            )
+            if not self.repair_legacy_heic_button.winfo_manager():
+                self.repair_legacy_heic_button.pack(fill="x", pady=(6, 0))
+            return
+        self.repair_legacy_heic_button.pack_forget()
+
+    def repair_legacy_heic_ratings(self) -> None:
+        """Migrate obsolete sidecar ratings without a new AI pass."""
+        if self.export_running:
+            return
+        if not self.ensure_metadata_editors_closed():
+            return
+        candidates = legacy_managed_embedded_photos(self.imported_files)
+        if not candidates:
+            self._refresh_legacy_heic_repair_button()
+            return
+        if not messagebox.askyesno(
+            "修复旧版照片星级",
+            f"检测到 {len(candidates)} 张 JPG、DNG、TIFF 或 HEIC 使用了旧版旁边的 .xmp 星级。\n\n"
+            "将把这些已有星级写入照片文件内的 XMP，让 Lightroom 正常读取；"
+            "每张原文件会先完整备份到 .event-cull-backups，照片像素不会重新编码。",
+        ):
+            return
+        try:
+            outcomes = migrate_legacy_embedded_ratings(candidates)
+        except (OSError, RuntimeError, ValueError) as exc:
+            messagebox.showerror("照片星级修复失败", str(exc))
+            return
+        updated = sum(value == "embedded-updated" for value in outcomes.values())
+        skipped = sum(value == "skipped-existing-rating" for value in outcomes.values())
+        message = f"照片星级修复完成：已写入 {updated} 张，保留已有嵌入星级 {skipped} 张。"
+        self.status.set(message)
+        self._set_xmp_result(f"✓ {message}\n回到 Lightroom 后执行“从文件中读取元数据”。")
+        self._refresh_legacy_heic_repair_button()
+
     def confirm_restore(self) -> None:
+        if self.export_running:
+            return
         if not self.ensure_metadata_editors_closed():
             return
         if not messagebox.askyesno(self.t["restore_confirm"], self.t["restore_confirm_detail"]):

@@ -27,9 +27,15 @@ try:
 except ImportError:  # pragma: no cover - setup validation covers this
     rawpy = None
 
+try:
+    from pillow_heif import register_heif_opener
+except ImportError:  # pragma: no cover - packaging validation covers this
+    register_heif_opener = None
+
 RAW_EXTENSIONS = {".arw", ".cr2", ".cr3", ".dng", ".nef", ".orf", ".raf", ".rw2"}
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".heic", ".heif", *RAW_EXTENSIONS}
-ANALYSIS_CACHE_VERSION = 12
+HEIC_EXTENSIONS = {".heic", ".heif"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", *HEIC_EXTENSIONS, *RAW_EXTENSIONS}
+ANALYSIS_CACHE_VERSION = 13
 MAX_ANALYSIS_WORKERS = 8
 _DETECTORS = threading.local()
 _EMOTION_MODEL = Path("event_cull/models/emotion-ferplus-8.onnx")
@@ -289,6 +295,13 @@ def _load_preview(path: Path, *, maximum_dimension: int = 1600) -> np.ndarray:
         if image is None:
             raise RuntimeError("JPEG could not be decoded")
         return _resize_preview(image, maximum_dimension)
+    if path.suffix.lower() in HEIC_EXTENSIONS:
+        if register_heif_opener is None:
+            raise RuntimeError("HEIC support requires the bundled pillow-heif component")
+        # Pillow does not discover third-party codecs by itself. Registering
+        # the bundled decoder here makes HEIC work in analysis, grid previews,
+        # and close review without converting or altering the original file.
+        register_heif_opener()
     with Image.open(path) as image:
         image = ImageOps.exif_transpose(image).convert("RGB")
         image.thumbnail((maximum_dimension, maximum_dimension))
@@ -947,6 +960,10 @@ def _analyze(path: Path, pairs: list[Path], options: AnalysisOptions) -> PhotoRe
         median_luminance=median_luminance,
         subject_luminance=subject_luminance,
     )
+    if _subject_motion_fault(result, options):
+        blur_reason = _message(options, "blur")
+        if blur_reason not in result.reasons:
+            result.reasons.append(blur_reason)
     _apply_must_keep_rule(result, options)
     return result
 
@@ -1062,6 +1079,25 @@ def _people_focus_issue(item: PhotoResult, options: AnalysisOptions) -> bool:
     )
 
 
+def _subject_motion_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
+    """Reject a soft multi-person subject despite sharp background texture.
+
+    Whole-frame Laplacian variance can look excellent when foliage, lettering,
+    or stonework is sharp behind motion-blurred people. Require multiple face
+    detections and no reliable eye evidence before treating this as a hard
+    fault, keeping single distant faces and environmental images conservative.
+    """
+    return bool(
+        options.detect_blur
+        and item.frontal_face_count >= 2
+        and item.open_eye_face_count == 0
+        and item.sharpness is not None
+        and item.subject_sharpness is not None
+        and item.subject_sharpness < options.blur_floor * 8
+        and item.subject_sharpness < item.sharpness * 0.45
+    )
+
+
 def _group_expression_issue(item: PhotoResult, options: AnalysisOptions | None = None) -> bool:
     # Treat a confirmed mixed result as risky.  When the eye cascade finds no
     # eyes at all, keep it ambiguous so low-head and atmospheric frames survive.
@@ -1129,7 +1165,12 @@ def _has_hard_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
     focus_fault = _focus_fault(item, options) and not (
         item.scene_protected or item.coverage_protected
     )
-    return focus_fault or _has_exposure_fault(item, options) or _id_photo_fault(item, options)
+    return (
+        focus_fault
+        or _subject_motion_fault(item, options)
+        or _has_exposure_fault(item, options)
+        or _id_photo_fault(item, options)
+    )
 
 
 def _has_exposure_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
@@ -1461,18 +1502,11 @@ def _assign_tiered_ratings(
     target_floor = len(ranked) if options.target_keep_count is None else max(1, options.target_keep_count)
     target = target_floor
     if options.target_keep_max_count is not None:
-        # The second number is a preferred quantity rather than a hard cap.
-        # Scene coverage may legitimately go beyond it; the photographer's
-        # first number remains the guaranteed minimum whenever enough sound
-        # photos exist to meet it.
-        coverage_floor = sum(
-            1 for group in groups if any(item in eligible for item in group)
-        )
-        target = max(
-            target_floor,
-            max(1, options.target_keep_max_count),
-            coverage_floor,
-        )
+        # A scene detector can split one real setting into many small groups
+        # when the pose or camera angle changes. Never turn those groups into
+        # a hidden minimum that overrides the photographer's requested cap.
+        # Explicit must-keep moments are handled separately below.
+        target = max(target_floor, options.target_keep_max_count)
     one_star_or_more = _density_selection(
         ranked,
         min(target, len(ranked)),

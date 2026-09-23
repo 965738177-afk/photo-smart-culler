@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import threading
+import urllib.parse
 import webbrowser
 from collections.abc import Callable
 from typing import Any
@@ -11,21 +11,15 @@ from typing import Any
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from PIL import ImageTk
-
 from event_cull.licensing import (
     TRIAL_DAYS,
-    CheckoutOrder,
     LicenseController,
     LicenseError,
     LicensePlan,
     license_label,
 )
 
-
-def payment_actions_enabled() -> bool:
-    """Whether real purchase checkout has explicitly been enabled for a release."""
-    return os.environ.get("EVENT_CULL_ENABLE_PAYMENT", "").strip() == "1"
+CHECKOUT_PAGE_URL = "https://cull.lhxx.online/"
 
 
 class DeviceManagementDialog(tk.Toplevel):
@@ -285,9 +279,6 @@ class LicenseDialog(tk.Toplevel):
         self.controller = controller
         self.on_changed = on_changed
         self.internal_build = self.controller.decision.plan is LicensePlan.DEVELOPER
-        self.payment_actions_available = payment_actions_enabled()
-        self.pending_order: CheckoutOrder | None = None
-        self._qr_image: ImageTk.PhotoImage | None = None
         self.title("授权与订阅")
         self.geometry("680x750")
         self.minsize(620, 680)
@@ -372,28 +363,65 @@ class LicenseDialog(tk.Toplevel):
             justify="left",
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
-        team_access = ttk.Frame(outer, style="LicenseTeam.TFrame", padding=(15, 12))
-        team_access.pack(fill="x", pady=(10, 0))
-        team_access.columnconfigure(0, weight=1)
-        ttk.Label(team_access, text="我是团队成员 / 团队主人", style="LicenseTeamTitle.TLabel").grid(
+        self.team_access = ttk.Frame(outer, style="LicenseTeam.TFrame", padding=(15, 12))
+        self.team_access.pack(fill="x", pady=(10, 0))
+        self.team_access.columnconfigure(0, weight=1)
+        ttk.Label(self.team_access, text="我是团队成员 / 团队主人", style="LicenseTeamTitle.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         ttk.Label(
-            team_access,
+            self.team_access,
             text="已受邀请的邮箱不需要购买或输入个人激活码；验证邮箱即可将团队永久授权绑定到当前 Mac。",
             style="LicenseTeamCopy.TLabel", wraplength=400, justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(3, 0))
         self.team_button = ttk.Button(
-            team_access,
+            self.team_access,
             text="使用团队邮箱验证",
             command=self.manage_team,
             style="LicensePrimary.TButton",
         )
         self.team_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(14, 0))
 
-        secondary_heading = ttk.Frame(outer, style="LicenseRoot.TFrame")
-        secondary_heading.pack(fill="x", pady=(15, 7))
-        ttk.Label(secondary_heading, text="个人授权，或准备购买", style="LicenseSecondaryHeading.TLabel").pack(side="left")
+        # Do not open a nested Toplevel here. On recent macOS releases, Tk's
+        # text-input bridge can crash when a third-party input method switches
+        # first responder while an already-modal Tk window opens another one.
+        # Keeping the verification fields in this same scrollable window
+        # avoids that native path entirely.
+        self.team_verify = ttk.Frame(outer, style="LicenseTeam.TFrame", padding=(15, 12))
+        ttk.Label(self.team_verify, text="验证团队邀请邮箱", style="LicenseTeamTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            self.team_verify,
+            text="输入受邀请的邮箱，获取验证码后即可授权当前 Mac。",
+            style="LicenseTeamCopy.TLabel", wraplength=540, justify="left",
+        ).pack(anchor="w", pady=(3, 9))
+        self.team_email = tk.StringVar()
+        ttk.Entry(self.team_verify, textvariable=self.team_email).pack(fill="x")
+        team_request = ttk.Frame(self.team_verify, style="LicenseTeam.TFrame")
+        team_request.pack(fill="x", pady=(8, 0))
+        self.team_send_button = ttk.Button(
+            team_request,
+            text="发送验证码",
+            command=self.request_team_code,
+            style="LicenseSecondary.TButton",
+        )
+        self.team_send_button.pack(side="left")
+        self.team_note = tk.StringVar(value="验证码会发送至受邀请的邮箱。")
+        ttk.Label(team_request, textvariable=self.team_note, style="LicenseTeamCopy.TLabel").pack(side="left", padx=(10, 0))
+        team_verify_row = ttk.Frame(self.team_verify, style="LicenseTeam.TFrame")
+        team_verify_row.pack(fill="x", pady=(10, 0))
+        self.team_code = tk.StringVar()
+        ttk.Entry(team_verify_row, textvariable=self.team_code, width=18).pack(side="left")
+        self.team_activate_button = ttk.Button(
+            team_verify_row,
+            text="确认团队授权",
+            command=self.activate_team,
+            style="LicensePrimary.TButton",
+        )
+        self.team_activate_button.pack(side="right")
+
+        self.secondary_heading = ttk.Frame(outer, style="LicenseRoot.TFrame")
+        self.secondary_heading.pack(fill="x", pady=(15, 7))
+        ttk.Label(self.secondary_heading, text="个人授权，或准备购买", style="LicenseSecondaryHeading.TLabel").pack(side="left")
 
         offers = ttk.Frame(outer, style="LicenseRoot.TFrame")
         offers.pack(fill="x")
@@ -429,25 +457,35 @@ class LicenseDialog(tk.Toplevel):
         self.lifetime_plan.pack(side="right")
         payment_actions = ttk.Frame(purchase, style="LicenseCard.TFrame")
         payment_actions.pack(fill="x")
-        self.alipay_button = ttk.Button(payment_actions, text="支付宝", command=lambda: self.begin_purchase("alipay"), style="LicenseSecondary.TButton")
-        self.alipay_button.pack(side="left")
-        self.wechat_button = ttk.Button(payment_actions, text="微信支付", command=lambda: self.begin_purchase("wechat"), style="LicensePrimary.TButton")
-        self.wechat_button.pack(side="right")
+        # Keep the two payment choices equally prominent.  Using equal grid
+        # columns makes their visible width match even when the dialog is
+        # resized, rather than relying on the label's character count.
+        payment_actions.columnconfigure(0, weight=1, uniform="payment")
+        payment_actions.columnconfigure(1, weight=1, uniform="payment")
+        self.alipay_button = ttk.Button(
+            payment_actions,
+            text="支付宝支付",
+            command=lambda: self.begin_purchase("alipay"),
+            style="LicenseAlipay.TButton",
+        )
+        self.alipay_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.wechat_button = ttk.Button(
+            payment_actions,
+            text="微信支付",
+            command=lambda: self.begin_purchase("wechat"),
+            style="LicenseWeChat.TButton",
+        )
+        self.wechat_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Label(
+            purchase,
+            text="点击后将在官网完成安全付款，付款成功后激活码会发送至邮箱。",
+            style="LicenseCardCopy.TLabel", wraplength=220, justify="left",
+        ).pack(anchor="w", pady=(9, 0))
 
         payment_feedback = ttk.Frame(outer, style="LicenseRoot.TFrame")
         payment_feedback.pack(fill="x", pady=(11, 0))
         self.payment_note = tk.StringVar()
         ttk.Label(payment_feedback, textvariable=self.payment_note, style="LicenseSubtitle.TLabel", wraplength=590, justify="left").pack(anchor="w", fill="x")
-        self.order_status_button = ttk.Button(
-            payment_feedback,
-            text="完成付款后刷新授权",
-            command=self.refresh_order,
-            state="disabled",
-            style="LicensePrimary.TButton",
-        )
-        self.order_status_button.pack(anchor="w", pady=(8, 0))
-        self.qr = ttk.Label(payment_feedback, style="LicenseCard.TLabel")
-        self.qr.pack(anchor="w", pady=(10, 0))
 
         footer = ttk.Frame(outer, style="LicenseRoot.TFrame")
         footer.pack(fill="x", pady=(12, 0))
@@ -458,8 +496,10 @@ class LicenseDialog(tk.Toplevel):
         ttk.Button(footer, text="关闭", command=self.destroy, style="LicenseQuiet.TButton").pack(side="right")
         self._controls = [
             self.trial_start_button, self.alipay_button,
-            self.wechat_button, self.order_status_button, self.activate_button,
-            self.refresh_button, self.devices_button, self.team_button, self.monthly_plan, self.lifetime_plan,
+            self.wechat_button, self.activate_button,
+            self.refresh_button, self.devices_button, self.team_button,
+            self.team_send_button, self.team_activate_button,
+            self.monthly_plan, self.lifetime_plan,
         ]
 
         self.refresh_view()
@@ -517,6 +557,10 @@ class LicenseDialog(tk.Toplevel):
         style.map("LicensePlan.TRadiobutton", background=[("active", "#1a1d20")], foreground=[("disabled", "#70777d")])
         style.configure("LicensePrimary.TButton", background="#3478e5", foreground="#ffffff", borderwidth=0, padding=(13, 9), font=("Helvetica Neue", 11, "bold"))
         style.map("LicensePrimary.TButton", background=[("active", "#4a8bf0"), ("disabled", "#35465f")], foreground=[("disabled", "#98a4b5")])
+        style.configure("LicenseAlipay.TButton", background="#1677ff", foreground="#ffffff", borderwidth=0, padding=(12, 9), font=("Helvetica Neue", 11, "bold"))
+        style.map("LicenseAlipay.TButton", background=[("active", "#4096ff"), ("disabled", "#2d4769")], foreground=[("disabled", "#aab8ca")])
+        style.configure("LicenseWeChat.TButton", background="#07c160", foreground="#ffffff", borderwidth=0, padding=(12, 9), font=("Helvetica Neue", 11, "bold"))
+        style.map("LicenseWeChat.TButton", background=[("active", "#2bc879"), ("disabled", "#254d3a")], foreground=[("disabled", "#a8c7b5")])
         style.configure("LicenseTrial.TButton", background="#d99536", foreground="#18130c", borderwidth=0, padding=(18, 10), font=("Helvetica Neue", 12, "bold"))
         style.map("LicenseTrial.TButton", background=[("active", "#e9ab50"), ("disabled", "#625035")], foreground=[("disabled", "#b7a98f")])
         style.configure("LicenseSecondary.TButton", background="#292e33", foreground="#edf0f2", borderwidth=0, padding=(12, 9), font=("Helvetica Neue", 11, "bold"))
@@ -542,7 +586,10 @@ class LicenseDialog(tk.Toplevel):
 
     def _failed(self, detail: str) -> None:
         self.refresh_view()
-        messagebox.showwarning("授权与订阅", detail, parent=self)
+        # Keep authorization feedback in the existing window. Besides being
+        # less disruptive during a cull, this avoids spawning a native Tk
+        # alert while an IME is changing focus on macOS.
+        self.payment_note.set(detail)
 
     def _finished(self, value: Any, finished: Callable[[Any], None]) -> None:
         finished(value)
@@ -557,17 +604,25 @@ class LicenseDialog(tk.Toplevel):
             f"{team_name} · 团队永久授权已启用。团队主人可在网站管理成员和设备。"
             if team_name else decision.message
         )
-        self.team_button.configure(text="管理团队授权设备" if team_name else "使用团队邮箱验证")
+        if team_name:
+            self.team_access.pack_forget()
+            self.team_verify.pack_forget()
+        elif not self.team_access.winfo_manager():
+            self.team_access.pack(fill="x", pady=(10, 0), before=self.secondary_heading)
+        self.team_button.configure(text="使用团队邮箱验证")
+        # _run disables every action while a request is in flight. Restore
+        # the controls needed for the second step of email verification too.
+        self.team_button.configure(state="normal")
+        self.team_send_button.configure(state="normal")
+        self.team_activate_button.configure(state="normal")
+        self.monthly_plan.configure(state="normal")
+        self.lifetime_plan.configure(state="normal")
         has_device = self.controller.service.credential() is not None
         self.devices_button.configure(state="normal" if has_device else "disabled")
         self.refresh_button.configure(state="normal" if has_device else "disabled")
-        if self.pending_order is not None and self.payment_actions_available:
-            self.order_status_button.configure(state="normal")
-        else:
-            self.order_status_button.configure(state="disabled")
         self.activate_button.configure(state="normal")
-        self.alipay_button.configure(state="normal" if self.payment_actions_available else "disabled")
-        self.wechat_button.configure(state="normal" if self.payment_actions_available else "disabled")
+        self.alipay_button.configure(state="normal")
+        self.wechat_button.configure(state="normal")
         self.trial_start_button.configure(state="disabled" if has_device else "normal")
 
     def start_trial(self) -> None:
@@ -575,8 +630,6 @@ class LicenseDialog(tk.Toplevel):
 
     def _trial_activated(self, _lease: Any) -> None:
         self.payment_note.set(f"{TRIAL_DAYS} 天试用已开通，并已绑定当前 Mac。授权凭据已保存到系统钥匙串。")
-        self.qr.configure(image="")
-        self._qr_image = None
 
     def activate(self) -> None:
         if not self.code.get().strip():
@@ -584,78 +637,74 @@ class LicenseDialog(tk.Toplevel):
             return
         self._run(lambda: self.controller.activate(self.email.get(), self.code.get()), self._activated)
 
+    def request_team_code(self) -> None:
+        email = self.team_email.get().strip()
+        if not email:
+            self.payment_note.set("请先填写受邀请的团队邮箱。")
+            return
+        self._run(
+            lambda: self.controller.request_team_activation_code(email),
+            self._team_code_sent,
+        )
+
+    def _team_code_sent(self, _result: Any) -> None:
+        self.team_note.set("验证码已发送，请在 10 分钟内填写下方验证码。")
+        self.payment_note.set("团队验证码已发送。")
+
+    def activate_team(self) -> None:
+        email = self.team_email.get().strip()
+        code = self.team_code.get().strip()
+        if not email or not code:
+            self.payment_note.set("请填写团队邀请邮箱和验证码。")
+            return
+        self._run(
+            lambda: self.controller.activate_team(email, code),
+            self._team_activated,
+        )
+
+    def _team_activated(self, _lease: Any) -> None:
+        self.team_code.set("")
+        self.payment_note.set("当前 Mac 已完成团队邮箱验证和授权。")
+
     def _activated(self, _lease: Any) -> None:
         self.code.set("")
         self.payment_note.set("当前设备已完成授权。你可在“管理设备”中自行移除旧设备。")
-        self.qr.configure(image="")
-        self._qr_image = None
 
     def refresh_license(self) -> None:
         self._run(self.controller.refresh, lambda _lease: self.payment_note.set("授权已刷新。"))
 
     def begin_purchase(self, provider: str) -> None:
-        if not self.payment_actions_available:
-            return
         plan = self.plan.get()
         if plan not in {"monthly", "lifetime"} or provider not in {"alipay", "wechat"}:
             return
-
-        def created(order: CheckoutOrder) -> None:
-            self.pending_order = order
-            self.order_status_button.configure(state="normal")
-            price = f"¥{order.amount_cents / 100:.2f}"
-            if order.payment_type == "redirect":
-                webbrowser.open(order.payment_value)
-                self.payment_note.set(f"支付宝支付页已在浏览器打开（{price}）。完成付款后回到这里点击“我已付款，刷新授权”。")
-                self.qr.configure(image="")
-                self._qr_image = None
-                return
-            try:
-                import qrcode
-                image = qrcode.make(order.payment_value).convert("RGB")
-                image.thumbnail((230, 230))
-                self._qr_image = ImageTk.PhotoImage(image)
-                self.qr.configure(image=self._qr_image, text="")
-                self.payment_note.set(f"请使用微信扫描二维码完成支付（{price}）。支付后点击“我已付款，刷新授权”。")
-            except Exception:
-                self.payment_note.set("微信订单已创建；请在微信商户侧完成支付后点击“我已付款，刷新授权”。")
-
-        self._run(
-            lambda: self.controller.service.create_checkout(email=self.email.get(), plan=plan, provider=provider),
-            created,
+        query = urllib.parse.urlencode(
+            {
+                "checkout": "1",
+                "plan": plan,
+                "provider": provider,
+                "email": self.email.get().strip(),
+            }
         )
-
-    def refresh_order(self) -> None:
-        if not self.payment_actions_available:
-            return
-        order = self.pending_order
-        if order is None:
-            return
-
-        def checked(status: dict[str, Any]) -> None:
-            if status.get("status") != "paid":
-                self.payment_note.set("订单仍在等待支付平台回调确认；请稍后再刷新。")
-                return
-            code = status.get("activation_code")
-            if not isinstance(code, str):
-                self.payment_note.set("付款已确认，但激活码暂未生成，请稍后刷新。")
-                return
-            self.code.set(code)
-            self._run(lambda: self.controller.activate(self.email.get(), code), self._activated)
-
-        self._run(lambda: self.controller.service.checkout_status(order), checked)
+        webbrowser.open_new_tab(f"{CHECKOUT_PAGE_URL}?{query}")
+        self.payment_note.set("已在浏览器打开官网支付页；付款成功后，请使用邮件中的激活码回到这里完成授权。")
 
     def manage_devices(self) -> None:
         DeviceManagementDialog(self, self.controller)
 
     def manage_team(self, *, initial_email: str = "") -> None:
-        def completed_team_authorization() -> None:
-            self.on_changed()
-            self.destroy()
-
-        TeamAuthorizationDialog(
-            self,
-            self.controller,
-            completed_team_authorization,
-            initial_email=initial_email,
+        if self.controller.lease is not None and self.controller.lease.team_name:
+            self.manage_devices()
+            return
+        if initial_email.strip() and not self.team_email.get().strip():
+            self.team_email.set(initial_email.strip())
+        if self.team_verify.winfo_manager():
+            self.team_verify.pack_forget()
+            self.team_button.configure(text="使用团队邮箱验证")
+            return
+        self.team_verify.pack(
+            fill="x",
+            pady=(0, 0),
+            before=self.secondary_heading,
         )
+        self.team_button.configure(text="收起团队邮箱验证")
+        self._sync_scroll_region()

@@ -16,9 +16,14 @@ def test_scene_picker_includes_every_supported_scene_rule_set():
     assert SCENE_TYPES == ("通用", "婚礼", "人像写真", "活动纪实", "儿童与家庭", "毕业照", "证件照", "美食")
 
 
-def test_main_window_uses_available_display_space_without_exceeding_release_size():
-    assert EventCullApp._main_window_size_for_screen(1728, 1117) == (1680, 1033)
-    assert EventCullApp._main_window_size_for_screen(2560, 1600) == (1700, 1050)
+def test_main_window_opens_larger_but_keeps_a_display_margin():
+    assert EventCullApp._main_window_size_for_screen(1728, 1117) == (1696, 1053)
+    assert EventCullApp._main_window_size_for_screen(2560, 1600) == (1900, 1180)
+    assert EventCullApp._main_window_size_for_screen(1440, 900) == (1408, 836)
+
+
+def test_legacy_rating_repair_count_is_explicitly_a_photo_count():
+    assert EventCullApp._legacy_repair_button_text(1) == "修复旧版星级 · 待处理 1 张照片"
 
 
 def test_mousewheel_normalization_supports_trackpads_and_notched_wheels():
@@ -265,7 +270,7 @@ def test_picker_summary_makes_active_detection_rules_explicit():
     app.detect_exposure = Value(True)
     app.detect_duplicates = Value(True)
 
-    assert app._picker_rule_summary_text() == "目标 至少 200，建议 300 张 · 每组优选 2–3 张 · 闭眼、模糊、曝光、重复检测"
+    assert app._picker_rule_summary_text() == "目标 至少 200，最多 300 张 · 每组优选 2–3 张 · 闭眼、模糊、曝光、重复检测"
 
 
 def test_start_analysis_opens_rule_confirmation_before_any_analysis_work():

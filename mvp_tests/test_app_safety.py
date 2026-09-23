@@ -156,6 +156,14 @@ def test_main_workspace_uses_native_horizontal_resizable_panes():
     assert 'content.add(right_shell, minsize=280' in contents
 
 
+def test_main_authorization_never_opens_a_nested_team_dialog_on_macos():
+    source = Path(__file__).parents[1] / "event_cull" / "app.py"
+    contents = source.read_text(encoding="utf-8")
+
+    assert "from event_cull.license_ui import LicenseDialog" in contents
+    assert "TeamAuthorizationDialog" not in contents
+
+
 def test_results_table_keeps_identifier_columns_compact():
     source = Path(__file__).parents[1] / "event_cull" / "app.py"
     contents = source.read_text(encoding="utf-8")

@@ -18,6 +18,11 @@ datas = [
     ('event_cull/data/other_must_keep_shots.csv', 'event_cull/data'),
     ('assets/branding/miaoxuan-logo.png', 'assets/branding'),
 ]
+if os.environ.get('MIAOXUAN_INTERNAL_BUILD') == '1':
+    datas.append(('event_cull/internal_build_marker.txt', 'event_cull'))
+for exiftool_file in Path('event_cull/vendor/exiftool').rglob('*'):
+    if exiftool_file.is_file():
+        datas.append((str(exiftool_file), str(exiftool_file.parent)))
 binaries = []
 hiddenimports = []
 datas += collect_data_files('cv2')
@@ -26,7 +31,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 # Personal calibration uses an inference-only ONNX model. Avoid collecting the
 # complete PyTorch training runtime, which previously added hundreds of MB.
-for package in ('cryptography', 'keyring', 'qrcode'):
+for package in ('cryptography', 'keyring', 'qrcode', 'pillow_heif'):
     tmp_ret = collect_all(package)
     datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
@@ -49,7 +54,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=(['runtime_hook_internal.py'] if os.environ.get('MIAOXUAN_INTERNAL_BUILD') == '1' else []),
+    runtime_hooks=[],
     excludes=['torch', 'torchvision', 'onnx', 'onnxscript'],
     noarchive=False,
     optimize=0,

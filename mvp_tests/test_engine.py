@@ -653,6 +653,31 @@ def test_mixed_group_expression_and_front_focus_cannot_be_three_star():
     assert front_focus.suggested_rating != 3
 
 
+def test_soft_people_are_rejected_even_when_background_texture_is_sharp():
+    import event_cull.engine as engine
+
+    # Regression for a motion-blurred two-person frame whose sharp stones and
+    # foliage previously gave it a 3-star score (IMG_4537-style metrics).
+    soft_people = PhotoResult(
+        Path("soft-people.jpg"), score=105, sharpness=788,
+        subject_sharpness=327, frontal_face_count=2, open_eye_face_count=0,
+        perceptual_hash=1,
+    )
+    clear_alternative = PhotoResult(
+        Path("clear-people.jpg"), score=100, sharpness=788,
+        subject_sharpness=600, frontal_face_count=2, open_eye_face_count=2,
+        perceptual_hash=2,
+    )
+
+    engine._assign_tiered_ratings(
+        [[soft_people], [clear_alternative]],
+        AnalysisOptions(target_keep_count=1, target_keep_max_count=2),
+    )
+
+    assert soft_people.suggested_rating == 0
+    assert clear_alternative.suggested_rating > 0
+
+
 def test_smile_survives_when_another_person_is_not_looking_at_camera():
     import event_cull.engine as engine
 
@@ -867,7 +892,7 @@ def test_target_floor_is_not_reduced_by_a_per_group_selection_cap():
     assert sum(item.suggested_rating > 0 for item in groups[0]) >= 6
 
 
-def test_qualified_single_photo_scene_is_retained_and_explained():
+def test_qualified_single_photo_scene_is_retained_when_within_target_and_explained():
     import event_cull.engine as engine
 
     singleton = PhotoResult(Path("detail.jpg"), score=20, sharpness=100, perceptual_hash=1)
@@ -878,11 +903,29 @@ def test_qualified_single_photo_scene_is_retained_and_explained():
 
     engine._assign_tiered_ratings(
         [[singleton], competing_scene],
-        AnalysisOptions(target_keep_count=1, target_keep_max_count=1),
+        AnalysisOptions(target_keep_count=2, target_keep_max_count=2),
     )
 
     assert singleton.suggested_rating > 0
     assert "独立场景代表" in "；".join(singleton.reasons)
+
+
+def test_fragmented_scenes_do_not_raise_the_photographer_maximum():
+    import event_cull.engine as engine
+
+    # A pose change may fragment one real scene into many one-frame groups.
+    # Those groups cannot turn an 80-photo limit into hundreds of picks.
+    groups = [
+        [PhotoResult(Path(f"IMG_{index:04d}.jpg"), score=1000 - index, perceptual_hash=index + 1)]
+        for index in range(607)
+    ]
+
+    engine._assign_tiered_ratings(
+        groups,
+        AnalysisOptions(target_keep_count=40, target_keep_max_count=80),
+    )
+
+    assert sum(item.suggested_rating > 0 for group in groups for item in group) == 80
 
 
 def test_only_one_three_star_is_selected_from_each_similar_group():

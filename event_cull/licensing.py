@@ -203,10 +203,10 @@ def license_label(decision: LicenseDecision) -> str:
     remaining = max(0, int((lease.subscription_until - datetime.now(UTC)).total_seconds()))
     days, remainder = divmod(remaining, 86400)
     hours = remainder // 3600
-    if days == 0 and hours < 25:
-        return f"试用剩余 {max(1, hours)} 小时"
     if (lease.subscription_until - lease.issued_at) <= timedelta(days=TRIAL_DAYS):
-        return f"试用剩余 {days} 天"
+        if days == 0:
+            return f"试用剩余 {max(1, hours)} 小时"
+        return f"试用剩余 {days} 天 {hours} 小时"
     return f"订阅剩余 {days} 天"
 
 

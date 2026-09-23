@@ -4,6 +4,7 @@ import time
 
 import cv2
 import numpy as np
+from PIL import Image
 
 import event_cull.engine as engine
 from event_cull.engine import AnalysisOptions, PhotoResult
@@ -38,6 +39,28 @@ def test_preview_respects_requested_display_limit(monkeypatch, tmp_path: Path):
     preview = engine._load_preview(photo, maximum_dimension=320)
 
     assert preview.shape[:2] == (160, 320)
+
+
+def test_heic_preview_registers_the_bundled_decoder(monkeypatch, tmp_path: Path):
+    photo = tmp_path / "IMG_0001.HEIC"
+    photo.write_bytes(b"heic")
+    registrations = []
+    source = Image.new("RGB", (640, 480), color=(30, 40, 50))
+
+    class OpenedImage:
+        def __enter__(self):
+            return source
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(engine, "register_heif_opener", lambda: registrations.append(True))
+    monkeypatch.setattr(engine.Image, "open", lambda _path: OpenedImage())
+
+    preview = engine._load_preview(photo, maximum_dimension=320)
+
+    assert registrations == [True]
+    assert preview.shape[:2] == (240, 320)
 
 
 def test_face_detectors_are_reused_within_worker_thread(monkeypatch):

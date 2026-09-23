@@ -7,6 +7,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 import event_cull.licensing as licensing
+from event_cull.build_config import is_internal_developer_build
 
 
 def _lease(*, plan=licensing.LicensePlan.MONTHLY, expires_in_days=30, offline_hours=24, team_name=None):
@@ -60,7 +61,7 @@ def test_three_day_trial_copy_and_remaining_time_are_not_described_as_a_subscrip
 
     assert licensing.TRIAL_DAYS == 3
     assert "3 天试用" in licensing.evaluate_lease(None).message
-    assert licensing.license_label(licensing.evaluate_lease(lease)).startswith("试用剩余")
+    assert licensing.license_label(licensing.evaluate_lease(lease)) == "试用剩余 2 天 23 小时"
 
 
 def test_signed_lease_is_verified_and_tampering_is_rejected(monkeypatch):
@@ -214,3 +215,16 @@ def test_controlled_internal_package_can_use_developer_entitlement(monkeypatch):
 
     assert controller.decision.allows_analysis is True
     assert controller.decision.plan is licensing.LicensePlan.DEVELOPER
+
+
+def test_public_package_cannot_enable_developer_access_with_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("MIAOXUAN_INTERNAL_DEVELOPER_BUILD", "1")
+    monkeypatch.setenv("MIAOXUAN_INTERNAL_BUILD", "1")
+
+    assert not is_internal_developer_build(frozen=True, bundle_root=tmp_path)
+
+    marker = tmp_path / "event_cull" / "internal_build_marker.txt"
+    marker.parent.mkdir()
+    marker.write_text("private package")
+    assert is_internal_developer_build(frozen=True, bundle_root=tmp_path)
+    assert not is_internal_developer_build(frozen=False, bundle_root=tmp_path)

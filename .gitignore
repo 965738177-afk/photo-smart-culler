@@ -182,6 +182,7 @@ cython_debug/
 # Local photo-analysis artifacts and macOS delivery bundles.
 /work/
 /release/
+/event_cull/internal_build_marker.txt
 /*.app/
 /*.zip
 /design-previews/rendered/
