@@ -144,7 +144,10 @@ def _run_bundled_exiftool(*arguments: str) -> str:
             encoding="utf-8",
             errors="replace",
             input=input_text,
+            timeout=180,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("照片元数据写入超时，请检查原片所在磁盘并重试") from exc
     except OSError as exc:  # pragma: no cover - platform launch failure
         raise RuntimeError(f"无法启动 HEIC 元数据组件：{exc}") from exc
     if completed.returncode != 0:

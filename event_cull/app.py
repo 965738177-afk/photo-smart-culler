@@ -5244,13 +5244,20 @@ def _run_packaging_smoke_test() -> None:
             getattr(app, name).invoke()
             mark(f"invoked-{name}")
             app.update_idletasks()
-        from event_cull.xmp import _run_bundled_exiftool
-        mark("running-exiftool")
-        version = _run_bundled_exiftool("-ver")
-        if not version:
-            raise RuntimeError("Bundled Windows ExifTool did not start")
+        from tempfile import TemporaryDirectory
+        from event_cull.xmp import _read_embedded_rating, restore_managed_rating, write_rating
+        with TemporaryDirectory() as directory:
+            photo = Path(directory) / "测试照片.jpg"
+            Image.new("RGB", (32, 32), "#4682b4").save(photo)
+            mark("writing-jpeg-rating")
+            write_rating(photo, 3)
+            mark("reading-jpeg-rating")
+            if _read_embedded_rating(photo) != 3:
+                raise RuntimeError("Bundled Windows ExifTool rating round-trip failed")
+            mark("restoring-jpeg-rating")
+            restore_managed_rating(photo)
         mark("exiftool-verified")
-        print(f"MiaoXuan Windows packaging smoke passed; ExifTool {version}")
+        print("MiaoXuan Windows packaging smoke passed")
     finally:
         mark("destroying")
         app.destroy()
