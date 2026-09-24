@@ -5231,7 +5231,14 @@ def _run_packaging_smoke_test() -> None:
     mark("starting")
     app = EventCullApp()
     mark("app-created")
+    from tempfile import TemporaryDirectory
+    source_dir = TemporaryDirectory(prefix="MiaoXuan-Smoke-Source-")
     try:
+        imported_photo = Path(source_dir.name) / "import.jpg"
+        Image.new("RGB", (32, 32), "#4682b4").save(imported_photo)
+        if not app._load_selected_files([imported_photo]):
+            raise RuntimeError("Windows photo import failed")
+        mark("photo-imported")
         app.update_idletasks()
         mark("idle-updated")
         required = (
@@ -5269,7 +5276,6 @@ def _run_packaging_smoke_test() -> None:
             windows[0].destroy()
             mark(f"closed-{name}")
             app.update()
-        from tempfile import TemporaryDirectory
         from event_cull.xmp import _read_embedded_rating, restore_managed_rating, write_rating
         with TemporaryDirectory() as directory:
             photo = Path(directory) / "测试照片.jpg"
@@ -5287,6 +5293,7 @@ def _run_packaging_smoke_test() -> None:
         mark("destroying")
         app.destroy()
         mark("destroyed")
+        source_dir.cleanup()
 
 
 if __name__ == "__main__":
