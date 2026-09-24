@@ -58,21 +58,6 @@ jobs:
           Get-Content $env:MIAOXUAN_SMOKE_TRACE
       - name: Build the Tk culler, not the unrelated Qt PhotoSort app
         run: python -m PyInstaller --clean --noconfirm MiaoXuan-Windows.spec
-      - name: Probe bundled ExifTool outside the GUI process
-        run: |
-          @'
-          import subprocess
-          from pathlib import Path
-          root = Path('dist/秒选-Windows/_internal/event_cull/vendor/exiftool-windows').resolve()
-          exe = root / 'exiftool.exe'
-          assert exe.is_file() and (root / 'exiftool_files').is_dir()
-          for command, data in (([str(exe), '-ver'], None), ([str(exe), '-charset', 'filename=UTF8', '-@', '-'], '-ver\n')):
-              try:
-                  result = subprocess.run(command, input=data, capture_output=True, text=True, timeout=15)
-                  print('ExifTool probe:', result.returncode, repr(result.stdout[:100]), repr(result.stderr[:100]))
-              except subprocess.TimeoutExpired:
-                  print('ExifTool probe timed out:', command[1:])
-          '@ | python -
       - name: Launch frozen app and verify its primary controls
         run: |
           @'

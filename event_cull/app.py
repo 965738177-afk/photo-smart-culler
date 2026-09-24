@@ -5247,8 +5247,27 @@ def _run_packaging_smoke_test() -> None:
                 raise RuntimeError(f"Missing or unbound Windows button: {name}")
         mark("controls-verified")
         for name in ("export_nav_button", "calibration_nav_button", "cull_nav_button", "history_button"):
+            before = set(app.winfo_children())
             getattr(app, name).invoke()
             mark(f"invoked-{name}")
+            app.update()
+            if name == "history_button":
+                windows = [child for child in app.winfo_children() if isinstance(child, tk.Toplevel) and child not in before]
+                if len(windows) != 1:
+                    raise RuntimeError("History button did not open its window")
+                windows[0].destroy()
+                mark("history-closed")
+                app.update()
+        for name in ("picker_settings_button", "license_button"):
+            before = set(app.winfo_children())
+            getattr(app, name).invoke()
+            mark(f"invoked-{name}")
+            app.update()
+            windows = [child for child in app.winfo_children() if isinstance(child, tk.Toplevel) and child not in before]
+            if len(windows) != 1:
+                raise RuntimeError(f"{name} did not open its window")
+            windows[0].destroy()
+            mark(f"closed-{name}")
             app.update()
         from tempfile import TemporaryDirectory
         from event_cull.xmp import _read_embedded_rating, restore_managed_rating, write_rating
@@ -5266,10 +5285,6 @@ def _run_packaging_smoke_test() -> None:
         print("MiaoXuan Windows packaging smoke passed")
     finally:
         mark("destroying")
-        for child in list(app.children.values()):
-            mark(f"destroy-child-{child.winfo_class()}-{child.winfo_name()}")
-            child.destroy()
-            mark("destroy-child-done")
         app.destroy()
         mark("destroyed")
 
