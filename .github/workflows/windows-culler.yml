@@ -1,0 +1,77 @@
+name: Build and verify MiaoXuan Windows
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "event_cull/**"
+      - "mvp_tests/**"
+      - "requirements-mvp.txt"
+      - "MiaoXuan-Windows.spec"
+      - "scripts/prepare_windows_exiftool.py"
+      - ".github/workflows/windows-culler.yml"
+  push:
+    branches: [main, "windows-culler*"]
+    paths:
+      - "event_cull/**"
+      - "mvp_tests/**"
+      - "requirements-mvp.txt"
+      - "MiaoXuan-Windows.spec"
+      - "scripts/prepare_windows_exiftool.py"
+      - ".github/workflows/windows-culler.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          architecture: x64
+      - name: Install application and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-mvp.txt -r requirements-build.txt pytest
+          python -m pip check
+      - name: Prepare checksum-verified Windows metadata writer
+        run: python scripts/prepare_windows_exiftool.py
+      - name: Generate Windows icon
+        run: |
+          @'
+          from PIL import Image
+          Image.open('assets/branding/miaoxuan-logo.png').save('build/miaoxuan.ico', sizes=[(16,16), (32,32), (48,48), (256,256)])
+          '@ | python -
+      - name: Run all culler regression tests on Windows
+        run: python -m pytest -q mvp_tests
+      - name: Build the Tk culler, not the unrelated Qt PhotoSort app
+        run: python -m PyInstaller --clean --noconfirm MiaoXuan-Windows.spec
+      - name: Launch frozen app and verify its primary controls
+        run: |
+          @'
+          import subprocess
+          from pathlib import Path
+          executable = Path('dist/秒选-Windows/秒选.exe').resolve()
+          completed = subprocess.run([str(executable), '--packaging-smoke-test'], timeout=60, check=False)
+          assert completed.returncode == 0, f'Packaged app smoke failed: {completed.returncode}'
+          '@ | python -
+      - name: Zip portable Windows application
+        run: Compress-Archive -Path 'dist/秒选-Windows' -DestinationPath 'dist/秒选-Windows-x64.zip'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MiaoXuan-Windows-x64
+          path: dist/秒选-Windows-x64.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: MiaoXuan-Windows-diagnostics
+          path: build/MiaoXuan-Windows/warn-MiaoXuan-Windows.txt
+          if-no-files-found: ignore

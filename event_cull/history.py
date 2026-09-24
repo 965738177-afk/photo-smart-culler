@@ -8,13 +8,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
+from event_cull.platform_paths import application_data_dir
+
 
 HISTORY_VERSION = 1
 MAX_HISTORY_RECORDS = 200
 
 
 def application_support_path() -> Path:
-    return Path.home() / "Library" / "Application Support" / "EventCull"
+    return application_data_dir()
 
 
 def history_path() -> Path:

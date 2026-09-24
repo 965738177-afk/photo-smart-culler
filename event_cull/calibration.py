@@ -20,6 +20,7 @@ import numpy as np
 
 from event_cull.engine import IMAGE_EXTENSIONS, PhotoResult, _load_preview
 from event_cull.source_scan import scan_source_images
+from event_cull.platform_paths import application_data_dir
 from event_cull.deep_features import (
     PIPELINE_ID as DEEP_PIPELINE_ID,
     DeepFeatureUnavailable,
@@ -102,7 +103,7 @@ class CalibrationProfile:
 
 
 def default_profile_path() -> Path:
-    return Path.home() / "Library" / "Application Support" / "EventCull" / "calibration" / PROFILE_FILENAME
+    return application_data_dir() / "calibration" / PROFILE_FILENAME
 
 
 def load_profile(path: Path | None = None) -> CalibrationProfile | None:

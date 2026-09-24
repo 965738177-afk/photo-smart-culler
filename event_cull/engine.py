@@ -289,7 +289,7 @@ def _load_preview(path: Path, *, maximum_dimension: int = 1600) -> np.ndarray:
         if quicklook is not None:
             return quicklook
         raise RuntimeError(
-            "无法生成 RAW 缩略图：此机型暂未被 LibRaw 或 macOS Quick Look 支持"
+            "无法生成 RAW 缩略图：当前设备的解码组件暂不支持此相机文件"
         )
     if path.suffix.lower() in {".jpg", ".jpeg"}:
         image = cv2.imread(str(path), cv2.IMREAD_REDUCED_COLOR_4)
@@ -722,7 +722,9 @@ def _cache_path() -> Path:
     override = os.environ.get("EVENT_CULL_CACHE_PATH")
     if override:
         return Path(override)
-    return Path.home() / "Library" / "Caches" / "照片原图快速筛选器" / "analysis-v1.json"
+    from event_cull.platform_paths import cache_dir
+
+    return cache_dir() / "analysis-v1.json"
 
 
 def _load_analysis_cache() -> dict[str, dict]:

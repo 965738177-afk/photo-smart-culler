@@ -189,3 +189,5 @@ cython_debug/
 
 # This project keeps its small PyInstaller definition under version control.
 !照片原图快速筛选器.spec
+!MiaoXuan-Windows.spec
+event_cull/vendor/exiftool-windows/

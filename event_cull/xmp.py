@@ -113,24 +113,37 @@ def _bundled_exiftool_root() -> Path:
     well-tested ISO-BMFF metadata update without re-encoding HEIC pixels.
     """
     bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
-    return bundle_root / "event_cull" / "vendor" / "exiftool"
+    name = "exiftool-windows" if sys.platform == "win32" else "exiftool"
+    return bundle_root / "event_cull" / "vendor" / name
 
 
 def _run_bundled_exiftool(*arguments: str) -> str:
     root = _bundled_exiftool_root()
-    script = root / "exiftool"
-    library = root / "lib"
-    perl = Path("/usr/bin/perl")
-    if not script.is_file() or not library.is_dir() or not perl.is_file():
-        raise RuntimeError("HEIC 元数据组件不可用；请重新安装秒选后再试")
+    if sys.platform == "win32":
+        executable = root / "exiftool.exe"
+        # ExifTool's UTF-8 argument-file reader is required for Chinese paths
+        # on Windows; command-line filenames otherwise use the active codepage.
+        command = [str(executable), "-charset", "filename=UTF8", "-@", "-"]
+        input_text = "\n".join(arguments) + "\n"
+        available = executable.is_file() and (root / "exiftool_files").is_dir()
+    else:
+        script = root / "exiftool"
+        library = root / "lib"
+        perl = Path("/usr/bin/perl")
+        command = [str(perl), "-I", str(library), str(script), *arguments]
+        input_text = None
+        available = script.is_file() and library.is_dir() and perl.is_file()
+    if not available:
+        raise RuntimeError("照片元数据组件不可用；请重新安装秒选后再试")
     try:
         completed = subprocess.run(
-            [str(perl), "-I", str(library), str(script), *arguments],
+            command,
             check=False,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
+            input=input_text,
         )
     except OSError as exc:  # pragma: no cover - platform launch failure
         raise RuntimeError(f"无法启动 HEIC 元数据组件：{exc}") from exc

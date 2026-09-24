@@ -1,4 +1,4 @@
-"""Safe, manifest-driven update discovery for the macOS desktop app.
+"""Safe, platform-specific manifest-driven desktop update discovery.
 
 The client only downloads a release after the user accepts an in-app prompt.
 Every downloadable release must advertise a SHA-256 digest; a mismatched or
@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
 import urllib.error
 import urllib.parse
@@ -18,9 +19,13 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from event_cull.platform_paths import downloads_dir
+
 
 UPDATE_MANIFEST_URL = os.environ.get(
     "MIAOXUAN_UPDATE_MANIFEST_URL",
+    "https://cull.lhxx.online/api/v1/app-updates/windows"
+    if sys.platform == "win32" else
     "https://cull.lhxx.online/api/v1/app-updates/macos",
 )
 _VERSION = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
@@ -77,7 +82,7 @@ def check_for_update(current_version: str, endpoint: str = UPDATE_MANIFEST_URL) 
 
 def download_update(update: UpdateInfo, downloads: Path | None = None) -> Path:
     """Download the opted-in release and verify its digest before returning it."""
-    target_directory = downloads or Path.home() / "Downloads"
+    target_directory = downloads or downloads_dir()
     target_directory.mkdir(parents=True, exist_ok=True)
     name = Path(urllib.parse.urlparse(update.download_url).path).name or f"照片智能筛选器-{update.version}.zip"
     destination = target_directory / name

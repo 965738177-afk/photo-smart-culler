@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 from collections import OrderedDict
 import hashlib
-from io import BytesIO
+from io import BytesIO, StringIO
 import json
 import locale
 import math
@@ -20,12 +20,12 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from PIL import Image, ImageOps, ImageTk
+from PIL import Image, ImageDraw, ImageOps, ImageTk
 from tkinterdnd2 import COPY, DND_FILES, REFUSE_DROP, TkinterDnD
 
-try:  # macOS ships SF Symbols; use them rather than font-dependent glyphs.
+try:  # Prefer native SF Symbols where available.
     from AppKit import NSImage
-except ImportError:  # pragma: no cover - the production app is macOS-only.
+except ImportError:
     NSImage = None
 
 from event_cull.calibration import (
@@ -59,6 +59,7 @@ from event_cull.export_selected import (
     export_selected_files,
 )
 from event_cull.source_scan import scan_source_images
+from event_cull.platform_paths import application_data_dir
 from event_cull.xmp import (
     EMBEDDED_EXTENSIONS,
     legacy_managed_embedded_photos,
@@ -82,7 +83,6 @@ GRID_CARD_GUTTER = 3
 PRODUCT_TITLE_ZH = "秒选 — 照片智能筛选器"
 BRAND_LOGO_RESOURCE = Path("assets/branding/miaoxuan-logo.png")
 SCENE_TYPES = ("通用", "婚礼", "人像写真", ATMOSPHERE_PORTRAIT_SCENE, "活动纪实", "儿童与家庭", "毕业照", "证件照", "美食")
-
 
 def app_resource_path(relative_path: Path) -> Path:
     """Resolve a bundled asset in both source and PyInstaller builds."""
@@ -312,6 +312,10 @@ TEXT["en"].update({
     "calibration_failed": "Selection preference tuning was not enabled: {error}",
     "calibration_apply_skipped": "Selection preference tuning was not applied: {error}. Base culling results were kept.",
 })
+
+if sys.platform == "win32":
+    TEXT["zh"]["history_open_log"] = "打开日志文件夹"
+    TEXT["en"]["history_open_log"] = "Open log folder"
 
 
 class ToolTip:
@@ -2771,15 +2775,16 @@ class EventCullApp(TkinterDnD.Tk):
         # Mirror every primary workflow action in the native menu bar so
         # VoiceOver and keyboard-only users can still operate the complete flow.
         workflow_menu = tk.Menu(menu_bar, tearoff=False)
-        workflow_menu.add_command(label=self.t["menu_culling"], command=self.show_culling_workspace, accelerator="⌘1")
-        workflow_menu.add_command(label=self.t["menu_export"], command=self.show_export_workspace, accelerator="⌘2")
-        workflow_menu.add_command(label=self.t["menu_calibration"], command=self.show_calibration_workspace, accelerator="⌘3")
+        shortcut = "⌘" if sys.platform == "darwin" else "Ctrl+"
+        workflow_menu.add_command(label=self.t["menu_culling"], command=self.show_culling_workspace, accelerator=f"{shortcut}1")
+        workflow_menu.add_command(label=self.t["menu_export"], command=self.show_export_workspace, accelerator=f"{shortcut}2")
+        workflow_menu.add_command(label=self.t["menu_calibration"], command=self.show_calibration_workspace, accelerator=f"{shortcut}3")
         workflow_menu.add_separator()
-        workflow_menu.add_command(label=self.t["menu_picker_settings"], command=self.show_picker_settings, accelerator="⌘,")
-        workflow_menu.add_command(label=self.t["menu_start_analysis"], command=self.start_analysis, accelerator="⌘↩")
-        workflow_menu.add_command(label=self.t["menu_pause_resume"], command=self._menu_toggle_pause, accelerator="⌘P")
-        workflow_menu.add_command(label=self.t["menu_stop_analysis"], command=self._menu_stop_analysis, accelerator="⌘.")
-        workflow_menu.add_command(label=self.t["menu_write_ratings"], command=self._menu_confirm_write, accelerator="⌘⇧W")
+        workflow_menu.add_command(label=self.t["menu_picker_settings"], command=self.show_picker_settings, accelerator=f"{shortcut},")
+        workflow_menu.add_command(label=self.t["menu_start_analysis"], command=self.start_analysis, accelerator=f"{shortcut}Enter")
+        workflow_menu.add_command(label=self.t["menu_pause_resume"], command=self._menu_toggle_pause, accelerator=f"{shortcut}P")
+        workflow_menu.add_command(label=self.t["menu_stop_analysis"], command=self._menu_stop_analysis, accelerator=f"{shortcut}.")
+        workflow_menu.add_command(label=self.t["menu_write_ratings"], command=self._menu_confirm_write, accelerator=f"{shortcut}Shift+W")
         menu_bar.add_cascade(label=self.t["menu_workflow"], menu=workflow_menu)
 
         window_menu = tk.Menu(menu_bar, tearoff=False)
@@ -2794,14 +2799,15 @@ class EventCullApp(TkinterDnD.Tk):
         self._bind_menu_shortcuts()
 
     def _bind_menu_shortcuts(self) -> None:
-        self.bind_all("<Command-Key-1>", lambda _event: self.show_culling_workspace())
-        self.bind_all("<Command-Key-2>", lambda _event: self.show_export_workspace())
-        self.bind_all("<Command-Key-3>", lambda _event: self.show_calibration_workspace())
-        self.bind_all("<Command-comma>", lambda _event: self.show_picker_settings())
-        self.bind_all("<Command-Return>", lambda _event: self.start_analysis())
-        self.bind_all("<Command-Key-p>", lambda _event: self._menu_toggle_pause())
-        self.bind_all("<Command-period>", lambda _event: self._menu_stop_analysis())
-        self.bind_all("<Command-Shift-Key-W>", lambda _event: self._menu_confirm_write())
+        modifier = "Command" if sys.platform == "darwin" else "Control"
+        self.bind_all(f"<{modifier}-Key-1>", lambda _event: self.show_culling_workspace())
+        self.bind_all(f"<{modifier}-Key-2>", lambda _event: self.show_export_workspace())
+        self.bind_all(f"<{modifier}-Key-3>", lambda _event: self.show_calibration_workspace())
+        self.bind_all(f"<{modifier}-comma>", lambda _event: self.show_picker_settings())
+        self.bind_all(f"<{modifier}-Return>", lambda _event: self.start_analysis())
+        self.bind_all(f"<{modifier}-Key-p>", lambda _event: self._menu_toggle_pause())
+        self.bind_all(f"<{modifier}-period>", lambda _event: self._menu_stop_analysis())
+        self.bind_all(f"<{modifier}-Shift-Key-W>", lambda _event: self._menu_confirm_write())
 
     def _menu_toggle_pause(self) -> None:
         if self.analysis_running:
@@ -2938,6 +2944,8 @@ class EventCullApp(TkinterDnD.Tk):
                 return
             if sys.platform == "darwin":
                 subprocess.run(["open", "-R", str(log_path)], check=False)
+            elif sys.platform == "win32":
+                os.startfile(str(log_path.parent))
             else:
                 subprocess.run(["xdg-open", str(log_path.parent)], check=False)
 
@@ -2964,7 +2972,7 @@ class EventCullApp(TkinterDnD.Tk):
         return image
 
     def _sidebar_icon(self, kind: str, *, color: str = "#e8e5de") -> tk.PhotoImage:
-        """Render a macOS SF Symbol into the shared 18 px sidebar slot."""
+        """Render a native symbol, or a legible platform-independent fallback."""
         symbols = {
             "history": "clock.arrow.circlepath",
             "folder": "folder",
@@ -2976,7 +2984,25 @@ class EventCullApp(TkinterDnD.Tk):
         }
         symbol_name = symbols[kind]
         if NSImage is None:
-            return tk.PhotoImage(width=18, height=18)
+            canvas = Image.new("RGBA", (18, 18))
+            draw = ImageDraw.Draw(canvas)
+            if kind in {"folder", "photos", "export"}:
+                draw.rectangle((2, 5, 15, 14), outline=color, width=2)
+                draw.line((3, 4, 8, 4), fill=color, width=2)
+            elif kind == "history":
+                draw.ellipse((2, 2, 15, 15), outline=color, width=2)
+                draw.line((9, 4, 9, 9, 13, 11), fill=color, width=2)
+            elif kind == "cull":
+                for left in (2, 10):
+                    for top in (2, 10):
+                        draw.rectangle((left, top, left + 5, top + 5), outline=color)
+            elif kind == "list":
+                for top in (4, 8, 12):
+                    draw.line((4, top, 15, top), fill=color, width=2)
+            else:
+                draw.ellipse((5, 2, 12, 9), outline=color, width=2)
+                draw.arc((2, 7, 15, 17), 180, 360, fill=color, width=2)
+            return ImageTk.PhotoImage(canvas)
         native_image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol_name, None)
         if native_image is None:
             return tk.PhotoImage(width=18, height=18)
@@ -3967,10 +3993,7 @@ end run
         stat = path.stat()
         identity = f"preview-v1|{path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}"
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        return (
-            Path.home() / "Library" / "Application Support" / "EventCull" /
-            "preview-cache" / f"{digest}.jpg"
-        )
+        return application_data_dir() / "preview-cache" / f"{digest}.jpg"
 
     def _remember_preview(self, path: Path, image: Image.Image) -> None:
         key = path.resolve()
@@ -4725,7 +4748,7 @@ end run
             return
         if self.current_log_path is None:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            log_folder = Path.home() / "Library" / "Application Support" / "EventCull" / "logs"
+            log_folder = application_data_dir() / "logs"
             log_folder.mkdir(parents=True, exist_ok=True)
             self.current_log_path = log_folder / f"analysis-{stamp}.json"
         temporary = self.current_log_path.with_suffix(".json.tmp")
@@ -4926,6 +4949,29 @@ end run
         Lightroom's crash reporter must not lock a task after Lightroom itself
         has quit, so framework helpers are deliberately ignored.
         """
+        if sys.platform == "win32":
+            try:
+                result = subprocess.run(
+                    ["tasklist", "/fo", "csv", "/nh"],
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=2,
+                    check=False,
+                )
+                process_names = {
+                    row[0].strip().casefold()
+                    for row in csv.reader(StringIO(result.stdout))
+                    if row
+                }
+            except (OSError, subprocess.SubprocessError, csv.Error):
+                return ()
+            matches = (
+                ("lightroom.exe", "Lightroom Classic"),
+                ("photoshop.exe", "Photoshop"),
+                ("pixelcake.exe", "像素蛋糕"),
+            )
+            return tuple(label for executable, label in matches if executable in process_names)
         try:
             result = subprocess.run(
                 ["ps", "-axo", "comm="],
@@ -5167,5 +5213,36 @@ end run
         self.xmp_notice.set(self.lr_instructions)
         self._write_task_history("已还原 XMP" if self.language == "zh" else "XMP restored")
 
+def _run_packaging_smoke_test() -> None:
+    """Exercise the frozen Windows shell and its primary navigation in CI."""
+    app = EventCullApp()
+    try:
+        app.update_idletasks()
+        required = (
+            "new_task_button", "choose_button", "choose_files_button", "history_button",
+            "cull_nav_button", "export_nav_button", "calibration_nav_button",
+            "license_button", "picker_settings_button", "analyze_button",
+            "write_button", "restore_button", "export_selected_button",
+            "grid_view_button", "list_view_button", "calibration_button",
+        )
+        for name in required:
+            widget = getattr(app, name)
+            if not widget.winfo_exists() or not str(widget.cget("command")):
+                raise RuntimeError(f"Missing or unbound Windows button: {name}")
+        for name in ("export_nav_button", "calibration_nav_button", "cull_nav_button", "history_button"):
+            getattr(app, name).invoke()
+            app.update_idletasks()
+        from event_cull.xmp import _run_bundled_exiftool
+        version = _run_bundled_exiftool("-ver")
+        if not version:
+            raise RuntimeError("Bundled Windows ExifTool did not start")
+        print(f"MiaoXuan Windows packaging smoke passed; ExifTool {version}")
+    finally:
+        app.destroy()
+
+
 if __name__ == "__main__":
-    EventCullApp().mainloop()
+    if "--packaging-smoke-test" in sys.argv:
+        _run_packaging_smoke_test()
+    else:
+        EventCullApp().mainloop()
