@@ -88,17 +88,18 @@ def download_update(update: UpdateInfo, downloads: Path | None = None) -> Path:
     destination = target_directory / name
     with tempfile.NamedTemporaryFile(prefix=f".{name}.", suffix=".download", dir=target_directory, delete=False) as stream:
         temporary = Path(stream.name)
-        try:
+    try:
+        with temporary.open("wb") as stream:
             request = urllib.request.Request(update.download_url, headers={"User-Agent": "MiaoXuan-updater"})
             with urllib.request.urlopen(request, timeout=30) as response:
                 while chunk := response.read(1024 * 1024):
                     stream.write(chunk)
             stream.flush()
             os.fsync(stream.fileno())
-            digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
-            if digest != update.sha256:
-                raise ValueError("更新包校验失败，未打开下载文件。")
-            os.replace(temporary, destination)
-            return destination
-        finally:
-            temporary.unlink(missing_ok=True)
+        digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+        if digest != update.sha256:
+            raise ValueError("更新包校验失败，未打开下载文件。")
+        os.replace(temporary, destination)
+        return destination
+    finally:
+        temporary.unlink(missing_ok=True)

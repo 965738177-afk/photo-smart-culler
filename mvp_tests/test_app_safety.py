@@ -1,9 +1,13 @@
 from types import SimpleNamespace
 from pathlib import Path
+import sys
+
+import pytest
 
 from event_cull.app import COPY, REFUSE_DROP, EventCullApp
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS process names")
 def test_metadata_editor_guard_ignores_lightroom_crash_helpers(monkeypatch):
     calls = []
 
@@ -19,6 +23,7 @@ def test_metadata_editor_guard_ignores_lightroom_crash_helpers(monkeypatch):
     assert calls == [["ps", "-axo", "comm="]]
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS process names")
 def test_metadata_editor_guard_detects_each_supported_photo_editor(monkeypatch):
     monkeypatch.setattr(
         "event_cull.app.subprocess.run",
@@ -174,6 +179,7 @@ def test_results_table_keeps_identifier_columns_compact():
     assert '("reason", "分析原因", 440, 240, True)' in contents
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS AppleScript picker")
 def test_macos_folder_picker_requests_multiple_folders_and_restores_last_location(monkeypatch):
     calls = []
 
