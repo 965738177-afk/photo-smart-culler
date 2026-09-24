@@ -704,6 +704,30 @@ def test_smile_survives_when_another_person_is_not_looking_at_camera():
     assert not engine._group_expression_issue(smiling_moment)
 
 
+def test_atmosphere_portrait_does_not_force_smiles_or_facing_camera():
+    import event_cull.engine as engine
+
+    back_view = PhotoResult(
+        Path("back-view.jpg"), score=100, sharpness=180,
+        perceptual_hash=1, frontal_face_count=0, open_eye_face_count=0,
+    )
+    interrupted_smile = PhotoResult(
+        Path("interrupted-smile.jpg"), score=92, sharpness=180,
+        perceptual_hash=2, frontal_face_count=1, smiling_face_count=1,
+        open_eye_face_count=0,
+    )
+    options = AnalysisOptions(
+        scene_type="男生氛围写真", target_keep_count=1,
+        target_keep_max_count=1,
+    )
+
+    engine._assign_tiered_ratings([[back_view, interrupted_smile]], options)
+
+    assert back_view.suggested_rating == 3
+    assert interrupted_smile.suggested_rating == 0
+    assert engine._eye_policy(options, 1, 0.1, 0, None).penalty == 0
+
+
 def test_each_smiling_scene_gets_a_smile_before_ordinary_scene_leads():
     import event_cull.engine as engine
 

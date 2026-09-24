@@ -43,6 +43,7 @@ from event_cull.licensing import LicenseController, license_label
 from event_cull.license_ui import LicenseDialog
 from event_cull.updater import UpdateInfo, check_for_update, download_update
 from event_cull.engine import (
+    ATMOSPHERE_PORTRAIT_SCENE,
     HEIC_EXTENSIONS,
     RAW_EXTENSIONS,
     AnalysisCancelled,
@@ -53,11 +54,11 @@ from event_cull.engine import (
     analyze_paths,
 )
 from event_cull.export_selected import (
-    EXPORT_MARKER,
     ExportCancelled,
     collect_selected_files,
     export_selected_files,
 )
+from event_cull.source_scan import scan_source_images
 from event_cull.xmp import (
     EMBEDDED_EXTENSIONS,
     legacy_managed_embedded_photos,
@@ -80,7 +81,7 @@ GRID_THUMBNAIL_CACHE_LIMIT = 120
 GRID_CARD_GUTTER = 3
 PRODUCT_TITLE_ZH = "秒选 — 照片智能筛选器"
 BRAND_LOGO_RESOURCE = Path("assets/branding/miaoxuan-logo.png")
-SCENE_TYPES = ("通用", "婚礼", "人像写真", "活动纪实", "儿童与家庭", "毕业照", "证件照", "美食")
+SCENE_TYPES = ("通用", "婚礼", "人像写真", ATMOSPHERE_PORTRAIT_SCENE, "活动纪实", "儿童与家庭", "毕业照", "证件照", "美食")
 
 
 def app_resource_path(relative_path: Path) -> Path:
@@ -2311,6 +2312,19 @@ class EventCullApp(TkinterDnD.Tk):
     def _picker_threshold(value: str, *, weak: float, standard: float, strong: float) -> float:
         return {"弱": weak, "标准": standard, "强": strong}.get(value, standard)
 
+    @staticmethod
+    def _scene_grouping_settings(scene_type: str, similarity_label: str) -> tuple[int, float]:
+        """Allow a longer pose sequence to count as one male-portrait scene."""
+        if scene_type == ATMOSPHERE_PORTRAIT_SCENE:
+            return ({"严格": 22, "标准": 30, "宽松": 32}.get(similarity_label, 30), 60.0)
+        return ({
+            "严格": 10,
+            "标准": 18,
+            "宽松": 26,
+            "重复": 10,
+            "相似": 26,
+        }.get(similarity_label, 18), 8.0)
+
     def _analysis_options_from_picker(
         self,
         *,
@@ -2323,13 +2337,9 @@ class EventCullApp(TkinterDnD.Tk):
         # The picker uses human-facing grouping language while the engine
         # compares perceptual-hash distance.  Keep the old labels as a
         # compatibility fallback for an already-open legacy settings window.
-        similarity = {
-            "严格": 10,
-            "标准": 18,
-            "宽松": 26,
-            "重复": 10,
-            "相似": 26,
-        }.get(self.duplicate_similarity.get(), 18)
+        similarity, burst_gap = self._scene_grouping_settings(
+            self.scene_type.get(), self.duplicate_similarity.get()
+        )
         return AnalysisOptions(
             picks_per_group=picks_min,
             max_picks_per_group=picks_max,
@@ -2338,12 +2348,16 @@ class EventCullApp(TkinterDnD.Tk):
             blur_floor=self._picker_threshold(self.blur_sensitivity.get(), weak=45, standard=55, strong=70),
             severe_clip_fraction=self._picker_threshold(self.exposure_sensitivity.get(), weak=0.18, standard=0.12, strong=0.08),
             similarity_threshold=int(similarity),
+            burst_gap_seconds=burst_gap,
             detect_closed_eyes=self.detect_closed_eyes.get(),
             detect_blur=self.detect_blur.get(),
             detect_exposure=self.detect_exposure.get(),
             detect_duplicates=self.detect_duplicates.get(),
             ai_selection_enabled=self.ai_selection_enabled.get(),
-            prefer_people=self.priority_more_faces.get(),
+            prefer_people=(
+                self.priority_more_faces.get()
+                and self.scene_type.get() != ATMOSPHERE_PORTRAIT_SCENE
+            ),
             max_duplicate_picks_per_group=duplicate_keep_limit,
             fill_with_similar=self.fill_with_similar.get(),
             scene_type=self.scene_type.get(),
@@ -2648,7 +2662,7 @@ class EventCullApp(TkinterDnD.Tk):
         preferences = tk.Frame(target_section, bg=palette["window"])
         preferences.pack(fill="x", pady=(10, 0))
         preference(preferences, "启用 AI 精选", self.ai_selection_enabled)
-        preference(preferences, "优先保留表情自然的人像照片", self.priority_more_faces)
+        preference(preferences, "正脸与自然表情优先（氛围写真自动关闭）", self.priority_more_faces)
         preference(preferences, "数量不足时用重复照片补足", self.fill_with_similar)
         preference(preferences, "保留已手动设置的星级", self.keep_existing_labels)
 
@@ -3201,26 +3215,7 @@ class EventCullApp(TkinterDnD.Tk):
     @staticmethod
     def _files_in_folders(folders: list[Path]) -> list[Path]:
         """Find supported originals below every selected source folder."""
-        files: list[Path] = []
-        for folder in folders:
-            try:
-                for parent, directories, filenames in os.walk(folder):
-                    # Sidecar backups and other hidden work folders are not
-                    # photo sources and can be large on event jobs.  A prior
-                    # 秒选 delivery must not be imported as fresh originals.
-                    directories[:] = [
-                        name for name in directories
-                        if not name.startswith(".")
-                        and not (Path(parent, name) / EXPORT_MARKER).is_file()
-                    ]
-                    files.extend(
-                        Path(parent, name)
-                        for name in sorted(filenames, key=str.lower)
-                        if Path(name).suffix.lower() in SUPPORTED_EXTENSIONS
-                    )
-            except OSError:
-                continue
-        return sorted(files, key=lambda path: (str(path.parent).casefold(), path.name.casefold()))
+        return scan_source_images(folders)
 
     @staticmethod
     def _choose_folders_macos(

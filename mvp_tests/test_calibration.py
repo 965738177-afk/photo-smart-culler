@@ -4,6 +4,7 @@ import numpy as np
 
 from event_cull.calibration import (
     CalibrationProfile,
+    _source_previews,
     apply_profile,
     build_profile,
     exported_selection_stems,
@@ -91,3 +92,21 @@ def test_build_profile_reads_log_exports_and_originals(tmp_path: Path):
     assert profile.positive_examples == 16
     assert len(profile.weights) >= 256
     assert profile.feature_pipeline in {"handcrafted-visual-v1", "mobilenet-v3-small-visual-v1"}
+
+
+def test_calibration_ignores_curated_and_prior_export_copies(tmp_path: Path):
+    from event_cull.export_selected import EXPORT_MARKER
+
+    original = tmp_path / "IMG_0001.HEIC"
+    original.write_bytes(b"original")
+    curated = tmp_path / "选"
+    curated.mkdir()
+    (curated / original.name).write_bytes(b"curated copy")
+    prior_export = tmp_path / "秒选-3"
+    prior_export.mkdir()
+    (prior_export / EXPORT_MARKER).write_text("", encoding="utf-8")
+    (prior_export / original.name).write_bytes(b"export copy")
+
+    assert _source_previews([tmp_path], {"img_0001"}, excluded_folders=[curated]) == {
+        "img_0001": original
+    }

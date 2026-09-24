@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover - packaging validation covers this
 RAW_EXTENSIONS = {".arw", ".cr2", ".cr3", ".dng", ".nef", ".orf", ".raf", ".rw2"}
 HEIC_EXTENSIONS = {".heic", ".heif"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", *HEIC_EXTENSIONS, *RAW_EXTENSIONS}
+ATMOSPHERE_PORTRAIT_SCENE = "男生氛围写真"
 ANALYSIS_CACHE_VERSION = 13
 MAX_ANALYSIS_WORKERS = 8
 _DETECTORS = threading.local()
@@ -370,7 +371,8 @@ def _message(options: AnalysisOptions, key: str, **values: str) -> str:
 
 
 _CONTEXTUAL_EYE_SCENES = {
-    "通用", "婚礼", "人像写真", "活动纪实", "儿童与家庭", "毕业照"
+    "通用", "婚礼", "人像写真", ATMOSPHERE_PORTRAIT_SCENE,
+    "活动纪实", "儿童与家庭", "毕业照"
 }
 
 
@@ -489,6 +491,11 @@ def _eye_policy(
         # Children naturally blink, laugh with closed eyes, and look away;
         # expression is useful, but eye state must not suppress the moment.
         return EyePolicy("family_eye_tolerant")
+
+    if options.scene_type == ATMOSPHERE_PORTRAIT_SCENE:
+        # Side profiles, looking away, lowered heads, and back views are
+        # legitimate finished frames in an atmospheric portrait sequence.
+        return EyePolicy("atmosphere_eye_neutral")
 
     if not _uses_contextual_eye_policy(options):
         if face_count == 1 and open_eye_count == 0:
@@ -938,7 +945,7 @@ def _analyze(path: Path, pairs: list[Path], options: AnalysisOptions) -> PhotoRe
         )
     quality = min(effective_sharpness / max(options.blur_floor, 1), 3.0) * 25
     quality += (1 - min(highlights + shadows, 0.5) / 0.5) * 25
-    if options.prefer_people:
+    if options.prefer_people and options.scene_type != ATMOSPHERE_PORTRAIT_SCENE:
         quality += _people_priority_bonus(frontal_faces, smiling_faces)
     result = PhotoResult(
         path,
@@ -1099,6 +1106,8 @@ def _subject_motion_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
 
 
 def _group_expression_issue(item: PhotoResult, options: AnalysisOptions | None = None) -> bool:
+    if options is not None and options.scene_type == ATMOSPHERE_PORTRAIT_SCENE:
+        return False
     # Treat a confirmed mixed result as risky.  When the eye cascade finds no
     # eyes at all, keep it ambiguous so low-head and atmospheric frames survive.
     # A natural smile is a positive moment even when someone else looks away.
@@ -1265,7 +1274,11 @@ def _review_priority(item: PhotoResult, options: AnalysisOptions) -> float:
         if item.frontal_face_count > 0 and _message(options, "closed") in item.reasons
         else 0.0
     )
-    smile_priority = min(item.smiling_face_count, 2) * 24.0 if options.prefer_people else 0.0
+    smile_priority = (
+        min(item.smiling_face_count, 2) * 24.0
+        if options.prefer_people and options.scene_type != ATMOSPHERE_PORTRAIT_SCENE
+        else 0.0
+    )
     return item.score + smile_priority - closed_eye_penalty
 
 
@@ -1400,13 +1413,14 @@ def _density_selection(
     # A natural smile is worth keeping even when another person looks away.
     # Protect the strongest smiling frame from each scene before ordinary
     # scene leads consume the remaining target slots.
-    smile_leads = []
-    for ranked_group in ranked_groups:
-        smiling = [item for item in ranked_group if item.smiling_face_count > 0]
-        if smiling:
-            smile_leads.append(max(smiling, key=priority))
-    for item in sorted(smile_leads, key=priority, reverse=True):
-        add(item)
+    if options.scene_type != ATMOSPHERE_PORTRAIT_SCENE:
+        smile_leads = []
+        for ranked_group in ranked_groups:
+            smiling = [item for item in ranked_group if item.smiling_face_count > 0]
+            if smiling:
+                smile_leads.append(max(smiling, key=priority))
+        for item in sorted(smile_leads, key=priority, reverse=True):
+            add(item)
 
     leads = sorted((group[0] for group in ranked_groups), key=priority, reverse=True)
     for item in leads:
@@ -1468,6 +1482,8 @@ def _density_selection(
 
 def _three_star_score(item: PhotoResult, options: AnalysisOptions) -> float:
     """Within a scene, prefer a clear smile and complete group expressions."""
+    if options.scene_type == ATMOSPHERE_PORTRAIT_SCENE:
+        return _ranking_score(item, options)
     return (
         _ranking_score(item, options)
         + item.smiling_face_count * 24.0

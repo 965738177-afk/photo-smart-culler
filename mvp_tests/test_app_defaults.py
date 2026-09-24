@@ -13,7 +13,13 @@ def test_default_target_is_one_third_rounded_up_to_tens():
 
 
 def test_scene_picker_includes_every_supported_scene_rule_set():
-    assert SCENE_TYPES == ("通用", "婚礼", "人像写真", "活动纪实", "儿童与家庭", "毕业照", "证件照", "美食")
+    assert SCENE_TYPES == ("通用", "婚礼", "人像写真", "男生氛围写真", "活动纪实", "儿童与家庭", "毕业照", "证件照", "美食")
+
+
+def test_atmosphere_portrait_groups_longer_pose_sequences_without_changing_other_scenes():
+    assert EventCullApp._scene_grouping_settings("男生氛围写真", "标准") == (30, 60.0)
+    assert EventCullApp._scene_grouping_settings("男生氛围写真", "严格") == (22, 60.0)
+    assert EventCullApp._scene_grouping_settings("通用", "标准") == (18, 8.0)
 
 
 def test_main_window_opens_larger_but_keeps_a_display_margin():

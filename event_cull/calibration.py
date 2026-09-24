@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 
 from event_cull.engine import IMAGE_EXTENSIONS, PhotoResult, _load_preview
+from event_cull.source_scan import scan_source_images
 from event_cull.deep_features import (
     PIPELINE_ID as DEEP_PIPELINE_ID,
     DeepFeatureUnavailable,
@@ -184,32 +185,28 @@ def _log_rows(log_path: Path) -> dict[str, tuple[str, int]]:
     return {name: record for name, record in records.items() if record is not None}
 
 
-def _source_previews(folders: Iterable[Path], allowed_stems: set[str]) -> dict[str, Path]:
+def _source_previews(
+    folders: Iterable[Path], allowed_stems: set[str], *,
+    excluded_folders: Iterable[Path] = (),
+) -> dict[str, Path]:
     """Find one readable representative per old log record, preferring JPEG."""
     choices: dict[str, Path] = {}
     ambiguous: set[str] = set()
-    for folder in folders:
-        try:
-            paths = folder.rglob("*")
-            for path in paths:
-                if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
-                    continue
-                stem = path.stem.casefold()
-                if stem not in allowed_stems or stem in ambiguous:
-                    continue
-                previous = choices.get(stem)
-                if previous is None:
-                    choices[stem] = path
-                elif previous.parent == path.parent:
-                    # Prefer the JPEG already paired with a RAW, as it is also
-                    # what Lightroom exports and what the app previews first.
-                    if previous.suffix.lower() not in {".jpg", ".jpeg"} and path.suffix.lower() in {".jpg", ".jpeg"}:
-                        choices[stem] = path
-                else:
-                    ambiguous.add(stem)
-                    choices.pop(stem, None)
-        except OSError:
+    for path in scan_source_images(folders, excluded_folders=excluded_folders):
+        stem = path.stem.casefold()
+        if stem not in allowed_stems or stem in ambiguous:
             continue
+        previous = choices.get(stem)
+        if previous is None:
+            choices[stem] = path
+        elif previous.parent == path.parent:
+            # Prefer the JPEG already paired with a RAW, as it is also
+            # what Lightroom exports and what the app previews first.
+            if previous.suffix.lower() not in {".jpg", ".jpeg"} and path.suffix.lower() in {".jpg", ".jpeg"}:
+                choices[stem] = path
+        else:
+            ambiguous.add(stem)
+            choices.pop(stem, None)
     return choices
 
 
@@ -383,7 +380,7 @@ def build_profile(
     featured_rating = 3
     if not set(rows).intersection(selected_stems):
         raise CalibrationError("人工选片文件名与筛选日志没有匹配；请确认导出时没有重命名照片。")
-    sources = _source_previews(original_folders, set(rows))
+    sources = _source_previews(original_folders, set(rows), excluded_folders=[exported_folder])
     source_rows: list[tuple[str, str, Path, int]] = []
     items = sorted(sources.items())
     for index, (stem, path) in enumerate(items, start=1):

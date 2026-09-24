@@ -367,6 +367,7 @@ def test_completed_empty_easy_delete_result_is_not_recomputed():
         start_easy_delete_analysis=Mock(),
     )
     controller = SimpleNamespace(
+        require_analysis_license=lambda *_args: True,
         app_state=SimpleNamespace(
             image_files_data=[{"path": "photo.jpg", "media_type": "image"}],
             easy_delete_results={},
@@ -390,6 +391,7 @@ def test_completed_empty_easy_delete_result_is_not_recomputed():
 def test_easy_delete_rebuilds_embeddings_after_restoring_clusters_only():
     widget = SimpleNamespace(show_results=Mock(), show_loading=Mock())
     controller = SimpleNamespace(
+        require_analysis_license=lambda *_args: True,
         app_state=SimpleNamespace(
             image_files_data=[{"path": "photo.jpg", "media_type": "image"}],
             easy_delete_results=None,
@@ -419,6 +421,7 @@ def test_easy_delete_rebuilds_embeddings_after_restoring_clusters_only():
 
 def test_easy_delete_reuses_complete_similarity_inputs_without_recomputing():
     controller = SimpleNamespace(
+        require_analysis_license=lambda *_args: True,
         app_state=SimpleNamespace(
             image_files_data=[{"path": "photo.jpg", "media_type": "image"}],
             easy_delete_results=None,

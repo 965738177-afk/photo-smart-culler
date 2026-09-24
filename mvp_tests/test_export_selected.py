@@ -80,6 +80,18 @@ def test_adjacent_export_copies_and_does_not_reimport_delivery(tmp_path: Path):
     assert (output / photo.name).read_bytes() == b"original-pixels-and-metadata"
 
 
+def test_nested_curated_folder_is_not_reimported_but_can_be_opened_directly(tmp_path: Path):
+    original = tmp_path / "IMG_0001.HEIC"
+    original.write_bytes(b"original")
+    curated = tmp_path / "选"
+    curated.mkdir()
+    copy = curated / original.name
+    copy.write_bytes(b"curated-copy")
+
+    assert EventCullApp._files_in_folders([tmp_path]) == [original]
+    assert EventCullApp._files_in_folders([curated]) == [copy]
+
+
 def test_custom_export_separates_same_names_from_multiple_sources(tmp_path: Path):
     first = tmp_path / "camera-a"
     second = tmp_path / "camera-b"
