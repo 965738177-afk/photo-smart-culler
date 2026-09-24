@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 import json
 import shutil
+import tempfile
+import threading
 import subprocess
 import sys
 from datetime import datetime
@@ -117,9 +119,45 @@ def _bundled_exiftool_root() -> Path:
     return bundle_root / "event_cull" / "vendor" / name
 
 
+_WINDOWS_EXIFTOOL_STAGING: tempfile.TemporaryDirectory[str] | None = None
+_WINDOWS_EXIFTOOL_STAGING_LOCK = threading.Lock()
+
+
+def _windows_exiftool_root(root: Path) -> Path:
+    """Relocate Perl's helper files when the install path has Unicode.
+
+    The official Windows ExifTool build cannot locate ``exiftool_files`` when
+    its own directory has non-ASCII characters, even though it can read photo
+    filenames through a UTF-8 argument file.  A private temporary directory
+    under the system's ASCII ProgramData path avoids that launcher limitation.
+    """
+    if str(root).isascii():
+        return root
+    global _WINDOWS_EXIFTOOL_STAGING
+    with _WINDOWS_EXIFTOOL_STAGING_LOCK:
+        if _WINDOWS_EXIFTOOL_STAGING is not None:
+            return Path(_WINDOWS_EXIFTOOL_STAGING.name)
+        candidates = [Path(os.environ.get("PROGRAMDATA") or "C:/ProgramData"), Path(tempfile.gettempdir())]
+        for candidate in candidates:
+            if not str(candidate).isascii():
+                continue
+            try:
+                staging = tempfile.TemporaryDirectory(prefix="MiaoXuan-ExifTool-", dir=candidate)
+                shutil.copytree(root, staging.name, dirs_exist_ok=True)
+            except OSError:
+                if "staging" in locals():
+                    staging.cleanup()
+                    del staging
+                continue
+            _WINDOWS_EXIFTOOL_STAGING = staging
+            return Path(staging.name)
+    raise RuntimeError("无法在英文路径准备照片元数据组件；请将秒选解压到英文路径后重试")
+
+
 def _run_bundled_exiftool(*arguments: str) -> str:
     root = _bundled_exiftool_root()
     if sys.platform == "win32":
+        root = _windows_exiftool_root(root)
         executable = root / "exiftool.exe"
         # ExifTool's UTF-8 argument-file reader is required for Chinese paths
         # on Windows; command-line filenames otherwise use the active codepage.

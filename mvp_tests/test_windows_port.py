@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -74,6 +73,27 @@ def test_windows_exiftool_missing_companion_fails_closed(monkeypatch, tmp_path):
     (tmp_path / "exiftool.exe").touch()
     with pytest.raises(RuntimeError, match="元数据组件不可用"):
         xmp._run_bundled_exiftool("-ver")
+
+
+def test_unicode_install_path_stages_exiftool_under_ascii_programdata(monkeypatch, tmp_path):
+    source = tmp_path / "中文软件" / "exiftool-windows"
+    (source / "exiftool_files").mkdir(parents=True)
+    (source / "exiftool.exe").write_bytes(b"executable")
+    (source / "exiftool_files" / "helper.dll").write_bytes(b"helper")
+    programdata = tmp_path / "ProgramData"
+    programdata.mkdir()
+    monkeypatch.setenv("PROGRAMDATA", str(programdata))
+    monkeypatch.setattr(xmp, "_WINDOWS_EXIFTOOL_STAGING", None)
+    try:
+        staged = xmp._windows_exiftool_root(source)
+        assert str(staged).isascii()
+        assert (staged / "exiftool.exe").read_bytes() == b"executable"
+        assert (staged / "exiftool_files" / "helper.dll").read_bytes() == b"helper"
+        assert xmp._windows_exiftool_root(source) == staged
+    finally:
+        if xmp._WINDOWS_EXIFTOOL_STAGING is not None:
+            xmp._WINDOWS_EXIFTOOL_STAGING.cleanup()
+        monkeypatch.setattr(xmp, "_WINDOWS_EXIFTOOL_STAGING", None)
 
 
 def test_windows_keyring_must_be_native(monkeypatch):
