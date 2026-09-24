@@ -51,6 +51,11 @@ jobs:
           '@ | python -
       - name: Run all culler regression tests on Windows
         run: python -m pytest -q mvp_tests
+      - name: Launch source GUI and verify its primary controls
+        run: |
+          $env:MIAOXUAN_SMOKE_TRACE = (Join-Path $env:RUNNER_TEMP 'source-smoke-trace.txt')
+          python -m event_cull.app --packaging-smoke-test
+          Get-Content $env:MIAOXUAN_SMOKE_TRACE
       - name: Build the Tk culler, not the unrelated Qt PhotoSort app
         run: python -m PyInstaller --clean --noconfirm MiaoXuan-Windows.spec
       - name: Probe bundled ExifTool outside the GUI process
@@ -81,7 +86,8 @@ jobs:
               completed = subprocess.run([str(executable), '--packaging-smoke-test'], env=environment, timeout=45, check=False)
           except subprocess.TimeoutExpired:
               raise AssertionError('Packaged app timed out; stages: ' + (trace.read_text(encoding='utf-8') if trace.exists() else '<not started>'))
-          assert completed.returncode == 0, f'Packaged app smoke failed: {completed.returncode}; stages: {trace.read_text(encoding="utf-8") if trace.exists() else "<not started>"}'
+          faults = trace.with_suffix('.faults.txt')
+          assert completed.returncode == 0, f'Packaged app smoke failed: {completed.returncode}; stages: {trace.read_text(encoding="utf-8") if trace.exists() else "<not started>"}; faults: {faults.read_text(encoding="utf-8") if faults.exists() else "<none>"}'
           '@ | python -
       - name: Zip portable Windows application
         run: Compress-Archive -Path 'dist/秒选-Windows' -DestinationPath 'dist/秒选-Windows-x64.zip'

@@ -5216,6 +5216,12 @@ end run
 def _run_packaging_smoke_test() -> None:
     """Exercise the frozen Windows shell and its primary navigation in CI."""
     trace_path = os.environ.get("MIAOXUAN_SMOKE_TRACE")
+    fault_stream = None
+    if trace_path:
+        import faulthandler
+        fault_stream = Path(trace_path).with_suffix(".faults.txt").open("w", encoding="utf-8")
+        globals()["_SMOKE_FAULT_STREAM"] = fault_stream
+        faulthandler.enable(file=fault_stream, all_threads=True)
 
     def mark(stage: str) -> None:
         if trace_path:
@@ -5261,6 +5267,7 @@ def _run_packaging_smoke_test() -> None:
     finally:
         mark("destroying")
         app.destroy()
+        mark("destroyed")
 
 
 if __name__ == "__main__":
