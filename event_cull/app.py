@@ -5228,6 +5228,18 @@ def _run_packaging_smoke_test() -> None:
             with Path(trace_path).open("a", encoding="utf-8") as stream:
                 stream.write(stage + "\n")
 
+    def verify_button_wiring(parent: tk.Misc) -> int:
+        checked = 0
+        stack = [parent]
+        while stack:
+            widget = stack.pop()
+            stack.extend(widget.winfo_children())
+            if isinstance(widget, (tk.Button, ttk.Button)):
+                checked += 1
+                if not str(widget.cget("command")):
+                    raise RuntimeError(f"Unbound Windows button: {widget}")
+        return checked
+
     mark("starting")
     app = EventCullApp()
     mark("app-created")
@@ -5252,7 +5264,7 @@ def _run_packaging_smoke_test() -> None:
             widget = getattr(app, name)
             if not widget.winfo_exists() or not str(widget.cget("command")):
                 raise RuntimeError(f"Missing or unbound Windows button: {name}")
-        mark("controls-verified")
+        mark(f"controls-verified-{verify_button_wiring(app)}")
         for name in ("export_nav_button", "calibration_nav_button", "cull_nav_button", "history_button"):
             before = set(app.winfo_children())
             getattr(app, name).invoke()
@@ -5262,6 +5274,7 @@ def _run_packaging_smoke_test() -> None:
                 windows = [child for child in app.winfo_children() if isinstance(child, tk.Toplevel) and child not in before]
                 if len(windows) != 1:
                     raise RuntimeError("History button did not open its window")
+                mark(f"history-buttons-verified-{verify_button_wiring(windows[0])}")
                 windows[0].destroy()
                 mark("history-closed")
                 app.update()
@@ -5273,6 +5286,7 @@ def _run_packaging_smoke_test() -> None:
             windows = [child for child in app.winfo_children() if isinstance(child, tk.Toplevel) and child not in before]
             if len(windows) != 1:
                 raise RuntimeError(f"{name} did not open its window")
+            mark(f"{name}-buttons-verified-{verify_button_wiring(windows[0])}")
             windows[0].destroy()
             mark(f"closed-{name}")
             app.update()
