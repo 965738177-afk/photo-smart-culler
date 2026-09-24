@@ -5249,7 +5249,7 @@ def _run_packaging_smoke_test() -> None:
         for name in ("export_nav_button", "calibration_nav_button", "cull_nav_button", "history_button"):
             getattr(app, name).invoke()
             mark(f"invoked-{name}")
-            app.update_idletasks()
+            app.update()
         from tempfile import TemporaryDirectory
         from event_cull.xmp import _read_embedded_rating, restore_managed_rating, write_rating
         with TemporaryDirectory() as directory:
