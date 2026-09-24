@@ -5266,6 +5266,10 @@ def _run_packaging_smoke_test() -> None:
         print("MiaoXuan Windows packaging smoke passed")
     finally:
         mark("destroying")
+        for child in list(app.children.values()):
+            mark(f"destroy-child-{child.winfo_class()}-{child.winfo_name()}")
+            child.destroy()
+            mark("destroy-child-done")
         app.destroy()
         mark("destroyed")
 
