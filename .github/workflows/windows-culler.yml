@@ -57,10 +57,16 @@ jobs:
         run: |
           @'
           import subprocess
+          import os
           from pathlib import Path
           executable = Path('dist/秒选-Windows/秒选.exe').resolve()
-          completed = subprocess.run([str(executable), '--packaging-smoke-test'], timeout=60, check=False)
-          assert completed.returncode == 0, f'Packaged app smoke failed: {completed.returncode}'
+          trace = Path('build/windows-smoke-trace.txt').resolve()
+          environment = dict(os.environ, MIAOXUAN_SMOKE_TRACE=str(trace))
+          try:
+              completed = subprocess.run([str(executable), '--packaging-smoke-test'], env=environment, timeout=45, check=False)
+          except subprocess.TimeoutExpired:
+              raise AssertionError('Packaged app timed out; stages: ' + (trace.read_text(encoding='utf-8') if trace.exists() else '<not started>'))
+          assert completed.returncode == 0, f'Packaged app smoke failed: {completed.returncode}; stages: {trace.read_text(encoding="utf-8") if trace.exists() else "<not started>"}'
           '@ | python -
       - name: Zip portable Windows application
         run: Compress-Archive -Path 'dist/秒选-Windows' -DestinationPath 'dist/秒选-Windows-x64.zip'

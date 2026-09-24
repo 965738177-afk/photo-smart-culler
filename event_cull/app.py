@@ -5215,9 +5215,19 @@ end run
 
 def _run_packaging_smoke_test() -> None:
     """Exercise the frozen Windows shell and its primary navigation in CI."""
+    trace_path = os.environ.get("MIAOXUAN_SMOKE_TRACE")
+
+    def mark(stage: str) -> None:
+        if trace_path:
+            with Path(trace_path).open("a", encoding="utf-8") as stream:
+                stream.write(stage + "\n")
+
+    mark("starting")
     app = EventCullApp()
+    mark("app-created")
     try:
         app.update_idletasks()
+        mark("idle-updated")
         required = (
             "new_task_button", "choose_button", "choose_files_button", "history_button",
             "cull_nav_button", "export_nav_button", "calibration_nav_button",
@@ -5229,15 +5239,20 @@ def _run_packaging_smoke_test() -> None:
             widget = getattr(app, name)
             if not widget.winfo_exists() or not str(widget.cget("command")):
                 raise RuntimeError(f"Missing or unbound Windows button: {name}")
+        mark("controls-verified")
         for name in ("export_nav_button", "calibration_nav_button", "cull_nav_button", "history_button"):
             getattr(app, name).invoke()
+            mark(f"invoked-{name}")
             app.update_idletasks()
         from event_cull.xmp import _run_bundled_exiftool
+        mark("running-exiftool")
         version = _run_bundled_exiftool("-ver")
         if not version:
             raise RuntimeError("Bundled Windows ExifTool did not start")
+        mark("exiftool-verified")
         print(f"MiaoXuan Windows packaging smoke passed; ExifTool {version}")
     finally:
+        mark("destroying")
         app.destroy()
 
 
