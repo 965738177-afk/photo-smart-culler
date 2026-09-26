@@ -5240,6 +5240,29 @@ def _run_packaging_smoke_test() -> None:
         if not app._load_selected_files([imported_photo]):
             raise RuntimeError("Windows photo import failed")
         mark("photo-imported")
+        analysis_photo = Path(source_dir.name) / "analysis.jpg"
+        analysis_image = Image.new("RGB", (320, 240), "#7287a0")
+        analysis_draw = ImageDraw.Draw(analysis_image)
+        for x in range(0, 320, 20):
+            for y in range(0, 240, 20):
+                if (x // 20 + y // 20) % 2:
+                    analysis_draw.rectangle((x, y, x + 19, y + 19), fill="#d4c3a0")
+        analysis_image.save(analysis_photo)
+        try:
+            analysis_result = analyze_paths([analysis_photo])[0]
+        except Exception as exc:
+            mark(f"image-analysis-error-{type(exc).__name__}-{exc}")
+            raise
+        mark(f"image-analysis-result-{analysis_result.score:.0f}-{analysis_result.reasons}")
+        if analysis_result.score <= 0:
+            raise RuntimeError(f"Packaged image analysis failed: {analysis_result.reasons}")
+        mark("image-analysis-verified")
+        raw_smoke_path = os.environ.get("MIAOXUAN_SMOKE_RAW_PATH")
+        if raw_smoke_path:
+            raw_result = analyze_paths([Path(raw_smoke_path)])[0]
+            if raw_result.score <= 0:
+                raise RuntimeError(f"Packaged RAW analysis failed: {raw_result.reasons}")
+            mark(f"raw-analysis-verified-{raw_result.score:.0f}")
         app.update_idletasks()
         mark("idle-updated")
         required = (

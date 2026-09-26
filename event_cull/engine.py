@@ -144,6 +144,10 @@ class AnalysisCancelled(Exception):
     """Raised only between files, so an in-flight RAW decode is never interrupted unsafely."""
 
 
+class AnalysisSetupError(RuntimeError):
+    """A required analysis resource is missing or unusable."""
+
+
 @dataclass(frozen=True)
 class AnalysisOptions:
     picks_per_group: int = 2
@@ -524,6 +528,35 @@ def _eye_policy(
     return EyePolicy(f"{mode_prefix}_portrait")
 
 
+def _cascade_path(filename: str) -> Path:
+    roots = [
+        Path(getattr(sys, "_MEIPASS", Path(cv2.__file__).resolve().parent.parent)) / "cv2" / "data",
+        Path(cv2.data.haarcascades),
+    ]
+    for root in roots:
+        path = root / filename
+        if path.is_file():
+            return path
+    raise AnalysisSetupError(f"人脸检测模型缺失：{filename}；请重新安装秒选")
+
+
+def _cascade_classifier(filename: str) -> cv2.CascadeClassifier:
+    try:
+        # OpenCV's Windows filename API can reject Unicode install paths.
+        # Python reads the bundled XML, then OpenCV parses it from memory.
+        content = _cascade_path(filename).read_text(encoding="utf-8")
+        storage = cv2.FileStorage(content, cv2.FILE_STORAGE_READ | cv2.FILE_STORAGE_MEMORY)
+        try:
+            classifier = cv2.CascadeClassifier()
+            if not storage.isOpened() or not classifier.read(storage.getFirstTopLevelNode()) or classifier.empty():
+                raise AnalysisSetupError(f"人脸检测模型无法加载：{filename}；请重新安装秒选")
+            return classifier
+        finally:
+            storage.release()
+    except (OSError, UnicodeError, cv2.error) as exc:
+        raise AnalysisSetupError(f"人脸检测模型无法加载：{filename}；请重新安装秒选") from exc
+
+
 def _face_metrics(
     gray: np.ndarray,
     options: AnalysisOptions,
@@ -533,9 +566,10 @@ def _face_metrics(
 ]:
     """Return face evidence plus a confidence-aware eye policy."""
     if not hasattr(_DETECTORS, "faces"):
-        _DETECTORS.faces = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-        _DETECTORS.eyes = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml")
-        _DETECTORS.smiles = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_smile.xml")
+        faces = _cascade_classifier("haarcascade_frontalface_default.xml")
+        eyes = _cascade_classifier("haarcascade_eye_tree_eyeglasses.xml")
+        smiles = _cascade_classifier("haarcascade_smile.xml")
+        _DETECTORS.faces, _DETECTORS.eyes, _DETECTORS.smiles = faces, eyes, smiles
     faces = _DETECTORS.faces
     eyes = _DETECTORS.eyes
     smiles = _DETECTORS.smiles
@@ -1712,6 +1746,8 @@ def analyze_paths(
                     ordered_results[index] = result
                     if new_record is not None:
                         cache[cache_key] = new_record
+                except AnalysisSetupError:
+                    raise
                 except Exception as exc:
                     ordered_results[index] = PhotoResult(
                         photo,

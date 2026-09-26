@@ -1,9 +1,12 @@
 from pathlib import Path
+import shutil
+import sys
 import threading
 import time
 
 import cv2
 import numpy as np
+import pytest
 from PIL import Image
 
 import event_cull.engine as engine
@@ -67,8 +70,14 @@ def test_face_detectors_are_reused_within_worker_thread(monkeypatch):
     created = []
 
     class FakeCascade:
-        def __init__(self, path):
-            created.append(path)
+        def __init__(self):
+            created.append(True)
+
+        def read(self, _node):
+            return True
+
+        def empty(self):
+            return False
 
         def detectMultiScale(self, *args, **kwargs):
             return []
@@ -81,6 +90,35 @@ def test_face_detectors_are_reused_within_worker_thread(monkeypatch):
     engine._face_reasons(gray, AnalysisOptions())
 
     assert len(created) == 3
+
+
+def test_face_detectors_use_frozen_bundle_when_opencv_source_path_is_stale(monkeypatch, tmp_path):
+    model_names = (
+        "haarcascade_frontalface_default.xml",
+        "haarcascade_eye_tree_eyeglasses.xml",
+        "haarcascade_smile.xml",
+    )
+    bundle_root = tmp_path / "秒选-Windows"
+    bundled = bundle_root / "cv2" / "data"
+    bundled.mkdir(parents=True)
+    for name in model_names:
+        shutil.copyfile(Path(cv2.data.haarcascades) / name, bundled / name)
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle_root), raising=False)
+    monkeypatch.setattr(cv2.data, "haarcascades", str(tmp_path / "old-build-path"))
+    monkeypatch.setattr(engine, "_DETECTORS", threading.local())
+
+    for name in model_names:
+        assert engine._cascade_path(name) == bundled / name
+    engine._face_reasons(np.zeros((200, 200), dtype=np.uint8), AnalysisOptions())
+
+
+def test_missing_face_detector_stops_analysis_instead_of_scoring_zero(monkeypatch, tmp_path):
+    photo = tmp_path / "photo.jpg"
+    Image.new("RGB", (64, 64), "#7287a0").save(photo)
+    monkeypatch.setattr(engine, "_cascade_path", lambda name: tmp_path / name)
+
+    with pytest.raises(engine.AnalysisSetupError, match="人脸检测模型无法加载"):
+        engine.analyze_paths([photo])
 
 
 def test_people_priority_favors_clear_frontal_faces_and_smiles_without_unbounded_bonus():
