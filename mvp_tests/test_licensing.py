@@ -56,7 +56,7 @@ def test_three_day_trial_copy_and_remaining_time_are_not_described_as_a_subscrip
         plan=licensing.LicensePlan.MONTHLY,
         issued_at=moment,
         offline_until=moment + timedelta(hours=4),
-        subscription_until=moment + timedelta(days=licensing.TRIAL_DAYS),
+        subscription_until=moment + timedelta(days=licensing.TRIAL_DAYS, minutes=-30),
     )
 
     assert licensing.TRIAL_DAYS == 3

@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 from collections import OrderedDict
 import hashlib
-from io import BytesIO, StringIO
+from io import BytesIO
 import json
 import locale
 import math
@@ -60,6 +60,7 @@ from event_cull.export_selected import (
 )
 from event_cull.source_scan import scan_source_images
 from event_cull.platform_paths import application_data_dir
+from event_cull.platform_process import running_executable_names
 from event_cull.xmp import (
     EMBEDDED_EXTENSIONS,
     legacy_managed_embedded_photos,
@@ -4951,20 +4952,8 @@ end run
         """
         if sys.platform == "win32":
             try:
-                result = subprocess.run(
-                    ["tasklist", "/fo", "csv", "/nh"],
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=2,
-                    check=False,
-                )
-                process_names = {
-                    row[0].strip().casefold()
-                    for row in csv.reader(StringIO(result.stdout))
-                    if row
-                }
-            except (OSError, subprocess.SubprocessError, csv.Error):
+                process_names = running_executable_names()
+            except OSError:
                 return ()
             matches = (
                 ("lightroom.exe", "Lightroom Classic"),

@@ -21,6 +21,8 @@ from pathlib import Path
 from uuid import uuid4
 from xml.etree import ElementTree as ET
 
+from event_cull.platform_process import no_console_creationflags
+
 XMP = "adobe:ns:meta/"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 X = "adobe:ns:meta/"
@@ -183,6 +185,7 @@ def _run_bundled_exiftool(*arguments: str) -> str:
             errors="replace",
             input=input_text,
             timeout=180,
+            creationflags=no_console_creationflags(),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("照片元数据写入超时，请检查原片所在磁盘并重试") from exc

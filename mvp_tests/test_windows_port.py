@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from event_cull import platform_paths, xmp
+from event_cull.platform_process import running_executable_names
 from event_cull.app import EventCullApp
 from event_cull.licensing import LicenseError, LicenseService
 
@@ -36,15 +38,13 @@ def test_windows_shortcuts_match_menu_actions(monkeypatch):
 
 def test_windows_editor_guard_detects_lightroom(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
-    calls = []
-
-    def fake_run(command, **kwargs):
-        calls.append(command)
-        return SimpleNamespace(returncode=0, stdout='"Lightroom.exe","1324","Console","1","456,000 K"\n')
-
-    monkeypatch.setattr("event_cull.app.subprocess.run", fake_run)
+    monkeypatch.setattr("event_cull.app.running_executable_names", lambda: {"lightroom.exe"})
     assert EventCullApp._metadata_editors_running() == ("Lightroom Classic",)
-    assert calls == [["tasklist", "/fo", "csv", "/nh"]]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires native Windows process API")
+def test_windows_process_enumeration_finds_current_executable():
+    assert Path(sys.executable).name.casefold() in running_executable_names()
 
 
 def test_windows_exiftool_uses_utf8_argument_file(monkeypatch, tmp_path):
@@ -65,6 +65,7 @@ def test_windows_exiftool_uses_utf8_argument_file(monkeypatch, tmp_path):
     assert captured["command"] == [str(root / "exiftool.exe"), "-charset", "filename=UTF8", "-@", "-"]
     assert captured["input"] == "-XMP-xmp:Rating\nC:\\照片\\测试.HEIC\n"
     assert captured["encoding"] == "utf-8"
+    assert captured["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 
 def test_windows_exiftool_missing_companion_fails_closed(monkeypatch, tmp_path):
