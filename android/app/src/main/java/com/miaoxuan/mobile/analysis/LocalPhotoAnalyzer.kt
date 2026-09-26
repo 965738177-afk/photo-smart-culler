@@ -77,29 +77,28 @@ class LocalPhotoAnalyzer(private val context: Context) {
 
         val suggested = groups.flatMapIndexed { groupIndex, group ->
             group.sortedByDescending { it.score }.mapIndexed { rank, item ->
-                val rating = when {
-                    rank < settings.minimumPerBurst -> 3
-                    rank < settings.maximumPerBurst -> 2
-                    item.score >= 56.0 -> 1
-                    else -> 0
-                }
-                item.copy(groupId = groupIndex + 1, suggestedRating = rating, rating = rating)
+                item.copy(
+                    groupId = groupIndex + 1,
+                    // Rank within a burst: a uniformly dark scene can still contain its best
+                    // frame. Keep the technical warning visible for manual review.
+                    recommended = rank < settings.maximumPerBurst && item.score >= 35.0,
+                )
             }
         }.toMutableList()
 
         val target = settings.targetKeepCount ?: return suggested
-        var overage = suggested.count { it.rating > 0 } - target
+        var overage = suggested.count { it.recommended } - target
         if (overage <= 0) return suggested
 
         // Preserve the leading shot from every scene before trimming weaker backups.
         val protectedUris = suggested.groupBy { it.groupId }
             .values.mapNotNull { group -> group.maxByOrNull { it.score }?.uri }.toSet()
         suggested.indices
-            .filter { suggested[it].rating > 0 && suggested[it].uri !in protectedUris }
+            .filter { suggested[it].recommended && suggested[it].uri !in protectedUris }
             .sortedBy { suggested[it].score }
             .forEach { index ->
                 if (overage-- > 0) {
-                    suggested[index] = suggested[index].copy(rating = 0, suggestedRating = 0)
+                    suggested[index] = suggested[index].copy(recommended = false)
                 }
             }
         return suggested

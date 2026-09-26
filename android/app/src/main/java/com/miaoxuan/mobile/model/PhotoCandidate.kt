@@ -9,8 +9,7 @@ data class PhotoCandidate(
     val capturedAtMillis: Long,
     val groupId: Int = 0,
     val score: Double = 0.0,
-    val suggestedRating: Int = 0,
-    val rating: Int = 0,
+    val recommended: Boolean = false,
     val sharpness: Double = 0.0,
     val luminance: Double = 0.0,
     val perceptualHash: Long = 0L,
@@ -19,7 +18,7 @@ data class PhotoCandidate(
 
 data class PickerSettings(
     val minimumPerBurst: Int = 1,
-    val maximumPerBurst: Int = 2,
+    val maximumPerBurst: Int = 1,
     val targetKeepCount: Int? = null,
     val detectBlur: Boolean = true,
     val detectExposure: Boolean = true,
@@ -38,4 +37,3 @@ data class TaskSummary(
     val sourceCount: Int,
     val keepCount: Int,
 )
-
