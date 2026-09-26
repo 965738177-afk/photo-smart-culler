@@ -37,8 +37,16 @@ class MiaoXuanViewModel(application: Application) : AndroidViewModel(application
     private val _state = MutableStateFlow(MobileUiState(history = historyStore.load()))
     val state: StateFlow<MobileUiState> = _state.asStateFlow()
 
-    fun setSourceUris(uris: List<Uri>) {
-        _state.update { it.copy(sourceUris = uris.distinct(), photos = emptyList(), error = null, analyzedCount = 0) }
+    /** Add another picker batch without discarding photos already chosen for this task. */
+    fun addSourceUris(uris: List<Uri>) {
+        _state.update { current ->
+            current.copy(
+                sourceUris = (current.sourceUris + uris).distinct(),
+                photos = emptyList(),
+                error = null,
+                analyzedCount = 0,
+            )
+        }
     }
 
     fun updateSettings(settings: PickerSettings) = _state.update { it.copy(settings = settings) }
@@ -104,4 +112,3 @@ class MiaoXuanViewModel(application: Application) : AndroidViewModel(application
 
     private fun csvCell(value: String): String = "\"${value.replace("\"", "\"\"")}\""
 }
-

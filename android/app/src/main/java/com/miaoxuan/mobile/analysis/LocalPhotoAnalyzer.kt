@@ -107,8 +107,13 @@ class LocalPhotoAnalyzer(private val context: Context) {
 
     private fun decodePreview(uri: Uri): Bitmap {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-            ?: error("无法读取图片")
+        // In bounds-only mode BitmapFactory intentionally returns null because it does not
+        // allocate a Bitmap. Treat a readable stream—not that return value—as success.
+        val streamWasOpened = resolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input, null, bounds)
+            true
+        } ?: false
+        check(streamWasOpened) { "无法读取图片" }
         require(bounds.outWidth > 0 && bounds.outHeight > 0) { "不是可识别的图片" }
         var sample = 1
         while (max(bounds.outWidth / sample, bounds.outHeight / sample) > MAX_DIMENSION) sample *= 2

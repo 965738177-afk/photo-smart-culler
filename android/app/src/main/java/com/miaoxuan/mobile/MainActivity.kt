@@ -1,14 +1,13 @@
 package com.miaoxuan.mobile
 
-import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.viewModels
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -31,7 +30,6 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.History
@@ -94,20 +92,21 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 val state by viewModel.state.collectAsStateWithLifecycle()
-                val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-                    uris.forEach { uri ->
-                        runCatching {
-                            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        }
-                    }
-                    if (uris.isNotEmpty()) viewModel.setSourceUris(uris)
+                val importLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.PickMultipleVisualMedia(MAX_PICKER_BATCH_SIZE),
+                ) { uris ->
+                    if (uris.isNotEmpty()) viewModel.addSourceUris(uris)
                 }
                 val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
                     if (uri != null) contentResolver.openOutputStream(uri)?.use(viewModel::writeCsv)
                 }
                 MiaoXuanApp(
                     state = state,
-                    onImport = { importLauncher.launch(arrayOf("image/*")) },
+                    onImport = {
+                        importLauncher.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                        )
+                    },
                     onAnalyze = viewModel::analyze,
                     onNewTask = viewModel::clearTask,
                     onSettings = viewModel::updateSettings,
@@ -118,6 +117,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+private const val MAX_PICKER_BATCH_SIZE = 150
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -176,14 +177,14 @@ private fun ImportContent(state: MobileUiState, modifier: Modifier, onImport: ()
             textAlign = TextAlign.Center,
         )
         Spacer(Modifier.height(28.dp))
-        Button(onClick = onImport, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Image, null); Spacer(Modifier.width(8.dp)); Text(if (state.sourceUris.isEmpty()) "选择照片" else "重新选择照片") }
+        Button(onClick = onImport, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Image, null); Spacer(Modifier.width(8.dp)); Text(if (state.sourceUris.isEmpty()) "从相册批量选择" else "继续添加照片") }
         if (state.sourceUris.isNotEmpty()) {
             Spacer(Modifier.height(12.dp))
             OutlinedButton(onClick = onAnalyze, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.AutoAwesome, null); Spacer(Modifier.width(8.dp)); Text("开始本机分析") }
         }
         state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 16.dp), textAlign = TextAlign.Center) }
         Spacer(Modifier.height(32.dp))
-        Text("不会上传照片 · 不删除原图 · 导出 CSV 交接桌面版", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+        Text("每次最多选择 150 张，可重复添加 · 不上传照片 · 不删除原图", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
     }
 }
 
