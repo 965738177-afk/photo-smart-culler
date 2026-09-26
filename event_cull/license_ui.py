@@ -18,6 +18,7 @@ from event_cull.licensing import (
     LicensePlan,
     license_label,
 )
+from event_cull.platform_paths import device_label
 
 CHECKOUT_PAGE_URL = "https://cull.lhxx.online/"
 
@@ -158,7 +159,7 @@ class TeamAuthorizationDialog(tk.Toplevel):
             ttk.Label(card, text=lease.team_name, style="Team.Name.TLabel").pack(anchor="w", pady=(6, 0))
             ttk.Label(
                 card,
-                text="当前 Mac 已绑定。团队主人移除这台设备或撤销成员后，设备将在下次联网验证时失效。",
+                text=f"当前{device_label()}已绑定。团队主人移除这台设备或撤销成员后，设备将在下次联网验证时失效。",
                 style="Team.ActiveCopy.TLabel", wraplength=450, justify="left",
             ).pack(anchor="w", pady=(8, 0))
             actions = ttk.Frame(outer, style="Team.Root.TFrame")
@@ -172,7 +173,7 @@ class TeamAuthorizationDialog(tk.Toplevel):
         ttk.Label(card, text="使用团队邀请邮箱", style="Team.Section.TLabel").pack(anchor="w")
         ttk.Label(
             card,
-            text="团队主人先在管理页邀请你的邮箱；收到验证码后，即可为当前 Mac 开通团队永久授权。",
+            text=f"团队主人先在管理页邀请你的邮箱；收到验证码后，即可为当前{device_label()}开通团队永久授权。",
             style="Team.Copy.TLabel", wraplength=470, justify="left",
         ).pack(anchor="w", pady=(4, 13))
         ttk.Label(card, text="邀请邮箱", style="Team.Field.TLabel").pack(anchor="w")
@@ -263,7 +264,7 @@ class TeamAuthorizationDialog(tk.Toplevel):
     def activate(self) -> None:
         def activated(_lease: Any) -> None:
             self.on_changed()
-            messagebox.showinfo("团队授权", "当前 Mac 已获得团队永久授权。", parent=self)
+            messagebox.showinfo("团队授权", f"当前{device_label()}已获得团队永久授权。", parent=self)
             self.destroy()
         self._run(lambda: self.controller.activate_team(self.email.get(), self.code.get()), activated)
 
@@ -346,7 +347,7 @@ class LicenseDialog(tk.Toplevel):
             style="LicenseTrial.TButton",
         )
         self.trial_start_button.pack(side="left")
-        ttk.Label(trial_actions, text="每台 Mac 限领一次", style="LicenseTrialHint.TLabel").pack(side="left", padx=(12, 0))
+        ttk.Label(trial_actions, text=f"每台{device_label()}限领一次", style="LicenseTrialHint.TLabel").pack(side="left", padx=(12, 0))
 
         card = ttk.Frame(outer, style="LicenseStatus.TFrame", padding=(15, 11))
         card.pack(fill="x", pady=(10, 0))
@@ -371,7 +372,7 @@ class LicenseDialog(tk.Toplevel):
         )
         ttk.Label(
             self.team_access,
-            text="已受邀请的邮箱不需要购买或输入个人激活码；验证邮箱即可将团队永久授权绑定到当前 Mac。",
+            text=f"已受邀请的邮箱不需要购买或输入个人激活码；验证邮箱即可将团队永久授权绑定到当前{device_label()}。",
             style="LicenseTeamCopy.TLabel", wraplength=400, justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(3, 0))
         self.team_button = ttk.Button(
@@ -391,7 +392,7 @@ class LicenseDialog(tk.Toplevel):
         ttk.Label(self.team_verify, text="验证团队邀请邮箱", style="LicenseTeamTitle.TLabel").pack(anchor="w")
         ttk.Label(
             self.team_verify,
-            text="输入受邀请的邮箱，获取验证码后即可授权当前 Mac。",
+            text=f"输入受邀请的邮箱，获取验证码后即可授权当前{device_label()}。",
             style="LicenseTeamCopy.TLabel", wraplength=540, justify="left",
         ).pack(anchor="w", pady=(3, 9))
         self.team_email = tk.StringVar()
@@ -629,7 +630,7 @@ class LicenseDialog(tk.Toplevel):
         self._run(self.controller.start_device_trial, self._trial_activated)
 
     def _trial_activated(self, _lease: Any) -> None:
-        self.payment_note.set(f"{TRIAL_DAYS} 天试用已开通，并已绑定当前 Mac。授权凭据已保存到系统钥匙串。")
+        self.payment_note.set(f"{TRIAL_DAYS} 天试用已开通，并已绑定当前{device_label()}。授权凭据已保存到系统安全凭据库。")
 
     def activate(self) -> None:
         if not self.code.get().strip():
@@ -664,7 +665,7 @@ class LicenseDialog(tk.Toplevel):
 
     def _team_activated(self, _lease: Any) -> None:
         self.team_code.set("")
-        self.payment_note.set("当前 Mac 已完成团队邮箱验证和授权。")
+        self.payment_note.set(f"当前{device_label()}已完成团队邮箱验证和授权。")
 
     def _activated(self, _lease: Any) -> None:
         self.code.set("")

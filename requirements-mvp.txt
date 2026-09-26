@@ -7,5 +7,5 @@ tkinterdnd2==0.6.3
 onnxruntime==1.29.0
 cryptography==46.0.5
 keyring==25.6.0
-pyobjc-framework-Security==12.1
+pyobjc-framework-Security==12.1; sys_platform == "darwin"
 qrcode[pil]==8.2

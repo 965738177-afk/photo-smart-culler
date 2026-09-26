@@ -12,12 +12,16 @@ from __future__ import annotations
 import os
 import json
 import shutil
+import tempfile
+import threading
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 from xml.etree import ElementTree as ET
+
+from event_cull.platform_process import no_console_creationflags
 
 XMP = "adobe:ns:meta/"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -113,25 +117,78 @@ def _bundled_exiftool_root() -> Path:
     well-tested ISO-BMFF metadata update without re-encoding HEIC pixels.
     """
     bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
-    return bundle_root / "event_cull" / "vendor" / "exiftool"
+    name = "exiftool-windows" if sys.platform == "win32" else "exiftool"
+    return bundle_root / "event_cull" / "vendor" / name
+
+
+_WINDOWS_EXIFTOOL_STAGING: tempfile.TemporaryDirectory[str] | None = None
+_WINDOWS_EXIFTOOL_STAGING_LOCK = threading.Lock()
+
+
+def _windows_exiftool_root(root: Path) -> Path:
+    """Relocate Perl's helper files when the install path has Unicode.
+
+    The official Windows ExifTool build cannot locate ``exiftool_files`` when
+    its own directory has non-ASCII characters, even though it can read photo
+    filenames through a UTF-8 argument file.  A private temporary directory
+    under the system's ASCII ProgramData path avoids that launcher limitation.
+    """
+    if str(root).isascii():
+        return root
+    global _WINDOWS_EXIFTOOL_STAGING
+    with _WINDOWS_EXIFTOOL_STAGING_LOCK:
+        if _WINDOWS_EXIFTOOL_STAGING is not None:
+            return Path(_WINDOWS_EXIFTOOL_STAGING.name)
+        candidates = [Path(os.environ.get("PROGRAMDATA") or "C:/ProgramData"), Path(tempfile.gettempdir())]
+        for candidate in candidates:
+            if not str(candidate).isascii():
+                continue
+            try:
+                staging = tempfile.TemporaryDirectory(prefix="MiaoXuan-ExifTool-", dir=candidate)
+                shutil.copytree(root, staging.name, dirs_exist_ok=True)
+            except OSError:
+                if "staging" in locals():
+                    staging.cleanup()
+                    del staging
+                continue
+            _WINDOWS_EXIFTOOL_STAGING = staging
+            return Path(staging.name)
+    raise RuntimeError("无法在英文路径准备照片元数据组件；请将秒选解压到英文路径后重试")
 
 
 def _run_bundled_exiftool(*arguments: str) -> str:
     root = _bundled_exiftool_root()
-    script = root / "exiftool"
-    library = root / "lib"
-    perl = Path("/usr/bin/perl")
-    if not script.is_file() or not library.is_dir() or not perl.is_file():
-        raise RuntimeError("HEIC 元数据组件不可用；请重新安装秒选后再试")
+    if sys.platform == "win32":
+        root = _windows_exiftool_root(root)
+        executable = root / "exiftool.exe"
+        # ExifTool's UTF-8 argument-file reader is required for Chinese paths
+        # on Windows; command-line filenames otherwise use the active codepage.
+        command = [str(executable), "-charset", "filename=UTF8", "-@", "-"]
+        input_text = "\n".join(arguments) + "\n"
+        available = executable.is_file() and (root / "exiftool_files").is_dir()
+    else:
+        script = root / "exiftool"
+        library = root / "lib"
+        perl = Path("/usr/bin/perl")
+        command = [str(perl), "-I", str(library), str(script), *arguments]
+        input_text = None
+        available = script.is_file() and library.is_dir() and perl.is_file()
+    if not available:
+        raise RuntimeError("照片元数据组件不可用；请重新安装秒选后再试")
     try:
         completed = subprocess.run(
-            [str(perl), "-I", str(library), str(script), *arguments],
+            command,
             check=False,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
+            input=input_text,
+            timeout=180,
+            creationflags=no_console_creationflags(),
         )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("照片元数据写入超时，请检查原片所在磁盘并重试") from exc
     except OSError as exc:  # pragma: no cover - platform launch failure
         raise RuntimeError(f"无法启动 HEIC 元数据组件：{exc}") from exc
     if completed.returncode != 0:

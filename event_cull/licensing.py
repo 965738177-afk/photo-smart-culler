@@ -2,8 +2,8 @@
 
 Payment secrets never enter this module.  The API verifies an Alipay or WeChat
 server callback, then returns a short, Ed25519-signed lease to this client.
-The client only verifies that signature and keeps its credential in macOS
-Keychain through the native ``keyring`` backend.
+The client only verifies that signature and keeps its credential in the native
+macOS Keychain or Windows Credential Locker through ``keyring``.
 """
 
 from __future__ import annotations
@@ -225,8 +225,13 @@ class LicenseService:
         except ImportError as exc:
             raise LicenseError("授权组件不完整，请重新安装照片智能筛选器。") from exc
         backend = keyring.get_keyring()
-        if backend.__class__.__module__ != "keyring.backends.macOS":
-            raise LicenseError("系统钥匙串不可用，请检查 macOS 钥匙串访问权限。")
+        backend_module = backend.__class__.__module__
+        native_backend = (
+            (platform.system() == "Darwin" and backend_module == "keyring.backends.macOS")
+            or (platform.system() == "Windows" and backend_module == "keyring.backends.Windows")
+        )
+        if not native_backend:
+            raise LicenseError("系统安全凭据存储不可用，请检查当前用户的系统账户权限。")
         return keyring, KeyringError
 
     def _read_secret(self, account: str) -> str | None:
@@ -234,14 +239,14 @@ class LicenseService:
         try:
             return keyring.get_password(KEYRING_SERVICE, account)
         except keyring_error as exc:
-            raise LicenseError("无法读取系统钥匙串，请检查钥匙串访问权限。") from exc
+            raise LicenseError("无法读取系统安全凭据，请检查当前用户的系统账户权限。") from exc
 
     def _write_secret(self, account: str, value: str) -> None:
         keyring, keyring_error = self._keyring()
         try:
             keyring.set_password(KEYRING_SERVICE, account, value)
         except keyring_error as exc:
-            raise LicenseError("无法写入系统钥匙串，请检查钥匙串访问权限。") from exc
+            raise LicenseError("无法写入系统安全凭据，请检查当前用户的系统账户权限。") from exc
 
     def device_id(self) -> str:
         existing = self._read_secret(DEVICE_ID_ACCOUNT)
@@ -445,7 +450,7 @@ class LicenseService:
 
     @staticmethod
     def _device_name() -> str:
-        computer = platform.node().strip() or "Mac"
+        computer = platform.node().strip() or "Desktop"
         return f"{computer} · {platform.system().strip() or 'Desktop'}"[:120]
 
     @staticmethod
@@ -462,6 +467,21 @@ class LicenseService:
                 if match:
                     traits.append(match.group(1))
             except (OSError, subprocess.SubprocessError):
+                pass
+        elif platform.system() == "Windows":
+            try:
+                import winreg
+
+                with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"SOFTWARE\Microsoft\Cryptography",
+                    0,
+                    winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+                ) as key:
+                    machine_guid, _kind = winreg.QueryValueEx(key, "MachineGuid")
+                if isinstance(machine_guid, str) and machine_guid.strip():
+                    traits.append(machine_guid.strip())
+            except (ImportError, OSError):
                 pass
         if len(traits) == 3:
             traits.append(platform.node())

@@ -343,7 +343,7 @@ def test_log_record_keeps_rating_quality_and_review_reason():
 
     record = EventCullApp._log_record(item, 1)
 
-    assert record["folder"] == "/photos"
+    assert record["folder"] == str(Path("/photos"))
     assert record["rating"] == 3
     assert record["score"] == 91.23
     assert record["subject_sharpness"] == 98.77
