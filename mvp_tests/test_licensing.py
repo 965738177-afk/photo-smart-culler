@@ -39,13 +39,28 @@ def test_policy_allows_lifetime_lease_until_server_offline_window_expires():
     assert decision.plan is licensing.LicensePlan.LIFETIME
 
 
-def test_team_lifetime_lease_has_a_clear_sidebar_label():
+@pytest.mark.parametrize("team_name", [None, "秒选摄影团队"])
+def test_lifetime_lease_has_an_activated_sidebar_label(team_name):
     decision = licensing.evaluate_lease(
-        _lease(plan=licensing.LicensePlan.LIFETIME, team_name="秒选摄影团队")
+        _lease(plan=licensing.LicensePlan.LIFETIME, team_name=team_name)
     )
 
     assert decision.allows_analysis
-    assert licensing.license_label(decision) == "团队授权"
+    assert licensing.license_label(decision) == "已激活"
+
+
+@pytest.mark.parametrize("team_name", [None, "秒选摄影团队"])
+def test_lifetime_offline_expiry_requests_verification_not_reactivation(team_name):
+    decision = licensing.evaluate_lease(
+        _lease(plan=licensing.LicensePlan.LIFETIME, offline_hours=-1, team_name=team_name)
+    )
+
+    assert not decision.allows_analysis
+    assert licensing.license_label(decision) == "已激活 · 待验证"
+
+
+def test_unactivated_sidebar_keeps_activation_entry():
+    assert licensing.license_label(licensing.evaluate_lease(None)) == "开始试用 / 激活"
 
 
 def test_three_day_trial_copy_and_remaining_time_are_not_described_as_a_subscription():

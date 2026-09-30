@@ -16,9 +16,13 @@ import cv2
 import numpy as np
 
 
-PIPELINE_ID = "mobilenet-v3-small-visual-v1"
+LEGACY_PIPELINE_ID = "mobilenet-v3-small-visual-v1"
+PIPELINE_ID = "mobilenet-v3-small-visual-v2"
+# An opt-in experiment contract: CPU-only extraction cannot silently mix
+# Core ML descriptors with descriptors produced after a batch fallback.
+CPU_PIPELINE_ID = "mobilenet-v3-small-cpu-visual-v3"
 MODEL_FILENAME = "mobilenet_v3_small_visual.onnx"
-FEATURE_DIMENSION = 72
+FEATURE_DIMENSION = 576
 _IMAGE_SIZE = 224
 _BATCH_SIZE = 24
 _LOCK = threading.RLock()
@@ -73,10 +77,13 @@ class DeepVisualEncoder:
     def __init__(self, backend: str | None = None) -> None:
         self.backend = backend or preferred_backend()
         self._model = None
+        self._closed = False
         if self.backend == "unavailable":
             raise DeepFeatureUnavailable("Deep visual model is not available locally.")
 
     def _load(self) -> None:
+        if self._closed:
+            raise DeepFeatureUnavailable("Deep visual encoder is closed.")
         if self._model is not None:
             return
         path = model_path()
@@ -90,7 +97,11 @@ class DeepVisualEncoder:
             providers = ["CPUExecutionProvider"]
             if self.backend == "coreml":
                 providers.insert(0, "CoreMLExecutionProvider")
-            self._model = ort.InferenceSession(str(path), providers=providers)
+            settings = ort.SessionOptions()
+            # Avoid nesting a full CPU pool inside the six RAW-analysis workers.
+            settings.intra_op_num_threads = 2
+            settings.inter_op_num_threads = 1
+            self._model = ort.InferenceSession(str(path), sess_options=settings, providers=providers)
         except Exception as exc:
             self._model = None
             raise DeepFeatureUnavailable("Deep visual model could not start on this computer.") from exc
@@ -111,11 +122,13 @@ class DeepVisualEncoder:
 
     @staticmethod
     def _compress(values: np.ndarray) -> np.ndarray:
-        # MobileNet emits 576 channels. Pool adjacent channel groups so a small
-        # per-user classifier can learn safely from a few hundred photographs.
+        # Channels are learned independently, not spatial neighbours. Averaging
+        # arbitrary adjacent channels discards the very pose/content differences
+        # needed for selection. Regularize the classifier instead (v1 migration
+        # is handled by the shared calibration feature builder).
         if values.shape[1] != 576:
             raise DeepFeatureUnavailable("Deep model returned an unexpected feature shape.")
-        return values.reshape(len(values), FEATURE_DIMENSION, 8).mean(axis=2).astype(np.float32)
+        return values.astype(np.float32)
 
     def encode(self, images: list[np.ndarray]) -> np.ndarray:
         if not images:
@@ -136,15 +149,27 @@ class DeepVisualEncoder:
                     return self.encode(images)
                 raise DeepFeatureUnavailable("Deep scoring could not process these images.") from exc
 
+    def close(self) -> None:
+        """Release a caller-owned diagnostic encoder without touching others."""
+        with _LOCK:
+            self._closed = True
+            self._model = None
 
-def encode_images(images: list[np.ndarray]) -> tuple[np.ndarray, str]:
+
+def encode_images(images: list[np.ndarray], *, backend: str | None = None) -> tuple[np.ndarray, str]:
     """Return compressed local deep features and the backend actually used."""
-    backend = preferred_backend()
-    if backend == "unavailable":
+    available = preferred_backend()
+    if available == "unavailable":
         raise DeepFeatureUnavailable("Deep visual model is not available locally.")
-    encoder = _ENCODERS.get(backend)
-    if encoder is None:
-        encoder = DeepVisualEncoder(backend)
-        _ENCODERS[backend] = encoder
-    values = encoder.encode(images)
+    if backend not in {None, "cpu", "coreml"}:
+        raise ValueError("Unknown deep visual backend")
+    backend = backend or available
+    if backend == "coreml" and available != "coreml":
+        raise DeepFeatureUnavailable("Core ML deep visual backend is not available.")
+    with _LOCK:
+        encoder = _ENCODERS.get(backend)
+        if encoder is None:
+            encoder = DeepVisualEncoder(backend)
+            _ENCODERS[backend] = encoder
+        values = encoder.encode(images)
     return values, encoder.backend

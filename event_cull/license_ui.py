@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import queue
 import urllib.parse
 import webbrowser
 from collections.abc import Callable
@@ -21,6 +22,55 @@ from event_cull.licensing import (
 from event_cull.platform_paths import device_label
 
 CHECKOUT_PAGE_URL = "https://cull.lhxx.online/"
+
+
+def _run_background(
+    parent: tk.Misc, operation: Callable[[], Any],
+    completed: Callable[[Any], None], failed: Callable[[str], None],
+) -> None:
+    """Deliver network results on Tk's thread, discarding closed-window work."""
+    results: queue.Queue[tuple[bool, Any]] = queue.Queue()
+    closed = False
+    timer = None
+
+    def on_destroy(event) -> None:
+        nonlocal closed
+        if event.widget is not parent:
+            return
+        closed = True
+        if timer is not None:
+            try:
+                parent.after_cancel(timer)
+            except tk.TclError:
+                pass
+
+    binding = parent.bind("<Destroy>", on_destroy, add="+")
+
+    def poll() -> None:
+        nonlocal timer
+        if closed:
+            return
+        try:
+            ok, value = results.get_nowait()
+        except queue.Empty:
+            timer = parent.after(50, poll)
+            return
+        if binding:
+            parent.unbind("<Destroy>", binding)
+        (completed if ok else failed)(value)
+
+    def worker() -> None:
+        try:
+            value = operation()
+        except (LicenseError, ValueError) as exc:
+            results.put((False, str(exc)))
+        except Exception:
+            results.put((False, "操作暂时无法完成，请检查网络后重试。"))
+        else:
+            results.put((True, value))
+
+    threading.Thread(target=worker, daemon=True).start()
+    timer = parent.after(50, poll)
 
 
 class DeviceManagementDialog(tk.Toplevel):
@@ -57,15 +107,8 @@ class DeviceManagementDialog(tk.Toplevel):
         self.refresh()
 
     def _run(self, operation: Callable[[], Any], finished: Callable[[Any], None]) -> None:
-        def worker() -> None:
-            try:
-                value = operation()
-            except LicenseError as error:
-                detail = str(error)
-                self.after(0, lambda detail=detail: messagebox.showwarning("设备管理", detail, parent=self))
-            else:
-                self.after(0, lambda: finished(value))
-        threading.Thread(target=worker, daemon=True).start()
+        _run_background(self, operation, finished,
+                        lambda detail: messagebox.showwarning("设备管理", detail, parent=self))
 
     def refresh(self) -> None:
         self.summary.set("正在读取已激活设备…")
@@ -233,17 +276,9 @@ class TeamAuthorizationDialog(tk.Toplevel):
         for control in controls:
             control.configure(state="disabled")
 
-        def worker() -> None:
-            try:
-                value = operation()
-            except (LicenseError, ValueError) as error:
-                detail = str(error)
-                self.after(0, lambda detail=detail: self._failed(detail, controls))
-            except Exception:
-                self.after(0, lambda: self._failed("操作暂时无法完成，请检查网络后重试。", controls))
-            else:
-                self.after(0, lambda: self._completed(value, completed, controls))
-        threading.Thread(target=worker, daemon=True).start()
+        _run_background(self, operation,
+                        lambda value: self._completed(value, completed, controls),
+                        lambda detail: self._failed(detail, controls))
 
     def _failed(self, detail: str, controls: list[ttk.Button]) -> None:
         for control in controls:
@@ -573,17 +608,7 @@ class LicenseDialog(tk.Toplevel):
         for control in self._controls:
             control.configure(state="disabled")
 
-        def worker() -> None:
-            try:
-                value = operation()
-            except (LicenseError, ValueError) as error:
-                detail = str(error)
-                self.after(0, lambda detail=detail: self._failed(detail))
-            except Exception:
-                self.after(0, lambda: self._failed("操作暂时无法完成，请检查网络后重试。"))
-            else:
-                self.after(0, lambda: self._finished(value, finished))
-        threading.Thread(target=worker, daemon=True).start()
+        _run_background(self, operation, lambda value: self._finished(value, finished), self._failed)
 
     def _failed(self, detail: str) -> None:
         self.refresh_view()
@@ -591,6 +616,9 @@ class LicenseDialog(tk.Toplevel):
         # less disruptive during a cull, this avoids spawning a native Tk
         # alert while an IME is changing focus on macOS.
         self.payment_note.set(detail)
+        # Keep failures visible next to the status even on short windows where
+        # the purchase feedback below is outside the current scroll viewport.
+        self.detail.set(detail)
 
     def _finished(self, value: Any, finished: Callable[[Any], None]) -> None:
         finished(value)
@@ -602,7 +630,7 @@ class LicenseDialog(tk.Toplevel):
         self.status.set(license_label(decision))
         team_name = decision.lease.team_name if decision.lease is not None else None
         self.detail.set(
-            f"{team_name} · 团队永久授权已启用。团队主人可在网站管理成员和设备。"
+            f"{team_name} · 团队永久授权已启用。{decision.message}团队主人可在网站管理成员和设备。"
             if team_name else decision.message
         )
         if team_name:

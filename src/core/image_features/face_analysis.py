@@ -8,14 +8,87 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import threading
 from typing import Protocol
 
 import numpy as np
 
-from core.runtime_paths import resolve_face_landmarker_model_path
+from ..runtime_paths import resolve_face_landmarker_model_path
 
 
 FACE_DESCRIPTOR_VERSION = "mediapipe-face-landmarks-v1"
+FACE_REGION_PIPELINE = "yunet-2023mar-640-score08-regions-v1"
+
+
+class FaceRegionDetector:
+    """Own bounded YuNet proposals for recovery and expression alignment.
+
+    Inputs are shared, decoded BGR pixels. Coordinates (including the five
+    alignment landmarks) are returned in the caller's original pixel units.
+    Proposals do not prove eye visibility, wedding roles or expression quality.
+    """
+
+    def __init__(self, *, model_path_resolver, backend_factory=None, checkpoint=lambda: None):
+        self._resolver = model_path_resolver
+        self._factory = backend_factory
+        self._checkpoint = checkpoint
+        self._backend = None
+        self._closed = False
+        self._lock = threading.RLock()
+
+    def load(self):
+        with self._lock:
+            self._checkpoint()
+            if self._closed:
+                raise RuntimeError("Face region detector is closed")
+            if self._backend is None:
+                path = str(self._resolver())
+                if self._factory is None:
+                    import cv2
+                    backend = cv2.FaceDetectorYN.create(path, "", (320, 320), .8, .3, 100)
+                else:
+                    backend = self._factory(path)
+                self._backend = backend
+
+    def detect(self, bgr, *, maximum_dimension=640, checkpoint=None):
+        import cv2
+        checkpoint = checkpoint or self._checkpoint
+        checkpoint()
+        if (not isinstance(bgr, np.ndarray) or bgr.dtype != np.uint8 or bgr.ndim != 3
+                or bgr.shape[2] != 3 or min(bgr.shape[:2]) < 1 or max(bgr.shape[:2]) > 1600
+                or type(maximum_dimension) is not int or not 32 <= maximum_dimension <= 640):
+            raise ValueError("Invalid bounded face region preview")
+        with self._lock:
+            self.load()
+            checkpoint()
+            height, width = bgr.shape[:2]
+            scale = min(1., maximum_dimension/max(height, width))
+            small = cv2.resize(bgr, None, fx=scale, fy=scale) if scale < 1 else bgr
+            self._backend.setInputSize((small.shape[1], small.shape[0]))
+            _, detected = self._backend.detect(small)
+            checkpoint()
+            if detected is None:
+                return np.empty((0, 15), dtype=np.float32)
+            values = np.asarray(detected, dtype=np.float32)
+            if (values.ndim != 2 or values.shape[1] != 15 or len(values) > 100
+                    or not np.isfinite(values).all() or (values[:, 2:4] <= 0).any()
+                    or ((values[:, 14] < 0) | (values[:, 14] > 1)).any()):
+                raise ValueError("Invalid face region output")
+            values = values.copy()
+            values[:, :14] /= scale
+            # Border proposals are clipped, not used as out-of-image crops.
+            x0, y0 = np.clip(values[:, 0], 0, width), np.clip(values[:, 1], 0, height)
+            x1 = np.clip(values[:, 0]+values[:, 2], 0, width)
+            y1 = np.clip(values[:, 1]+values[:, 3], 0, height)
+            values[:, :4] = np.column_stack((x0, y0, x1-x0, y1-y0))
+            return values[(x1-x0 >= 1) & (y1-y0 >= 1)]
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            backend, self._backend = self._backend, None
+            if backend is not None and hasattr(backend, "close"):
+                backend.close()
 
 
 @lru_cache(maxsize=1)
@@ -111,9 +184,9 @@ class SubjectDescriptor:
 def _default_backend_factory(model_path: Path) -> FaceLandmarkerBackend:
     # Import lazily so workflows that never inspect a near-duplicate do not import
     # MediaPipe or initialize its native runtime.
-    from core.best_photo_finder.scorers import MediaPipeTasksFaceLandmarker
+    from .landmarker_runtime import TasksLandmarker
 
-    return MediaPipeTasksFaceLandmarker(model_path)
+    return TasksLandmarker(model_path)
 
 
 class FaceAnalysisService:

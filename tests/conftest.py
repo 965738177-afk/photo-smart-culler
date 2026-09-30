@@ -18,6 +18,13 @@ if SRC_ROOT not in sys.path:
     sys.path.insert(0, SRC_ROOT)
 
 
+@pytest.fixture(autouse=True)
+def isolate_model_and_image_storage(monkeypatch, tmp_path):
+    """Unit tests must not mutate a person's actual photo/model caches."""
+    monkeypatch.setenv("PHOTOSORT_CACHE_ROOT",str(tmp_path/"runtime-cache"))
+    monkeypatch.setenv("PHOTOSORT_DATA_ROOT",str(tmp_path/"runtime-data"))
+
+
 @pytest.fixture
 def inline_model_download(monkeypatch):
     """Keep provisioning contract fakes local; process lifecycle is tested separately."""

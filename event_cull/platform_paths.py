@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import subprocess
 from pathlib import Path
 
 
@@ -25,3 +26,8 @@ def downloads_dir() -> Path:
 
 def device_label() -> str:
     return "Windows 电脑" if sys.platform == "win32" else "Mac"
+
+
+def hidden_subprocess_options() -> dict[str, int]:
+    """Console helpers must not flash a window in the frozen Windows GUI."""
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform == "win32" else {}

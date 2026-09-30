@@ -154,7 +154,7 @@ def test_target_count_keeps_one_lead_per_group_before_filling_global_slots(monke
     monkeypatch.setattr(engine, "_analyze", lambda path, pairs, options: values[path])
     monkeypatch.setattr(engine, "_same_group", lambda previous, current, options: previous.perceptual_hash == current.perceptual_hash)
     results = analyze_folder(tmp_path, AnalysisOptions(target_keep_count=2))
-    assert [item.suggested_rating for item in results] == [3, 0, 2, 0]
+    assert [item.suggested_rating for item in results] == [3, 0, 1, 0]
 
 
 def test_short_burst_keeps_best_and_one_backup(monkeypatch, tmp_path: Path):
@@ -175,7 +175,7 @@ def test_short_burst_keeps_best_and_one_backup(monkeypatch, tmp_path: Path):
 
     results = analyze_folder(tmp_path, AnalysisOptions(picks_per_group=2, target_keep_count=100))
 
-    assert [item.suggested_rating for item in results] == [3, 2, 2]
+    assert [item.suggested_rating for item in results] == [3, 1, 1]
 
 
 def test_duplicate_cap_can_be_expanded_to_the_preferred_quantity_when_similar_fill_is_enabled():
@@ -864,7 +864,7 @@ def test_single_capture_stays_in_review_instead_of_becoming_an_unrated_reject(mo
     monkeypatch.setattr(engine, "_analyze", lambda path, pairs, options: result)
     results = analyze_folder(tmp_path)
     assert results[0].suggested_rating == 3
-    assert "本组最佳" in results[0].reasons
+    assert "精修候选：本组优选" in results[0].reasons
 
 
 def test_english_analysis_reasons_follow_requested_language(monkeypatch, tmp_path: Path):
@@ -875,7 +875,7 @@ def test_english_analysis_reasons_follow_requested_language(monkeypatch, tmp_pat
     monkeypatch.setattr(engine, "_representatives", lambda folder: [(path, [path])])
     monkeypatch.setattr(engine, "_analyze", lambda path, pairs, options: result)
     results = analyze_folder(tmp_path, AnalysisOptions(language="en"))
-    assert "Best in group" in results[0].reasons
+    assert "Retouch candidate: best in group" in results[0].reasons
 
 
 def test_target_count_creates_cumulative_rating_tiers():
@@ -892,7 +892,7 @@ def test_target_count_creates_cumulative_rating_tiers():
         rating: sum(item.suggested_rating == rating for group in groups for item in group)
         for rating in range(4)
     }
-    assert counts == {0: 700, 1: 200, 2: 40, 3: 60}
+    assert counts == {0: 700, 1: 240, 2: 0, 3: 60}
 
 
 def test_target_floor_is_not_reduced_by_a_per_group_selection_cap():
@@ -994,7 +994,9 @@ def test_featured_tier_keeps_higher_ranked_candidates_ahead_of_one_star_reviews(
 
     engine._assign_tiered_ratings(groups, AnalysisOptions(target_keep_count=10))
 
-    assert [group[0].suggested_rating for group in groups] == [3, 3, 2, 2, 1]
+    # Only five actual retained frames: a target of ten must not inflate
+    # retouch recommendations, and no automatic two-star tier is created.
+    assert [group[0].suggested_rating for group in groups] == [3, 1, 1, 1, 1]
 
 
 def test_analysis_reports_each_processed_photo(monkeypatch, tmp_path: Path):

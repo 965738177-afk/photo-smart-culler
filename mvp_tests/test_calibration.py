@@ -60,7 +60,7 @@ def test_profile_only_reorders_featured_tier(monkeypatch):
     chosen = apply_profile([first, better_same_group, second_group], profile)
 
     assert chosen == 1
-    assert first.suggested_rating == 2
+    assert first.suggested_rating == 1
     assert better_same_group.suggested_rating == 3
     assert second_group.suggested_rating == 2
 
@@ -91,7 +91,10 @@ def test_build_profile_reads_log_exports_and_originals(tmp_path: Path):
     assert profile.training_examples == 80
     assert profile.positive_examples == 16
     assert len(profile.weights) >= 256
-    assert profile.feature_pipeline in {"handcrafted-visual-v1", "mobilenet-v3-small-visual-v1"}
+    assert profile.feature_pipeline in {"handcrafted-visual-v1", "mobilenet-v3-small-visual-v2"}
+    assert profile.objective == "retention"
+    assert profile.featured_rating == 1  # exported original stars are not retouch truth
+    assert profile.validation_precision is not None
 
 
 def test_calibration_ignores_curated_and_prior_export_copies(tmp_path: Path):

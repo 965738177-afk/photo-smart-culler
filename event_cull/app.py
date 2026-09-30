@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+# Native recognition runs in a private worker. Dispatch before importing Tk,
+# licensing or platform UI, especially in a frozen Windows/macOS application.
+import sys
+if __name__ == "__main__" and "--person-evidence-worker" in sys.argv:
+    from src.core.image_features.human_worker import main as _person_worker
+    _person_worker()
+    raise SystemExit(0)
+
 import csv
 from collections import OrderedDict
+from collections.abc import Callable
 import hashlib
 from io import BytesIO, StringIO
 import json
@@ -16,6 +25,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -37,9 +47,16 @@ from event_cull.calibration import (
     save_profile,
 )
 from event_cull.build_info import APP_VERSION
+from event_cull.rating_policy import RATING_LABELS, RATING_POLICY_VERSION, RETAINED_RATINGS
+from event_cull.wedding_rules import (
+    CONTENT_TYPES, PROGRAM_RULE_IDS, RULE_VERSION, rules as wedding_rules,
+    selection_summary as wedding_selection_summary,
+)
+from event_cull.wedding_content import MODEL_NAMES
+from event_cull.bundled_inference import bundled_status
 from event_cull.deep_features import status_label as deep_status_label
 from event_cull.history import load_history, task_name as history_task_name, upsert_task
-from event_cull.licensing import LicenseController, license_label
+from event_cull.licensing import LicenseController, LicenseError, license_label
 from event_cull.license_ui import LicenseDialog
 from event_cull.updater import UpdateInfo, check_for_update, download_update
 from event_cull.engine import (
@@ -59,9 +76,11 @@ from event_cull.export_selected import (
     export_selected_files,
 )
 from event_cull.source_scan import scan_source_images
-from event_cull.platform_paths import application_data_dir
+from event_cull.platform_paths import application_data_dir, hidden_subprocess_options
+from event_cull.preview_warmup import PreviewWarmup
 from event_cull.xmp import (
     EMBEDDED_EXTENSIONS,
+    MetadataCancelled,
     legacy_managed_embedded_photos,
     migrate_legacy_embedded_ratings,
     restore_managed_ratings,
@@ -142,12 +161,13 @@ TEXT["zh"].update({
     "stats_empty": "分析完成后显示星级统计",
     "stats": "1★ {one}　2★ {two}　3★ {three}　已选合计 {selected}　未入选 {zero}　共 {total} 张",
     "target": "目标选图数量",
-    "legend": "1★ 初选复核　2★ 优质备用　3★ 精选推荐　— 未入选",
+    "legend": "1★ 原片保留　2★ 人工确认　3★ 精修候选　— 未入选",
     "filter_label": "显示",
     "filter_all": "全部照片",
-    "filter_three": "仅 3★",
-    "filter_two": "仅 2★",
-    "filter_one": "仅 1★ 初选复核",
+    "filter_retained": "全部保留（1星以上）",
+    "filter_three": "仅 3★ 精修候选",
+    "filter_two": "仅 2★ 人工确认",
+    "filter_one": "仅 1★ 原片保留",
     "filter_zero": "仅未入选",
     "write_mode": "写入方式",
     "per_group": "相似图保留",
@@ -176,7 +196,7 @@ TEXT["zh"].update({
     "eta_remaining": "预计剩余时间：{minutes}分{seconds}秒",
     "eta_paused": "预计剩余时间：已暂停",
     "eta_complete": "已完成 ✅",
-    "done": "分析完成：共 {count} 张，已选 {selected} 张，其中 3★ 精选 {keep} 张；请复核后再写入 XMP。",
+    "done": "分析完成：共 {count} 张，保留原片 {selected} 张，其中 3★ 精修候选 {keep} 张；请检查后再写入 XMP。",
     "export_log": "导出筛选日志",
     "export_log_title": "导出本次筛选日志",
     "export_log_done": "筛选日志已导出：{path}",
@@ -199,8 +219,8 @@ TEXT["zh"].update({
     "calibration_sources": "选择校准原片文件夹（可多选）",
     "calibration_running": "正在本地学习你的最终选片偏好；只读取文件名与画面特征，不修改原图…",
     "calibration_progress": "正在提取本地画面特征 {current}/{total} · {name}",
-    "calibration_apply": "正在按你的历史选片偏好复核 3★ {current}/{total} · {name}",
-    "calibration_done": "选片偏好校准已启用：学习 {samples} 张原图，其中 {positive} 张为最高星级；分组验证区分度 {auc:.0%}。",
+    "calibration_apply": "正在按你的历史选片偏好复核 {current}/{total} · {name}",
+    "calibration_done": "已更新原片保留偏好：学习 {samples} 张原图，其中 {positive} 张是你最终保留的照片。下次用于 1 星原片取舍，不把交付原图当成 3 星精修标签；仍需人工复核。",
     "calibration_failed": "选片偏好校准未启用：{error}",
     "calibration_apply_skipped": "选片偏好校准未应用到本次结果：{error}；已保留基础筛选结果。",
 })
@@ -250,12 +270,13 @@ TEXT["en"].update({
     "stats_empty": "Rating totals appear after analysis",
     "stats": "1★ {one}   2★ {two}   3★ {three}   Selected {selected}   Not selected {zero}   Total {total}",
     "target": "TARGET SELECTION COUNT",
-    "legend": "1★ Review  ·  2★ Strong backup  ·  3★ Best  ·  — Not selected",
+    "legend": "1★ Retained  ·  2★ Manual  ·  3★ Retouch  ·  — Not selected",
     "filter_label": "SHOW",
     "filter_all": "All photos",
-    "filter_three": "3★ only",
-    "filter_two": "2★ only",
-    "filter_one": "1★ review only",
+    "filter_retained": "All retained originals (1★+)",
+    "filter_three": "3★ retouch only",
+    "filter_two": "2★ manual only",
+    "filter_one": "1★ retained only",
     "filter_zero": "Not selected",
     "write_mode": "WRITE MODE",
     "per_group": "SIMILAR PHOTOS KEPT",
@@ -307,8 +328,8 @@ TEXT["en"].update({
     "calibration_sources": "Choose calibration original folders",
     "calibration_running": "Learning your final selections locally; originals stay read-only…",
     "calibration_progress": "Extracting local visual features {current}/{total} · {name}",
-    "calibration_apply": "Reviewing featured picks against your history {current}/{total} · {name}",
-    "calibration_done": "Selection preference tuning is on: learned {samples} originals, with {positive} top-rated; group-separated validation {auc:.0%}.",
+    "calibration_apply": "Reviewing photos against your history {current}/{total} · {name}",
+    "calibration_done": "Original retention tuning is on: learned {samples} originals, including {positive} final retained photos. Used for original delivery, not as retouch labels; review is still needed.",
     "calibration_failed": "Selection preference tuning was not enabled: {error}",
     "calibration_apply_skipped": "Selection preference tuning was not applied: {error}. Base culling results were kept.",
 })
@@ -376,6 +397,7 @@ class EventCullApp(TkinterDnD.Tk):
         self._preview_memory: OrderedDict[Path, Image.Image] = OrderedDict()
         self._zoom_preview_memory: OrderedDict[Path, Image.Image] = OrderedDict()
         self._preview_lock = threading.RLock()
+        self._preview_load_locks = [threading.Lock() for _ in range(64)]
         self._preview_generation = 0
         self._preview_zoom_generation = 0
         self._preview_zoom_window: tk.Toplevel | None = None
@@ -389,6 +411,9 @@ class EventCullApp(TkinterDnD.Tk):
         self.current_task_name = ""
         self.current_task_created_at: str | None = None
         self.license_controller = LicenseController()
+        self._license_refresh_in_flight = False
+        self._license_next_refresh_attempt = 0.0
+        self._license_resume_context = None
         self.folder = tk.StringVar(value=self.t["choose"])
         self.import_notice = tk.StringVar(value="")
         self.task_import_summary = tk.StringVar(value="")
@@ -425,6 +450,10 @@ class EventCullApp(TkinterDnD.Tk):
         # to AnalysisOptions only when a new analysis starts, so changing a
         # setting never rewrites already-reviewed ratings.
         self.scene_type = tk.StringVar(value="通用")
+        self.wedding_content_type = tk.StringVar(value="自动（保守）")
+        self.content_model_enabled = tk.BooleanVar(value=False)
+        self.content_model_name = tk.StringVar(value=MODEL_NAMES[0])
+        self.content_model_status = tk.StringVar(value=bundled_status()[1])
         self.ai_selection_enabled = tk.BooleanVar(value=True)
         self.priority_more_faces = tk.BooleanVar(value=True)
         self.fill_with_similar = tk.BooleanVar(value=False)
@@ -454,6 +483,8 @@ class EventCullApp(TkinterDnD.Tk):
         self._virtual_grid_entries: list[tuple[int | None, Path, list[Path], str, int, list[str]]] = []
         self._virtual_grid_range: tuple[int, int] | None = None
         self._virtual_grid_rows: dict[int, list[tk.Widget]] = {}
+        self._visible_grid_sources: set[Path] = set()
+        self._preview_failures: dict[Path, str] = {}
         self._virtual_grid_render_after: str | None = None
         self._mousewheel_bound = False
         self.grid_visible_limit = 72
@@ -483,7 +514,16 @@ class EventCullApp(TkinterDnD.Tk):
         self.cancel_event = threading.Event()
         self.export_cancel_event = threading.Event()
         self.export_running = False
+        self.metadata_running = False
+        self.metadata_cancel_event = threading.Event()
+        self._close_after_operations = False
         self.ui_events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._preview_warmup = PreviewWarmup(
+            self._preview_image,
+            lambda batch, source: self.ui_events.put(("grid_preview_ready", (batch, source))),
+            failed=lambda batch, source, error: self.ui_events.put(("grid_preview_failed", (batch, source, error))),
+        )
+        self.bind("<Destroy>", self._close_preview_warmup, add="+")
         self.is_paused = False
         self.analysis_running = False
         self.analysis_started_at: float | None = None
@@ -497,11 +537,15 @@ class EventCullApp(TkinterDnD.Tk):
         self.calibration_profile: CalibrationProfile | None = load_profile()
         self.calibration_running = False
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self._request_close)
+        if sys.platform == "darwin":
+            self.createcommand("tk::mac::Quit", self._request_close)
         self.after_idle(self._dismiss_startup_menu_tearoffs)
         self._register_drop_targets(self)
         self.after(50, self.process_ui_events)
         self.after(250, self.refresh_lightroom_guard)
         self.after(1600, self._check_for_updates_in_background)
+        self.after(1000, self._check_license_in_background)
 
     @staticmethod
     def _main_window_size_for_screen(screen_width: int, screen_height: int) -> tuple[int, int]:
@@ -539,6 +583,48 @@ class EventCullApp(TkinterDnD.Tk):
             return 0
         magnitude = max(1, round(abs(delta) / 120)) if abs(delta) >= 120 else 1
         return -magnitude if delta > 0 else magnitude
+
+    @staticmethod
+    def _touchpad_vertical_delta(delta: int) -> int:
+        """Tk 9 packs signed X/Y pixel deltas into the high/low 16 bits."""
+        vertical = int(delta) & 0xffff
+        return vertical - 0x10000 if vertical & 0x8000 else vertical
+
+    def _scroll_canvas(self, event: tk.Event, canvas: tk.Canvas, *, precise: bool = False) -> str | None:
+        """Share scrolling between modal settings and the review surfaces.
+
+        Keep the ordinary wheel's original step, but use single-pixel canvas
+        increments for high-frequency trackpad input. Returning break at the
+        widget binding prevents Combobox/Spinbox class bindings changing values.
+        """
+        delta = int(getattr(event, "delta", 0) or 0)
+        if precise:
+            movement = -self._touchpad_vertical_delta(delta)
+        else:
+            if not delta and getattr(event, "num", None) in {4, 5}:
+                delta = 1 if event.num == 4 else -1
+            movement = self._wheel_units(delta)
+        if movement == 0:
+            return None
+        try:
+            if "_wheel_scroll_pixels" not in canvas.__dict__:
+                original = int(float(canvas.cget("yscrollincrement") or 0))
+                canvas._wheel_scroll_pixels = original or max(1, canvas.winfo_height() // 10)
+                canvas.configure(yscrollincrement=1)
+            if not precise:
+                movement *= canvas._wheel_scroll_pixels
+            canvas.yview_scroll(movement, "units")
+            return "break"
+        except tk.TclError:
+            return None  # A modal can be destroyed while an event is queued.
+
+    def _bind_canvas_scrolling(self, widget: tk.Widget, canvas: tk.Canvas) -> None:
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(sequence, lambda event: self._scroll_canvas(event, canvas), add="+")
+        try:
+            widget.bind("<TouchpadScroll>", lambda event: self._scroll_canvas(event, canvas, precise=True), add="+")
+        except tk.TclError:
+            pass  # Tk 8.6 (including Windows) uses MouseWheel instead.
 
     def _build(self) -> None:
         # The active interface is a photographer-first workbench.  The former
@@ -738,7 +824,7 @@ class EventCullApp(TkinterDnD.Tk):
         rating_scheme.pack(side="right")
         ttk.Label(
             rating_scheme,
-            text="精选推荐" if self.language == "zh" else "Featured",
+            text="精修候选" if self.language == "zh" else "Retouch candidate",
             style="PanelMuted.TLabel",
         ).pack(side="left", padx=(8, 4))
         self.featured_star_menu = ttk.Combobox(
@@ -752,7 +838,7 @@ class EventCullApp(TkinterDnD.Tk):
         self.featured_star_menu.bind("<<ComboboxSelected>>", self._on_star_mapping_changed)
         ttk.Label(
             rating_scheme,
-            text="优质备用" if self.language == "zh" else "Backup",
+            text="人工确认" if self.language == "zh" else "Manual confirmation",
             style="PanelMuted.TLabel",
         ).pack(side="left", padx=(8, 4))
         self.backup_star_menu = ttk.Combobox(
@@ -1257,6 +1343,7 @@ class EventCullApp(TkinterDnD.Tk):
         body.columnconfigure(0, weight=1)
         body.rowconfigure(2, weight=1)
         header = ttk.Frame(body, style="Workbench.TFrame")
+        self.task_header = header
         header.grid(row=0, column=0, sticky="ew")
         # The header keeps task identity on the left and uses the right edge
         # for contextual status after an import, rather than duplicating more
@@ -1281,6 +1368,7 @@ class EventCullApp(TkinterDnD.Tk):
             highlightbackground=colors["line"],
             highlightthickness=1,
         )
+        self.workflow_band = workflow_band
         workflow_band.grid(row=1, column=0, sticky="ew", pady=(12, 20))
         workflow_band.columnconfigure(0, weight=1)
         steps = ttk.Frame(workflow_band, style="Soft.TFrame", padding=(22, 16, 22, 10))
@@ -1381,7 +1469,8 @@ class EventCullApp(TkinterDnD.Tk):
         footer = ttk.Frame(body, style="Workbench.TFrame")
         footer.grid(row=3, column=0, sticky="ew", pady=(9, 0))
         ttk.Label(footer, textvariable=self.status, style="Muted.TLabel").pack(side="left")
-        ttk.Label(footer, text="本地处理 · 确认后才写入星级元数据", style="Muted.TLabel").pack(side="right")
+        self.workspace_footer_note = ttk.Label(footer, text="本地处理 · 确认后才写入星级元数据", style="Muted.TLabel")
+        self.workspace_footer_note.pack(side="right")
 
     def _build_brand_lockup(self, sidebar: ttk.Frame, colors: dict[str, str]) -> None:
         """Render the compact 秒选 mark and its two-line product name."""
@@ -1438,30 +1527,27 @@ class EventCullApp(TkinterDnD.Tk):
         self.grid_count_label = ttk.Label(toolbar, text="0 张", style="Toolbar.TLabel")
         self.grid_count_label.grid(row=0, column=1, sticky="w", padx=(9, 22))
         ttk.Label(toolbar, text="显示照片", style="Toolbar.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 6))
-        self.rating_filter_menu = ttk.Combobox(toolbar, textvariable=self.rating_filter, state="readonly", width=11)
+        self.rating_filter_menu = ttk.Combobox(toolbar, textvariable=self.rating_filter, state="readonly", width=22)
         self.rating_filter_menu.grid(row=0, column=3, sticky="w")
         self.rating_filter_menu.bind("<<ComboboxSelected>>", self.filter_results)
         self.rating_filter_tooltip = ToolTip(
             self.rating_filter_menu,
-            lambda: "1★ 为初选复核：已进入保留池，但建议人工确认；筛选不会改变推荐星级。",
+            lambda: "交付原片请选择“全部保留（1星以上）”：包含 1/2/3 星。2 星只由你手动确认；3 星是保留池内的精修候选。",
         )
-        ttk.Label(toolbar, text="备用评级", style="Toolbar.TLabel").grid(row=0, column=4, sticky="w", padx=(13, 6))
-        self.backup_star_menu = ttk.Combobox(toolbar, textvariable=self.backup_star, values=("2★", "3★", "4★"), state="readonly", width=4)
-        self.backup_star_menu.grid(row=0, column=5, sticky="w")
+        # Keep the state-owning widgets for shared worker lifecycle handling,
+        # but don't display selectors for a policy that is no longer editable.
+        self.backup_star_menu = ttk.Combobox(toolbar, textvariable=self.backup_star, values=("2★",), state="disabled", width=4)
         self.backup_star_menu.bind("<<ComboboxSelected>>", self._on_star_mapping_changed)
         self.backup_star_tooltip = ToolTip(
             self.backup_star_menu,
-            lambda: "把内部“优质备用”层级写入 Lightroom 时使用的星级。",
+            lambda: "2 星留给摄影师人工确认，自动分析和偏好校准均不生成 2 星。",
         )
-        ttk.Label(toolbar, text="精选评级", style="Toolbar.TLabel").grid(row=0, column=6, sticky="w", padx=(9, 6))
-        self.featured_star_menu = ttk.Combobox(toolbar, textvariable=self.featured_star, values=("3★", "4★", "5★"), state="readonly", width=4)
-        self.featured_star_menu.grid(row=0, column=7, sticky="w")
+        self.featured_star_menu = ttk.Combobox(toolbar, textvariable=self.featured_star, values=("3★",), state="disabled", width=4)
         self.featured_star_menu.bind("<<ComboboxSelected>>", self._on_star_mapping_changed)
         self.featured_star_tooltip = ToolTip(
             self.featured_star_menu,
-            lambda: "把内部“精选推荐”层级写入 Lightroom 时使用的星级。",
+            lambda: "3 星从已保留原片中推荐，不增加交付总数；只是精修候选，不保证已达到成片质量。",
         )
-        ttk.Label(toolbar, text="排序：拍摄时间（新→旧）", style="Toolbar.TLabel").grid(row=0, column=8, sticky="w", padx=(17, 0))
         view_controls = tk.Frame(toolbar, bg=self._workbench_colors["paper"])
         self.grid_view_controls = view_controls
         view_controls.grid(row=0, column=9, sticky="e", padx=(16, 0))
@@ -1522,7 +1608,7 @@ class EventCullApp(TkinterDnD.Tk):
         self.photo_grid_canvas.configure(yscrollcommand=self._on_photo_grid_scroll)
         self.photo_grid_inner = tk.Frame(self.photo_grid_canvas, background=self._workbench_colors["paper"])
         self._photo_grid_window = self.photo_grid_canvas.create_window((0, 0), window=self.photo_grid_inner, anchor="nw")
-        self.photo_grid_inner.bind("<Configure>", lambda _event: self.photo_grid_canvas.configure(scrollregion=self.photo_grid_canvas.bbox("all")))
+        self.photo_grid_inner.bind("<Configure>", self._on_grid_inner_configure)
         self.photo_grid_canvas.bind("<Configure>", self._on_grid_canvas_resize)
 
     @staticmethod
@@ -1546,6 +1632,7 @@ class EventCullApp(TkinterDnD.Tk):
         if not hasattr(self, "grid_view_controls"):
             return
         compact = self._grid_toolbar_is_compact(getattr(self, "_grid_toolbar_width", 0))
+        self.grid_hint.configure(wraplength=max(320, getattr(self, "_grid_toolbar_width", 0)))
         if compact:
             self.grid_view_controls.grid_configure(
                 row=1, column=0, columnspan=10, sticky="w", padx=(0, 0), pady=(8, 0)
@@ -1588,25 +1675,23 @@ class EventCullApp(TkinterDnD.Tk):
 
     def _build_calibration_workspace(self, workspace: ttk.Frame) -> None:
         """A dedicated local-learning page, separate from a frame's XMP work."""
-        self.calibration_panel = ttk.Frame(workspace, style="Paper.TFrame", padding=(34, 30))
-        self.calibration_panel.grid(row=0, column=0, sticky="nsew")
-        self.calibration_panel.columnconfigure(0, weight=1)
-        self.calibration_panel.columnconfigure(1, weight=1)
+        self.calibration_panel = ttk.Frame(workspace, style="Paper.TFrame", padding=(28, 24))
+        self.calibration_panel.grid(row=0, column=0, columnspan=2, sticky="nsew")
+        self.calibration_panel.columnconfigure(0, weight=1, uniform="calibration")
+        self.calibration_panel.columnconfigure(1, weight=1, uniform="calibration")
         ttk.Label(self.calibration_panel, text="选片偏好校准", style="TaskTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(
             self.calibration_panel,
-            text="让软件逐步学会你在不同拍摄题材中，真正留下哪一张。所有比对与训练均在本机完成。",
+            text="告诉软件你最后留下了哪些照片，作为下次 3 星推荐的排序参考。",
             style="Muted.TLabel",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 24))
-        loop = ttk.Frame(self.calibration_panel, style="Soft.TFrame", padding=(20, 18))
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 18))
+        loop = ttk.Frame(self.calibration_panel, style="Soft.TFrame", padding=(18, 16))
         loop.grid(row=2, column=0, columnspan=2, sticky="ew")
-        ttk.Label(loop, text="本地反馈闭环", style="PanelTitle.TLabel").pack(anchor="w")
-        ttk.Label(loop, text="每一次交付后的最终选片，都能成为下一次更贴近你审美的依据。", style="PanelMuted.TLabel").pack(anchor="w", pady=(4, 15))
+        ttk.Label(loop, text="怎么用？只需要这 3 步", style="PanelTitle.TLabel").pack(anchor="w", pady=(0, 12))
         steps = (
-            ("1", "保存推荐", "每个任务自动保存软件的建议、分组与评分。"),
-            ("2", "选择最终交付", "只需选择 Lightroom 最终导出的照片文件夹。"),
-            ("3", "自动对比", "按文件名识别选对、漏选与误选，优先学习同组连拍。"),
-            ("4", "安全更新", "新偏好优于当前模型才启用；旧模型始终可一键回退。"),
+            ("1", "先完成一次筛选", "软件自动保存本次结果，不需要手动导出日志。"),
+            ("2", "整理你真正要留下的照片", "放进一个文件夹；可以是原片，也可以是 Lightroom 导出的 JPG。"),
+            ("3", "选择这个文件夹", "按原文件名与本次任务对照，在本机学习；下次分析时使用。"),
         )
         loop_grid = ttk.Frame(loop, style="Soft.TFrame")
         loop_grid.pack(fill="x")
@@ -1616,37 +1701,59 @@ class EventCullApp(TkinterDnD.Tk):
             item.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 12, 0))
             ttk.Label(item, text=number, style="SyncIndex.TLabel", width=2, anchor="center").pack(anchor="w")
             ttk.Label(item, text=title, style="Paper.TLabel").pack(anchor="w", pady=(8, 3))
-            ttk.Label(item, text=copy, style="PanelMuted.TLabel", justify="left", wraplength=180).pack(anchor="w", fill="x")
-        evidence = ttk.Frame(self.calibration_panel, style="Paper.TFrame", padding=(0, 24, 12, 0))
+            ttk.Label(item, text=copy, style="PanelMuted.TLabel", justify="left", wraplength=230).pack(anchor="w", fill="x")
+        evidence = ttk.Frame(self.calibration_panel, style="Paper.TFrame", padding=(0, 20, 12, 0))
         evidence.grid(row=3, column=0, sticky="nsew")
-        ttk.Label(evidence, text="下一次更新选片偏好校准", style="PanelTitle.TLabel").pack(anchor="w")
-        ttk.Label(evidence, text="选择 Lightroom 最终交付文件夹后，软件会自动关联当前任务的本地筛选日志。", style="PanelMuted.TLabel", justify="left", wraplength=390).pack(anchor="w", pady=(7, 14))
-        task_ready = "本次任务筛选日志：已就绪" if self.current_log_path else "本次任务筛选日志：完成一次分析后自动生成"
-        self.calibration_task_status = ttk.Label(evidence, text=task_ready, style="Stats.TLabel")
+        ttk.Label(evidence, text="用我的最终选片学习", style="PanelTitle.TLabel").pack(anchor="w")
+        ttk.Label(evidence, text="请选择这次任务的完整留片，不要直接用软件的自动导出结果。保持原文件名，例如 IMG_1234.HEIC → IMG_1234.jpg。", style="PanelMuted.TLabel", justify="left", wraplength=360).pack(anchor="w", pady=(7, 12))
+        self.calibration_task_status = ttk.Label(evidence, style="Stats.TLabel", wraplength=360)
         self.calibration_task_status.pack(anchor="w", pady=(0, 12))
-        self.calibration_button = ttk.Button(evidence, text="选择最终交付文件夹并更新", style="Primary.TButton", command=self.import_calibration)
+        self.calibration_button = ttk.Button(evidence, text="选择我最终保留的照片文件夹", style="Primary.TButton", command=self.import_calibration)
         self.calibration_button.pack(anchor="w")
-        ttk.Label(evidence, text="不会上传、移动、删除或改写原片及 Lightroom 星级。", style="PanelMuted.TLabel").pack(anchor="w", pady=(10, 0))
-        insight = ttk.Frame(self.calibration_panel, style="Soft.TFrame", padding=(20, 18))
-        insight.grid(row=3, column=1, sticky="nsew", padx=(12, 0), pady=(24, 0))
-        ttk.Label(insight, text="校准报告", style="PanelTitle.TLabel").pack(anchor="w")
-        self.calibration_report = ttk.Label(insight, text=self._calibration_report_text(), style="PanelMuted.TLabel", justify="left", wraplength=340)
+        self.calibration_history_button = ttk.Button(evidence, text="用以前的任务学习…", command=self.import_historical_calibration)
+        self.calibration_history_button.pack(anchor="w", pady=(8, 0))
+        ttk.Label(evidence, text="只在本机读取，不上传照片，不改原片或星级。", style="PanelMuted.TLabel", wraplength=360).pack(anchor="w", pady=(10, 0))
+        insight = ttk.Frame(self.calibration_panel, style="Soft.TFrame", padding=(18, 16))
+        insight.grid(row=3, column=1, sticky="nsew", padx=(12, 0), pady=(20, 0))
+        ttk.Label(insight, text="现在学到了什么？", style="PanelTitle.TLabel").pack(anchor="w")
+        self.calibration_report = ttk.Label(insight, text=self._calibration_report_text(), style="PanelMuted.TLabel", justify="left", wraplength=360)
         self.calibration_report.pack(anchor="w", fill="x", pady=(9, 16))
-        ttk.Label(insight, text="推荐的学习方式", style="Paper.TLabel").pack(anchor="w")
-        ttk.Label(insight, text="• 按婚礼、写真、活动分开校准\n• 重点学习同组连拍最终留片\n• 只复核模型最没有把握的少量照片", style="PanelMuted.TLabel", justify="left", wraplength=340).pack(anchor="w", pady=(7, 0))
+        ttk.Label(insight, text="注意这几点", style="Paper.TLabel").pack(anchor="w")
+        ttk.Label(insight, text="• 原片仍需保留在原位置\n• 用同一题材的完整人工留片学习\n• 样本不足或验证不通过，不启用新偏好\n• 目前只保存一份偏好；成功更新会替换旧偏好", style="PanelMuted.TLabel", justify="left", wraplength=360).pack(anchor="w", pady=(7, 0))
+        # Present the existing worker's state here when task chrome is hidden.
+        # This is a second view, not a separate worker or decoding pipeline.
+        self.calibration_activity = ttk.Frame(self.calibration_panel, style="Soft.TFrame", padding=(18, 12))
+        self.calibration_activity.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        self.calibration_activity.columnconfigure(0, weight=1)
+        ttk.Label(self.calibration_activity, textvariable=self.progress_text, style="PanelMuted.TLabel", wraplength=620).grid(row=0, column=0, sticky="w")
+        self.calibration_stop_button = ttk.Button(self.calibration_activity, text="停止学习", command=self.cancel_calibration)
+        self.calibration_stop_button.grid(row=0, column=1, rowspan=2, padx=(16, 0))
+        self.calibration_progress = ttk.Progressbar(self.calibration_activity, style="Culling.Horizontal.TProgressbar", maximum=1, value=0)
+        self.calibration_progress.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.calibration_activity.grid_remove()
         self._refresh_calibration_button()
 
     def _calibration_report_text(self) -> str:
         if self.calibration_profile is None:
-            return "尚未建立个人偏好。完成一轮分析并导入最终交付照片后，即可生成第一份本地校准报告。"
+            return "还没有学习记录。\n选好照片后，选择左侧的最终留片文件夹即可开始。"
+        if getattr(self.calibration_profile, "objective", "featured") == "retention":
+            profile = self.calibration_profile
+            precision, recall = profile.validation_precision, profile.validation_recall
+            validation = (f"训练留出排序：一致率 {precision:.1%}，找回率 {recall:.1%}（未含最终去重/硬门槛）。\n"
+                          if precision is not None and recall is not None else "尚无留片一致率验证。\n")
+            return (f"已学习 {profile.training_examples:,} 张原片，其中 {profile.positive_examples:,} 张人工保留。\n"
+                    f"仅用于{profile.scene_type or '对应题材'}原片取舍；不学习精修标签。\n"
+                    + validation + "这是同批分组留出结果，不代表其他婚礼；未达 75% 不会显示达标。")
         return (
-            f"已学习 {self.calibration_profile.training_examples:,} 个本地样本\n"
-            f"验证准确度 {self.calibration_profile.validation_auc:.1%}\n"
-            "当前偏好已启用；下次更新仅在验证结果更好时替换。"
+            f"已学习 {self.calibration_profile.training_examples:,} 张原片，"
+            f"其中 {self.calibration_profile.positive_examples:,} 张是你最终保留的照片。\n"
+            "已启用：用于下次分析的 3 星排序，不改本次星级。\n"
+            "学习结果不保证选片准确，仍需你复核。"
         )
 
     def _build_decision_panel(self, workspace: ttk.Frame) -> None:
         shell = ttk.Frame(workspace, style="Paper.TFrame", width=360)
+        self.decision_panel = shell
         shell.grid(row=0, column=1, sticky="nsew")
         shell.grid_propagate(False)
         shell.rowconfigure(0, weight=1)
@@ -1723,6 +1830,7 @@ class EventCullApp(TkinterDnD.Tk):
         )
         self.restore_button = ttk.Button(right, text=self.t.get("restore", "还原本次星级"), command=self.confirm_restore, state="disabled")
         self.restore_button.pack(fill="x", pady=(6, 0))
+        self.metadata_cancel_button = ttk.Button(right, text="停止星级处理", command=self._cancel_metadata)
         self.export_selected_button = ttk.Button(right, text=self.t["export_selected"], command=self.export_selected_photos, state="disabled")
         self.export_selected_button.pack(fill="x", pady=(6, 0))
         self.xmp_card = ttk.Frame(right, style="Paper.TFrame")
@@ -1822,6 +1930,7 @@ class EventCullApp(TkinterDnD.Tk):
         self.table_panel.grid_remove()
         self.calibration_panel.grid_remove()
         self.grid_panel.grid()
+        self._set_workspace_chrome("cull")
         self._set_active_nav("cull")
         self._schedule_grid_render()
 
@@ -1830,22 +1939,35 @@ class EventCullApp(TkinterDnD.Tk):
         self.grid_panel.grid_remove()
         self.calibration_panel.grid_remove()
         self.table_panel.grid()
+        self._set_workspace_chrome("export")
         self._set_active_nav("export")
 
     def show_calibration_workspace(self) -> None:
         self.grid_panel.grid_remove()
         self.table_panel.grid_remove()
         self.calibration_panel.grid()
+        self._set_workspace_chrome("calibration")
         self._set_active_nav("calibration")
-        if hasattr(self, "calibration_task_status"):
-            task_ready = "本次任务筛选日志：已就绪" if self.current_log_path else "本次任务筛选日志：完成一次分析后自动生成"
-            self.calibration_task_status.configure(text=task_ready)
-            self.calibration_report.configure(text=self._calibration_report_text())
+        self._refresh_calibration_button()
+
+    def _set_workspace_chrome(self, active_key: str) -> None:
+        """Hide task-only chrome without destroying controls or task state."""
+        self._active_workspace = active_key
+        learning = active_key == "calibration"
+        for name in ("task_header", "workflow_band", "decision_panel"):
+            widget = self.__dict__.get(name)
+            if widget is not None:
+                widget.grid_remove() if learning else widget.grid()
+        note = self.__dict__.get("workspace_footer_note")
+        if note is not None:
+            note.configure(text="本地学习 · 不改原片或星级" if learning else "本地处理 · 确认后才写入星级元数据")
 
     @staticmethod
     def _pointer_is_over_widget(event: tk.Event, widget: tk.Widget) -> bool:
         """Check the pointer in screen coordinates so card children also scroll."""
         try:
+            if not widget.winfo_ismapped():
+                return False
             left = widget.winfo_rootx()
             top = widget.winfo_rooty()
             return (
@@ -1855,20 +1977,17 @@ class EventCullApp(TkinterDnD.Tk):
         except tk.TclError:
             return False
 
-    def _route_mousewheel(self, event: tk.Event) -> str | None:
+    def _route_mousewheel(self, event: tk.Event, *, precise: bool = False) -> str | None:
         """Let the pointer's active review surface own wheel and trackpad input."""
-        delta = int(getattr(event, "delta", 0) or 0)
-        if delta == 0 and getattr(event, "num", None) in {4, 5}:
-            delta = 1 if event.num == 4 else -1
-        units = self._wheel_units(delta)
-        if units == 0:
-            return None
+        form = self.__dict__.get("_picker_form_canvas")
+        if self.__dict__.get("_picker_dialog") is not None:
+            if form is not None and self._pointer_is_over_widget(event, form):
+                return self._scroll_canvas(event, form, precise=precise)
+            return None  # Never scroll the workbench behind a modal.
         if hasattr(self, "photo_grid_canvas") and self._pointer_is_over_widget(event, self.photo_grid_canvas):
-            self.photo_grid_canvas.yview_scroll(units, "units")
-            return "break"
+            return self._scroll_canvas(event, self.photo_grid_canvas, precise=precise)
         if hasattr(self, "decision_canvas") and self._pointer_is_over_widget(event, self.decision_canvas):
-            self.decision_canvas.yview_scroll(units, "units")
-            return "break"
+            return self._scroll_canvas(event, self.decision_canvas, precise=precise)
         return None
 
     def _install_mousewheel_routing(self) -> None:
@@ -1879,10 +1998,20 @@ class EventCullApp(TkinterDnD.Tk):
         self.bind_all("<MouseWheel>", self._route_mousewheel, add="+")
         self.bind_all("<Button-4>", lambda event: self._route_mousewheel(event), add="+")
         self.bind_all("<Button-5>", lambda event: self._route_mousewheel(event), add="+")
+        try:
+            self.bind_all("<TouchpadScroll>", lambda event: self._route_mousewheel(event, precise=True), add="+")
+        except tk.TclError:
+            pass
 
     def _on_grid_canvas_resize(self, event) -> None:
         self.photo_grid_canvas.itemconfigure(self._photo_grid_window, width=event.width)
         self._schedule_grid_render()
+
+    def _on_grid_inner_configure(self, _event=None) -> None:
+        # In grid mode the viewport-sized native frame is only a small part of
+        # the virtual wall. Its bbox must not replace the full scroll extent.
+        if self._virtual_grid_layout is None:
+            self.photo_grid_canvas.configure(scrollregion=self.photo_grid_canvas.bbox("all"))
 
     def _on_photo_grid_scroll(self, first: str, last: str) -> None:
         """Page in the next review batch shortly before the visible end."""
@@ -1918,8 +2047,8 @@ class EventCullApp(TkinterDnD.Tk):
         total_rows = math.ceil(len(entries) / columns)
         top = self.photo_grid_canvas.canvasy(0)
         viewport_height = max(1, self.photo_grid_canvas.winfo_height())
-        first_row = max(0, int(top // row_height) - 2)
-        last_row = min(total_rows, math.ceil((top + viewport_height) / row_height) + 2)
+        first_row = min(total_rows - 1, max(0, int(top // row_height) - 2))
+        last_row = min(total_rows, max(first_row + 1, math.ceil((top + viewport_height) / row_height) + 2))
         desired_range = (first_row, last_row)
         if desired_range == self._virtual_grid_range:
             return
@@ -1929,9 +2058,22 @@ class EventCullApp(TkinterDnD.Tk):
                 for card in cards:
                     card.destroy()
                 del self._virtual_grid_rows[row]
-        self._virtual_grid_range = desired_range
+        # Keep the native Tk frame viewport-sized. Giant macOS backing views
+        # can paint blank even though their placed children report mapped.
+        physical_height = (last_row - first_row) * row_height
+        self.photo_grid_inner.configure(height=physical_height)
+        self.photo_grid_canvas.itemconfigure(self._photo_grid_window, height=physical_height)
+        self.photo_grid_canvas.coords(self._photo_grid_window, 0, first_row * row_height)
+        self._visible_grid_sources = {
+            self._preview_source(entry[1], entry[2])
+            for entry in entries[first_row * columns:last_row * columns]
+        }
+        if "_preview_warmup" in self.__dict__:
+            self._preview_warmup.prioritize(self._visible_grid_sources)
         for row in range(first_row, last_row):
             if row in self._virtual_grid_rows:
+                for card in self._virtual_grid_rows[row]:
+                    card.place_configure(y=(row - first_row) * row_height + GRID_CARD_GUTTER)
                 continue
             start = row * columns
             end = min(len(entries), start + columns)
@@ -1942,7 +2084,9 @@ class EventCullApp(TkinterDnD.Tk):
                 card_width=card_width,
                 thumbnail_height=thumbnail_height,
                 virtual_row_height=row_height,
+                virtual_row_offset=first_row,
             )
+        self._virtual_grid_range = desired_range
         self._grid_photo_refs = list(self._grid_thumbnail_cache.values())
 
     def _auto_load_more_grid_photos(self) -> None:
@@ -2061,10 +2205,12 @@ class EventCullApp(TkinterDnD.Tk):
         self._virtual_grid_entries = []
         self._virtual_grid_range = None
         self._virtual_grid_rows = {}
+        self._visible_grid_sources.clear()
         if not hasattr(self, "photo_grid_inner"):
             return
         entries = self._grid_photo_entries()
         self.photo_grid_canvas.delete("empty_hint")
+        self.photo_grid_canvas.coords(self._photo_grid_window, 0, 0)
         for child in self.photo_grid_inner.winfo_children():
             child.destroy()
         for column in range(12):
@@ -2104,11 +2250,12 @@ class EventCullApp(TkinterDnD.Tk):
         )
         self._virtual_grid_entries = entries
         self._virtual_grid_layout = (columns, card_width, thumbnail_height, row_height)
-        self.photo_grid_inner.configure(width=available, height=total_height)
+        physical_height = min(total_height, max(row_height, self.photo_grid_canvas.winfo_height() + 5 * row_height))
+        self.photo_grid_inner.configure(width=available, height=physical_height)
         self.photo_grid_canvas.itemconfigure(
             self._photo_grid_window,
             width=available,
-            height=total_height,
+            height=physical_height,
         )
         self.photo_grid_canvas.configure(scrollregion=(0, 0, available, total_height))
         self._render_virtual_grid_window()
@@ -2148,6 +2295,7 @@ class EventCullApp(TkinterDnD.Tk):
         card_width: int,
         thumbnail_height: int,
         virtual_row_height: int | None = None,
+        virtual_row_offset: int = 0,
     ) -> list[tk.Widget]:
         """Add only a new batch of cards; existing visible cards stay intact."""
         cards: list[tk.Widget] = []
@@ -2164,7 +2312,7 @@ class EventCullApp(TkinterDnD.Tk):
                 cell_width = max(1, self.photo_grid_canvas.winfo_width() // columns)
                 card.place(
                     x=column * cell_width + GRID_CARD_GUTTER,
-                    y=row * virtual_row_height + GRID_CARD_GUTTER,
+                    y=(row - virtual_row_offset) * virtual_row_height + GRID_CARD_GUTTER,
                     width=max(1, cell_width - GRID_CARD_GUTTER * 2),
                     height=max(1, virtual_row_height - GRID_CARD_GUTTER * 2),
                 )
@@ -2177,7 +2325,7 @@ class EventCullApp(TkinterDnD.Tk):
             photo = (
                 tk.Label(thumbnail_slot, image=thumbnail, bg="#2a2d30")
                 if thumbnail is not None
-                else tk.Label(thumbnail_slot, text="正在准备预览", bg="#2a2d30", fg=self._workbench_colors["muted"], font=("Helvetica Neue", 10))
+                else tk.Label(thumbnail_slot, text=self._preview_placeholder(source), bg="#2a2d30", fg=self._workbench_colors["muted"], font=("Helvetica Neue", 10))
             )
             photo.place(relx=0.5, rely=0.5, anchor="center")
             name_row = tk.Frame(card, bg=self._workbench_colors["paper"])
@@ -2233,6 +2381,7 @@ class EventCullApp(TkinterDnD.Tk):
             )
             card.grid(row=row, column=0, sticky="ew", padx=5, pady=(0 if row == 0 else 5, 0))
             source = self._preview_source(path, companions)
+            self._visible_grid_sources.add(source)
             thumbnail = None
             if self._preview_is_cached(source):
                 try:
@@ -2243,7 +2392,7 @@ class EventCullApp(TkinterDnD.Tk):
                 except Exception:
                     thumbnail = None
             if thumbnail is None:
-                photo = tk.Label(card, text="正在准备预览", width=13, height=4, bg="#2a2d30", fg=self._workbench_colors["muted"], font=("Helvetica Neue", 9))
+                photo = tk.Label(card, text=self._preview_placeholder(source), width=13, height=4, bg="#2a2d30", fg=self._workbench_colors["muted"], font=("Helvetica Neue", 9))
             else:
                 photo = tk.Label(card, image=thumbnail, bg="#2a2d30")
             photo.pack(side="left", padx=7, pady=7)
@@ -2268,6 +2417,7 @@ class EventCullApp(TkinterDnD.Tk):
                 select = lambda _event, primary=path, pair_paths=companions: self._select_imported_photo(primary, pair_paths)
             for widget in (card, photo, details, headline, detail_label, *headline.winfo_children()):
                 widget.bind("<Button-1>", select, add="+")
+        self._preview_warmup.prioritize(self._visible_grid_sources)
 
     def _show_more_grid_photos(self) -> None:
         self.grid_visible_limit += 72
@@ -2297,20 +2447,11 @@ class EventCullApp(TkinterDnD.Tk):
         self.detail.configure(text=f"{path.name}\n已导入，等待开始 AI 分析。")
         self._render_photo_grid()
         source = self._preview_source(path, companions)
-        generation = self._preview_generation
-
-        def prepare_preview() -> None:
-            try:
-                self._preview_image(source)
-            except Exception:
-                return
-            self.ui_events.put(("import_selection_preview_ready", (generation, path, source)))
-
-        threading.Thread(
-            target=prepare_preview,
-            name="event-cull-import-preview",
-            daemon=True,
-        ).start()
+        self._active_import_preview_source = source
+        if self._preview_is_cached(source):
+            self._set_preview_from_path(source)
+        else:
+            self._preview_warmup.prioritize([source], request=True)
 
     @staticmethod
     def _picker_threshold(value: str, *, weak: float, standard: float, strong: float) -> float:
@@ -2344,6 +2485,10 @@ class EventCullApp(TkinterDnD.Tk):
         similarity, burst_gap = self._scene_grouping_settings(
             self.scene_type.get(), self.duplicate_similarity.get()
         )
+        def optional_value(name: str, default):
+            variable = self.__dict__.get(name)
+            return variable.get() if variable is not None else default
+
         return AnalysisOptions(
             picks_per_group=picks_min,
             max_picks_per_group=picks_max,
@@ -2366,6 +2511,10 @@ class EventCullApp(TkinterDnD.Tk):
             fill_with_similar=self.fill_with_similar.get(),
             scene_type=self.scene_type.get(),
             language=self.language,
+            wedding_content_type=optional_value("wedding_content_type", "自动（保守）"),
+            content_model_enabled=optional_value("content_model_enabled", False),
+            content_model_name=optional_value("content_model_name", MODEL_NAMES[0]),
+            content_review_mode="limited",
         )
 
     def _duplicate_keep_limit(self) -> int:
@@ -2385,6 +2534,11 @@ class EventCullApp(TkinterDnD.Tk):
 
     def _reset_picker_settings(self) -> None:
         self.scene_type.set("通用")
+        for name, default in (("wedding_content_type", "自动（保守）"),
+                              ("content_model_enabled", False), ("content_model_name", MODEL_NAMES[0])):
+            variable = self.__dict__.get(name)
+            if variable is not None:
+                variable.set(default)
         self.ai_selection_enabled.set(True)
         self.priority_more_faces.set(True)
         self.fill_with_similar.set(False)
@@ -2418,7 +2572,11 @@ class EventCullApp(TkinterDnD.Tk):
         if self.detect_duplicates.get():
             enabled.append("重复")
         detection = "、".join(enabled) if enabled else "未启用自动检测"
-        return f"目标 {target_text} 张 · 每组优选 {range_text} 张 · {detection}检测"
+        summary = f"目标 {target_text} 张 · 每组优选 {range_text} 张 · {detection}检测"
+        scene_variable = self.__dict__.get("scene_type")
+        if scene_variable is not None and scene_variable.get() == "婚礼":
+            summary += " · 婚礼 240 条规则 · 不强制补重复图"
+        return summary
 
     def _refresh_picker_confirmation_ui(self) -> None:
         """Keep the pre-analysis gate legible and enforceable in the main UI."""
@@ -2454,6 +2612,26 @@ class EventCullApp(TkinterDnD.Tk):
 
     def show_picker_settings(self) -> None:
         """Show the selected single-column rules layout before AI work begins."""
+        if self._task_operation_running():
+            return
+        existing = self.__dict__.get("_picker_dialog")
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_set()
+            return
+        variables = [getattr(self, name) for name in (
+            "target", "target_max", "picks", "picks_max", "scene_type",
+            "ai_selection_enabled", "priority_more_faces", "fill_with_similar",
+            "keep_existing_labels", "detect_closed_eyes", "detect_blur", "detect_exposure",
+            "detect_duplicates", "blur_sensitivity", "exposure_sensitivity",
+            "duplicate_similarity", "keep_per_duplicate",
+        )]
+        original_values = [(variable, variable.get()) for variable in variables]
+        original_values.extend((self.__dict__[name], self.__dict__[name].get()) for name in (
+            "wedding_content_type", "content_model_enabled", "content_model_name"
+        ) if name in self.__dict__)
+        was_confirmed = self.picker_settings_confirmed
+        accepted = False
         palette = {
             "window": "#17191b",
             "header": "#202326",
@@ -2467,6 +2645,24 @@ class EventCullApp(TkinterDnD.Tk):
             "control_ink": "#191919",
         }
         dialog = tk.Toplevel(self)
+        self._picker_dialog = dialog
+
+        def restore_unconfirmed_settings(event) -> None:
+            if event.widget is not dialog:
+                return
+            self._picker_dialog = None
+            self._picker_form_canvas = None
+            if not accepted:
+                for variable, value in original_values:
+                    variable.set(value)
+                self.picker_settings_confirmed = was_confirmed
+                try:
+                    self._refresh_picker_confirmation_ui()
+                except tk.TclError:
+                    pass  # The application itself may be closing.
+
+        dialog.bind("<Destroy>", restore_unconfirmed_settings, add="+")
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
         dialog.title("秒选 · AI 挑图设置")
         dialog.configure(bg=palette["window"])
         dialog.transient(self)
@@ -2517,6 +2713,7 @@ class EventCullApp(TkinterDnD.Tk):
             highlightthickness=0,
             yscrollincrement=12,
         )
+        self._picker_form_canvas = form_canvas
         form_scroll = ttk.Scrollbar(form_shell, orient="vertical", command=form_canvas.yview)
         form_canvas.configure(yscrollcommand=form_scroll.set)
         form_canvas.grid(row=0, column=0, sticky="nsew")
@@ -2530,20 +2727,9 @@ class EventCullApp(TkinterDnD.Tk):
         def resize_form_content(event) -> None:
             form_canvas.itemconfigure(content_window, width=event.width)
 
-        def scroll_form(event) -> str:
-            raw_delta = getattr(event, "delta", 0)
-            if raw_delta:
-                units = self._wheel_units(raw_delta)
-            else:
-                units = -1 if getattr(event, "num", 0) == 5 else 1
-            form_canvas.yview_scroll(units, "units")
-            return "break"
-
         content.bind("<Configure>", sync_form_scroll_region)
         form_canvas.bind("<Configure>", resize_form_content)
-        form_canvas.bind("<MouseWheel>", scroll_form)
-        form_canvas.bind("<Button-4>", scroll_form)
-        form_canvas.bind("<Button-5>", scroll_form)
+        self._bind_canvas_scrolling(form_canvas, form_canvas)
 
         def section(title: str, subtitle: str) -> tk.Frame:
             block = tk.Frame(content, bg=palette["window"])
@@ -2647,9 +2833,9 @@ class EventCullApp(TkinterDnD.Tk):
             tk.Frame(setting, bg=palette["line"], height=1).pack(fill="x", pady=(3, 0))
             return setting
 
-        target_section = section("目标图片数量", "AI 选片不超过最多张数；明确命中的必选镜头可例外保留。")
+        target_section = section("目标图片数量", "目标为参考；婚礼模式默认不补重复图，合格照片不足时显示差额。")
         target_section.pack(fill="x")
-        _, target_controls = row(target_section, "交付目标", "设置本次选片的最少和最多张数。")
+        _, target_controls = row(target_section, "交付原片总数", "所有有星原片合计，包含 3 星精修候选；不靠废片凑数。")
         tk.Label(target_controls, text="至少", bg=palette["window"], fg=palette["muted"], font=("Helvetica Neue", 10)).pack(side="left", padx=(0, 7))
         spin(target_controls, self.target).pack(side="left")
         tk.Label(target_controls, text="～", bg=palette["window"], fg=palette["ink"], font=("Helvetica Neue", 15, "bold")).pack(side="left", padx=10)
@@ -2670,10 +2856,27 @@ class EventCullApp(TkinterDnD.Tk):
         preference(preferences, "数量不足时用重复照片补足", self.fill_with_similar)
         preference(preferences, "保留已手动设置的星级", self.keep_existing_labels)
 
+        wedding_section = section("婚礼内容规则 · 240 条", "仅在图片场景选择“婚礼”时启用。混合整场使用自动；同类小批次可指定用途。")
+        wedding_section.pack(fill="x", pady=(20, 0))
+        _, content_controls = row(wedding_section, "照片用途", "合影检查表情完整；纪实、互动和肖像不机械要求笑脸或看镜头。")
+        ttk.Combobox(content_controls, textvariable=self.wedding_content_type,
+                     values=tuple(CONTENT_TYPES), state="readonly", width=22,
+                     style="Picker.TCombobox").pack(side="left")
+        _, model_controls = row(wedding_section, "内置内容重点复核（限时）", "默认关闭，使用快速筛选。开启后先完成全量初筛，仅在剩余时间预算内复核少量候选；不会逐张排队细查。")
+        toggle(model_controls, self.content_model_enabled)
+        model_info = tk.Frame(wedding_section, bg=palette["window"])
+        model_info.pack(fill="x", pady=(8, 0))
+        tk.Label(model_info, textvariable=self.content_model_status, bg=palette["window"],
+                 fg=palette["muted"], wraplength=650, justify="left").pack(anchor="w")
+        ttk.Button(model_info, text="检查内置组件", style="PickerQuiet.TButton",
+                   command=self.check_content_model).pack(side="left", pady=10)
+        ttk.Button(model_info, text="查看 240 条规则与能力边界", style="PickerQuiet.TButton",
+                   command=lambda: self.show_wedding_rules(dialog)).pack(side="left", padx=10, pady=10)
+
         quality_section = section("画面质量检测", "自动识别并过滤不符合要求的照片，提升成片质量。")
         quality_section.pack(fill="x", pady=(20, 0))
         for index, (label, description, variable, sensitivity) in enumerate((
-            ("闭眼检测", "人像中检测到多数人合眼时，会标记为不佳照片。", self.detect_closed_eyes, None),
+            ("眼部证据检测", "检测不到眼睛不等于闭眼；合影留复核，亲密互动和艺术肖像按用途评价。", self.detect_closed_eyes, None),
             ("欠曝 / 过曝检测", "检测画面过暗或过亮的照片。", self.detect_exposure, self.exposure_sensitivity),
             ("模糊检测", "检测因抖动、对焦不准等造成的模糊照片。", self.detect_blur, self.blur_sensitivity),
         )):
@@ -2707,8 +2910,7 @@ class EventCullApp(TkinterDnD.Tk):
         # wherever the pointer is in the settings form, including on a switch
         # or an input field.
         def bind_form_wheel(widget: tk.Widget) -> None:
-            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                widget.bind(sequence, scroll_form, add="+")
+            self._bind_canvas_scrolling(widget, form_canvas)
             for child in widget.winfo_children():
                 bind_form_wheel(child)
 
@@ -2720,6 +2922,7 @@ class EventCullApp(TkinterDnD.Tk):
         ttk.Button(actions, text="取消", style="PickerQuiet.TButton", command=dialog.destroy).pack(side="right", padx=(8, 28), pady=12)
 
         def confirm_rules() -> None:
+            nonlocal accepted
             try:
                 self._duplicate_keep_limit()
                 self._target_selection_range()
@@ -2730,11 +2933,73 @@ class EventCullApp(TkinterDnD.Tk):
                     parent=dialog,
                 )
                 return
+            accepted = True
             self.picker_settings_confirmed = True
             self._refresh_picker_confirmation_ui()
             dialog.destroy()
 
         ttk.Button(actions, text="确认挑图规则", style="PickerPrimary.TButton", command=confirm_rules).pack(side="right", pady=12)
+
+    def check_content_model(self) -> None:
+        """Check packaged assets only; no service connection or download."""
+        if self.__dict__.get("_content_model_check_running", False):
+            return
+        self._content_model_check_running = True
+        self.content_model_status.set("正在检查软件自带组件（不联网、不上传照片）…")
+
+        def probe() -> None:
+            _ready, message = bundled_status()
+            self.ui_events.put(("content_model_checked", message))
+
+        threading.Thread(target=probe, name="wedding-model-check", daemon=True).start()
+
+    def show_wedding_rules(self, parent=None) -> None:
+        existing = self.__dict__.get("_wedding_rules_dialog")
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            return
+        try:
+            catalogue = wedding_rules()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("婚礼规则库", str(exc), parent=parent or self)
+            return
+        dialog = tk.Toplevel(parent or self)
+        self._wedding_rules_dialog = dialog
+        dialog.title(f"婚礼选片规则 · {RULE_VERSION}")
+        dialog.geometry(f"{min(880, self.winfo_screenwidth() - 80)}x{min(740, self.winfo_screenheight() - 100)}")
+        dialog.transient(parent or self)
+        dialog.configure(bg="#17191b")
+        ttk.Label(dialog, text="240 条规则库 ≠ 240 项识别已完成。程序证据约束先执行，内容模型辅助判断，未知保留复核。",
+                  wraplength=760).pack(fill="x", padx=16, pady=(16, 8))
+        query = tk.StringVar(master=dialog)
+        ttk.Entry(dialog, textvariable=query).pack(fill="x", padx=16, pady=8)
+        area = ttk.Frame(dialog)
+        area.pack(fill="both", expand=True, padx=16, pady=8)
+        scrollbar = ttk.Scrollbar(area)
+        scrollbar.pack(side="right", fill="y")
+        text = tk.Text(area, wrap="word", bg="#202326", fg="#fffaf0", relief="flat",
+                       padx=12, pady=12, yscrollcommand=scrollbar.set)
+        text.pack(fill="both", expand=True)
+        scrollbar.configure(command=text.yview)
+
+        def refresh(*_args):
+            term = query.get().strip().casefold()
+            lines = ["基础规则和内容识别组件随完整安装包提供，选择婚礼场景即可使用，不需要另装软件。\n"
+                     "240 条为判断标准；不会自动确认新人/父母身份、跨组人物关系或完整故事，未知项须人工确认。\n"]
+            for rule in catalogue:
+                if term and term not in (rule.identifier + rule.section_name + rule.text).casefold():
+                    continue
+                state = "内置程序证据约束 / 仍需复核" if rule.identifier in PROGRAM_RULE_IDS else "内置内容观察参考 / 人工或序列证据待验证"
+                lines.append(f"{rule.identifier} · {rule.capabilities} · {rule.action} · {state}\n{rule.text}\n")
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            text.insert("1.0", "\n".join(lines))
+            text.configure(state="disabled")
+
+        query.trace_add("write", refresh)
+        refresh()
+        ttk.Button(dialog, text="关闭", command=dialog.destroy).pack(pady=(0, 12))
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
 
     def _build_menubar(self) -> None:
         """Set up shortcuts without allowing Tk to create detachable macOS menus."""
@@ -2754,7 +3019,7 @@ class EventCullApp(TkinterDnD.Tk):
         app_menu.add_command(label=self.t["menu_history"], command=self.show_task_history)
         app_menu.add_command(label=self.t["menu_license"], command=self.show_license_dialog)
         app_menu.add_separator()
-        app_menu.add_command(label=self.t["menu_quit"], command=self.destroy)
+        app_menu.add_command(label=self.t["menu_quit"], command=self._request_close)
         menu_bar.add_cascade(label=self.product_title, menu=app_menu)
 
         file_menu = tk.Menu(menu_bar, tearoff=False)
@@ -2849,6 +3114,63 @@ class EventCullApp(TkinterDnD.Tk):
         # second Tk modal window can crash macOS input methods while a cull is
         # still rendering HEIC previews, so never open a nested dialog here.
         LicenseDialog(self, self.license_controller, self._refresh_license_entry)
+
+    def _check_license_in_background(self) -> None:
+        """Check expiry after launch and wake from sleep without blocking Tk."""
+        self._refresh_license_entry()
+        if (time.monotonic() >= self._license_next_refresh_attempt
+                and self.license_controller.refresh_due()):
+            self._begin_license_refresh()
+        self.after(60_000, self._check_license_in_background)
+
+    def _begin_license_refresh(self, *, resume_analysis: bool = False) -> None:
+        if resume_analysis:
+            # Don't unexpectedly analyse another task imported while renewing.
+            self._license_resume_context = (self.current_task_id, tuple(self.imported_files))
+            self.status.set("正在联网验证已有授权，成功后自动开始分析…")
+        if self._license_refresh_in_flight:
+            return
+        self._license_refresh_in_flight = True
+
+        def renew() -> None:
+            try:
+                self.license_controller.refresh()
+            except Exception as exc:
+                detail = str(exc) if isinstance(exc, LicenseError) else "无法刷新授权，请检查网络后重试。"
+                self.ui_events.put(("license_refresh_finished", detail))
+            else:
+                self.ui_events.put(("license_refresh_finished", None))
+
+        threading.Thread(target=renew, name="miaoxuan-license-refresh", daemon=True).start()
+
+    def _finish_license_refresh(self, error: str | None) -> None:
+        self._license_refresh_in_flight = False
+        # Retry transient failures in 15 minutes, not every UI tick. Explicit
+        # user requests can retry immediately and reuse an in-flight request.
+        self._license_next_refresh_attempt = time.monotonic() + (900 if error else 60)
+        context = self._license_resume_context
+        self._license_resume_context = None
+        self._refresh_license_entry()
+        dialog = None
+        for window in self.winfo_children():
+            if isinstance(window, LicenseDialog):
+                dialog = window
+                window.refresh_view()
+                if error:
+                    window.detail.set(error)
+        if context is None:
+            return
+        if context != (self.current_task_id, tuple(self.imported_files)):
+            return
+        if error or not self.license_controller.decision.allows_analysis:
+            detail = error or self.license_controller.decision.message
+            self.status.set(detail)
+            if dialog is None:
+                dialog = LicenseDialog(self, self.license_controller, self._refresh_license_entry)
+            dialog.detail.set(detail)
+            dialog.payment_note.set(detail)
+        elif not self.analysis_running and self.picker_settings_confirmed:
+            self.start_analysis()
 
     def show_task_history(self) -> None:
         """Show the compact, local-only index of imports and completed culls."""
@@ -3282,8 +3604,34 @@ end run
     def _has_active_task(self) -> bool:
         return bool(self.results or self.imported_files)
 
+    def _task_operation_running(self) -> bool:
+        """One guard for buttons, menus, shortcuts and drag/drop task mutations."""
+        return any(self.__dict__.get(name, False) for name in (
+            "analysis_running", "calibration_running", "export_running", "metadata_running", "_picker_dialog", "_close_after_operations",
+        ))
+
     def _refresh_calibration_button(self) -> None:
-        self.calibration_button.configure(text=self.t["calibration_update"])
+        # Legacy layout retains its old action; the active workbench uses a
+        # clear current-task action and a separate historical-log workflow.
+        if "calibration_history_button" not in self.__dict__:
+            self.calibration_button.configure(text=self.t["calibration_update"])
+            return
+        ready = self._calibration_task_ready()
+        busy = self._task_operation_running()
+        self.calibration_button.configure(
+            text="选择我最终保留的照片文件夹",
+            state="normal" if ready and not busy else "disabled",
+        )
+        self.calibration_history_button.configure(state="disabled" if busy else "normal")
+        self.calibration_task_status.configure(text=(
+            "本次任务已就绪，只需选择最终留片文件夹。" if ready
+            else "先完成一次照片分析；也可以使用以前的任务。"
+        ))
+        self.calibration_report.configure(text=self._calibration_report_text())
+
+    def _calibration_task_ready(self) -> bool:
+        log = self.__dict__.get("current_log_path")
+        return bool(log is not None and log.is_file() and self.__dict__.get("imported_files"))
 
     def _set_xmp_result(self, message: str = "") -> None:
         self.xmp_result_notice.set(message)
@@ -3319,6 +3667,9 @@ end run
         self._active_preview_path = None
         self._close_preview_zoom()
         self._preview_generation += 1
+        self._preview_failures.clear()
+        if "_preview_warmup" in self.__dict__:
+            self._preview_warmup.cancel(self._preview_generation)
         with self._preview_lock:
             self._preview_memory.clear()
             self._zoom_preview_memory.clear()
@@ -3357,17 +3708,17 @@ end run
         self._refresh_picker_confirmation_ui()
         self._schedule_grid_render()
         self.refresh_lightroom_guard(schedule_next=False)
+        self._refresh_calibration_button()
 
     def new_task(self) -> None:
-        if self.__dict__.get("export_running", False):
-            messagebox.showinfo("正在导出", "请等待已选图片导出完成，或点击“取消导出”。")
+        if self._task_operation_running():
             return
         if not self._confirm_replace_task():
             return
         self._reset_task_state()
 
     def choose_folder(self) -> None:
-        if self.__dict__.get("export_running", False):
+        if self._task_operation_running():
             return
         if sys.platform == "darwin":
             selected = self._choose_folders_macos(
@@ -3388,11 +3739,11 @@ end run
 
     def import_calibration(self) -> None:
         """Learn from final-kept filenames without writing either source."""
-        if self.analysis_running or self.calibration_running:
+        if self._task_operation_running():
             return
         # Current tasks already have an automatic JSON log and known original
         # folders. The normal workflow therefore asks for only the final picks.
-        if self.current_log_path is not None and self.current_log_path.is_file() and self.imported_files:
+        if self._calibration_task_ready():
             exported_value = filedialog.askdirectory(
                 title=self.t["calibration_export"],
                 initialdir=str(self.last_import_directory),
@@ -3401,6 +3752,16 @@ end run
                 return
             sources = sorted({path.parent for path in self.imported_files})
             self._start_calibration(self.current_log_path, Path(exported_value), sources)
+            return
+
+        if "calibration_history_button" in self.__dict__:
+            messagebox.showinfo("先完成一次筛选", "完成本次照片分析后再选择最终留片；以前的任务请使用“用以前的任务学习”。")
+            return
+        self.import_historical_calibration()
+
+    def import_historical_calibration(self) -> None:
+        """Keep the portable log/original-folder flow explicitly separate."""
+        if self._task_operation_running():
             return
 
         # Historical tasks still accept the old portable CSV export as well as
@@ -3443,7 +3804,11 @@ end run
         exported_folder: Path,
         sources: list[Path],
     ) -> None:
+        if self._task_operation_running():
+            return
         self.calibration_running = True
+        self.cancel_event.clear()
+        self.pause_event.clear()
         self.status.set(self.t["calibration_running"])
         self.calibration_button.configure(state="disabled")
         self.new_task_button.configure(state="disabled")
@@ -3454,6 +3819,13 @@ end run
         self.progress.configure(mode="indeterminate", maximum=100, value=0)
         self.progress.start(12)
         self.progress_text.set(self.t["calibration_running"])
+        activity = self.__dict__.get("calibration_activity")
+        if activity is not None:
+            activity.grid()
+            self.calibration_progress.configure(mode="indeterminate", maximum=100, value=0)
+            self.calibration_progress.start(12)
+            self.calibration_stop_button.configure(state="normal")
+        self._refresh_calibration_button()
         threading.Thread(
             target=self._build_calibration,
             args=(log_path, exported_folder, sources),
@@ -3465,9 +3837,13 @@ end run
             def on_progress(current: int, total: int, path: Path) -> None:
                 self.ui_events.put(("calibration_progress", (current, total, path)))
 
-            profile = build_profile(log_path, exported_folder, sources, progress_callback=on_progress)
+            profile = build_profile(log_path, exported_folder, sources, progress_callback=on_progress,
+                                    checkpoint=self._analysis_checkpoint)
+            self._analysis_checkpoint()
             save_profile(profile)
             self.ui_events.put(("calibration_completed", profile))
+        except AnalysisCancelled:
+            self.ui_events.put(("calibration_cancelled", None))
         except CalibrationError as exc:
             self.ui_events.put(("calibration_failed", str(exc)))
         except Exception as exc:
@@ -3477,12 +3853,28 @@ end run
         self.calibration_running = False
         self.progress.stop()
         self.progress.configure(mode="determinate", maximum=1, value=0)
+        activity = self.__dict__.get("calibration_activity")
+        if activity is not None:
+            self.calibration_progress.stop()
+            self.calibration_progress.configure(mode="determinate", maximum=1, value=0)
+            activity.grid_remove()
         self.new_task_button.configure(state="normal")
         self.calibration_button.configure(state="normal")
         self._refresh_picker_confirmation_ui()
         self._refresh_calibration_button()
 
+    def cancel_calibration(self) -> None:
+        """Use the shared cancellation checkpoint; never edit originals."""
+        if not self.__dict__.get("calibration_running", False):
+            return
+        self.cancel_event.set()
+        self.pause_event.clear()
+        self.status.set("正在停止学习…")
+        self.calibration_stop_button.configure(state="disabled")
+
     def _load_selected_files(self, files: list[Path]) -> bool:
+        if self._task_operation_running():
+            return False
         selected = [path for path in files if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS]
         if not selected:
             messagebox.showerror(self.t["pick_needed"], self.t["drop_error"])
@@ -3683,6 +4075,9 @@ end run
             return self._preview_cache_path(path).is_file()
         except OSError:
             return False
+
+    def _preview_placeholder(self, path: Path) -> str:
+        return "预览不可用" if path in self._preview_failures else "正在准备预览"
 
     def _set_preview_from_path(self, path: Path) -> bool:
         """Show a cached 320px preview without blocking on a full RAW decode."""
@@ -4005,6 +4400,13 @@ end run
 
     def _preview_image(self, path: Path) -> Image.Image:
         """Load one small preview from memory, disk, or a read-only RAW decode."""
+        # The selected-photo view and background warmup share this boundary.
+        # Bounded striped locks prevent concurrent decoding of the same file.
+        key = path.resolve()
+        with self._preview_load_locks[hash(key) % len(self._preview_load_locks)]:
+            return self._load_small_preview(path)
+
+    def _load_small_preview(self, path: Path) -> Image.Image:
         key = path.resolve()
         with self._preview_lock:
             cached = self._preview_memory.get(key)
@@ -4045,7 +4447,7 @@ end run
         )
 
     def _start_preview_warmup(self, files: list[Path]) -> None:
-        """Build all small previews in one low-impact background queue on import."""
+        """Immediately queue every imported preview with two bounded workers."""
         self._preview_generation += 1
         generation = self._preview_generation
         sources = [
@@ -4053,18 +4455,12 @@ end run
             for primary, companions in self._logical_import_rows(files)
         ]
 
-        def warm() -> None:
-            for index, source in enumerate(sources):
-                if generation != self._preview_generation:
-                    return
-                try:
-                    self._preview_image(source)
-                    if index == 0 and generation == self._preview_generation:
-                        self.ui_events.put(("preview_ready", (generation, source)))
-                except Exception:
-                    continue
+        self._preview_warmup.submit(sources, generation)
+        self._preview_warmup.prioritize(self._visible_grid_sources)
 
-        threading.Thread(target=warm, name="event-cull-preview-warmup", daemon=True).start()
+    def _close_preview_warmup(self, event) -> None:
+        if event.widget is self:
+            self._preview_warmup.close()
 
     def _clear_results_for_source_change(self) -> None:
         """Invalidate stale analysis while preserving the accumulating source list."""
@@ -4079,6 +4475,9 @@ end run
         self._active_preview_path = None
         self._close_preview_zoom()
         self._preview_generation += 1
+        self._preview_failures.clear()
+        if "_preview_warmup" in self.__dict__:
+            self._preview_warmup.cancel(self._preview_generation)
         with self._preview_lock:
             self._preview_memory.clear()
             self._zoom_preview_memory.clear()
@@ -4096,9 +4495,10 @@ end run
         self.restore_button.configure(state="disabled")
         self.export_selected_button.configure(state="disabled")
         self._schedule_grid_render()
+        self._refresh_calibration_button()
 
     def choose_files(self) -> None:
-        if self.__dict__.get("export_running", False):
+        if self._task_operation_running():
             return
         selected = filedialog.askopenfilenames(
             title=self.t["pick_files"],
@@ -4114,7 +4514,7 @@ end run
             self._load_selected_files(paths)
 
     def accept_drop(self, event) -> str:
-        if self.analysis_running or self.calibration_running or self.__dict__.get("export_running", False):
+        if self._task_operation_running():
             messagebox.showinfo(self.t["drop_busy_title"], self.t["drop_busy_detail"])
             return REFUSE_DROP
         paths = [Path(value) for value in self.tk.splitlist(event.data)]
@@ -4135,6 +4535,8 @@ end run
         if self.__dict__.get("export_running", False):
             messagebox.showinfo("正在导出", "请等待已选图片导出完成，或点击“取消导出”。")
             return
+        if self._task_operation_running():
+            return
         if not self.imported_files:
             messagebox.showerror(self.t["pick_needed"], self.t["pick_error"])
             return
@@ -4142,6 +4544,9 @@ end run
             self.show_picker_settings()
             return
         if not self.license_controller.decision.allows_analysis:
+            if self.license_controller.lease is not None:
+                self._begin_license_refresh(resume_analysis=True)
+                return
             messagebox.showinfo(
                 "需要授权",
                 self.license_controller.decision.message,
@@ -4177,6 +4582,7 @@ end run
         self.analysis_running = True
         self.set_workflow_stage(3)
         self.analysis_started_at = time.monotonic()
+        self._eta_samples = []
         self.analysis_pause_started_at = None
         self.analysis_paused_seconds = 0.0
         self.analysis_completed_at = None
@@ -4271,13 +4677,20 @@ end run
         preserved_manual_ratings: dict[Path, int] | None = None,
     ) -> None:
         try:
+            if (getattr(self.calibration_profile, "objective", "featured") == "retention"
+                    and getattr(self.calibration_profile, "scene_type", "") in {"", options.scene_type}):
+                options = replace(options, calibration_feature_pipeline=self.calibration_profile.feature_pipeline)
             def on_progress(current: int, total: int, path: Path) -> None:
                 # Tk must only be called from its main thread on macOS.
                 self.ui_events.put(("progress", (current, total, path)))
+            def on_review(current: int, total: int, path: Path, seconds: float) -> None:
+                self.ui_events.put(("content_review_progress", (current, total, path, seconds)))
             if isinstance(source, list):
-                results = analyze_paths(source, options, progress_callback=on_progress, pause_event=self.pause_event, cancel_event=self.cancel_event)
+                results = analyze_paths(source, options, progress_callback=on_progress, pause_event=self.pause_event, cancel_event=self.cancel_event,
+                                        phase_callback=on_review)
             else:
                 results = analyze_folder(source, options, progress_callback=on_progress, pause_event=self.pause_event, cancel_event=self.cancel_event)
+            self._analysis_checkpoint()
             self._restore_manual_ratings(
                 results, preserved_manual_ratings or {}, self.language
             )
@@ -4286,14 +4699,29 @@ end run
                     def on_calibration_progress(current: int, total: int, path: Path) -> None:
                         self.ui_events.put(("calibration_apply_progress", (current, total, path)))
 
-                    apply_profile(results, self.calibration_profile, progress_callback=on_calibration_progress)
+                    apply_profile(
+                        results, self.calibration_profile, progress_callback=on_calibration_progress,
+                        checkpoint=self._analysis_checkpoint,
+                        protected_paths=frozenset(preserved_manual_ratings or {}),
+                        options=options,
+                    )
                 except CalibrationError as exc:
                     self.ui_events.put(("calibration_apply_skipped", str(exc)))
+            self._analysis_checkpoint()
+            self._restore_manual_ratings(results, preserved_manual_ratings or {}, self.language)
             self.ui_events.put(("completed", results))
         except AnalysisCancelled:
             self.ui_events.put(("cancelled", None))
         except Exception as exc:
             self.ui_events.put(("error", str(exc)))
+
+    def _analysis_checkpoint(self) -> None:
+        """Keep pause/stop effective through the preference-calibration stage."""
+        while self.pause_event.is_set():
+            if self.cancel_event.wait(0.1):
+                raise AnalysisCancelled()
+        if self.cancel_event.is_set():
+            raise AnalysisCancelled()
 
     def _check_for_updates_in_background(self) -> None:
         if self._update_check_started:
@@ -4334,10 +4762,24 @@ end run
 
     def process_ui_events(self) -> None:
         """Run all UI mutations in the Tk main thread."""
+        deadline = time.monotonic() + 0.016
         try:
-            while True:
+            for _ in range(100):
+                if time.monotonic() >= deadline:
+                    break
                 event, payload = self.ui_events.get_nowait()
-                if event == "progress":
+                if event == "license_refresh_finished":
+                    self._finish_license_refresh(payload)
+                elif event == "content_model_checked":
+                    self._content_model_check_running = False
+                    self.content_model_status.set(payload)
+                elif event == "metadata_progress":
+                    current, total, path = payload
+                    self.progress.configure(mode="determinate", maximum=total, value=current)
+                    self.progress_text.set(f"正在处理星级 {current}/{total} · {path.name}")
+                elif event == "metadata_finished":
+                    self._finish_metadata_operation(*payload)
+                elif event == "progress":
                     current, total, path = payload
                     self.update_progress(current, total, path)
                 elif event == "calibration_progress":
@@ -4355,14 +4797,44 @@ end run
                         auc=payload.validation_auc,
                     )
                     self.status.set(message)
-                    messagebox.showinfo(self.t["calibration"], message)
+                    if not self._close_after_operations:
+                        messagebox.showinfo(self.t["calibration"], message)
+                elif event == "calibration_cancelled":
+                    self._finish_calibration()
+                    self.status.set("选片偏好校准已停止。")
                 elif event == "calibration_failed":
                     self._finish_calibration()
                     message = self.t["calibration_failed"].format(error=payload)
                     self.status.set(message)
-                    messagebox.showerror(self.t["calibration"], message)
+                    if not self._close_after_operations:
+                        messagebox.showerror(self.t["calibration"], message)
                 elif event == "calibration_apply_skipped":
                     self.status.set(self.t["calibration_apply_skipped"].format(error=payload))
+                elif event == "grid_preview_ready":
+                    generation, path = payload
+                    if generation == self._preview_generation:
+                        self._preview_failures.pop(path, None)
+                        if path in self._visible_grid_sources:
+                            self._schedule_grid_render()
+                        if self.selected is not None:
+                            source = self._preview_source(self.selected.path, self.selected.pair_paths)
+                            if source == path:
+                                self._set_preview_from_path(path)
+                        elif self.active_import_path is not None:
+                            if path == self._active_import_preview_source:
+                                self._set_preview_from_path(path)
+                        elif self._active_preview_path is None and not self.results:
+                            self._set_preview_from_path(path)
+                elif event == "grid_preview_failed":
+                    generation, path, error = payload
+                    if generation == self._preview_generation:
+                        self._preview_failures[path] = error
+                        if path in self._visible_grid_sources:
+                            self._schedule_grid_render()
+                        source = (self._preview_source(self.selected.path, self.selected.pair_paths)
+                                  if self.selected is not None else self.__dict__.get("_active_import_preview_source"))
+                        if path == source:
+                            self.preview_label.configure(image="", text="预览不可用：文件损坏或格式暂不支持")
                 elif event == "preview_ready":
                     generation, path = payload
                     if (
@@ -4399,7 +4871,8 @@ end run
                     message = f"已复制 {payload.photo_count} 张已选照片，共 {payload.file_count} 个原文件/旁车文件。"
                     self.status.set(message)
                     self.progress_text.set("已选图片导出完成")
-                    messagebox.showinfo("导出完成", f"{message}\n\n保存位置：\n{folders}")
+                    if not self._close_after_operations:
+                        messagebox.showinfo("导出完成", f"{message}\n\n保存位置：\n{folders}")
                 elif event == "selected_export_cancelled":
                     self._finish_selected_export()
                     self.status.set("已取消导出；未更改原片，未保留未完成的导出文件夹。")
@@ -4408,25 +4881,39 @@ end run
                     self._finish_selected_export()
                     self.status.set("已选图片导出失败；原片未更改。")
                     self.progress_text.set("导出失败")
-                    messagebox.showerror("导出已选图片失败", str(payload))
+                    if not self._close_after_operations:
+                        messagebox.showerror("导出已选图片失败", str(payload))
                 elif event == "completed":
                     self.analysis_completed_at = datetime.now().isoformat(timespec="seconds")
                     self.show_results(payload)
                     try:
                         self._write_automatic_log()
+                        self._freeze_analysis_baseline()
                     except OSError as exc:
                         self.status.set("自动保存筛选日志失败；本次结果仍在界面中。")
                         messagebox.showwarning("自动日志保存失败", str(exc))
                     self._write_task_history("已完成" if self.language == "zh" else "Completed")
+                    self._refresh_calibration_button()
+                elif event == "content_review_progress":
+                    current, total, path, seconds = payload
+                    self.progress_text.set(f"基础检测已完成 · 内容重点复核 {current} 张 · {path.name}")
+                    self.eta_text.set(f"限时复核剩余预算：{math.ceil(seconds)} 秒（不覆盖全部照片）")
+                    self.task_import_summary.set(f"基础检测已完成 · 限时内容复核 {current} 张")
                 elif event == "cancelled":
                     self.analysis_cancelled()
                 elif event == "error":
                     self.analysis_cancelled()
                     self.status.set(f"{self.t['analysis_failed']}：{payload}")
-                    messagebox.showerror(self.t["analysis_failed"], str(payload))
+                    if not self._close_after_operations:
+                        messagebox.showerror(self.t["analysis_failed"], str(payload))
         except queue.Empty:
             pass
-        self.after(50, self.process_ui_events)
+        except Exception:
+            # One failed callback must not permanently stop delivery of all
+            # subsequent previews, progress updates and task completion.
+            self.report_callback_exception(*sys.exc_info())
+        finally:
+            self.after(50, self.process_ui_events)
 
     def analysis_cancelled(self) -> None:
         self.analysis_running = False
@@ -4470,7 +4957,20 @@ end run
             0.0,
             time.monotonic() - self.analysis_started_at - self.analysis_paused_seconds,
         )
-        remaining = self._remaining_seconds(elapsed, current, total)
+        samples = self.__dict__.setdefault("_eta_samples", [])
+        if samples and current <= samples[-1][0]:
+            samples.clear()
+        samples.append((current, elapsed))
+        samples[:] = samples[-100:]
+        # Exclude scan/model cold startup from the per-photo extrapolation.
+        # Three serial content samples cannot justify a 20-hour countdown.
+        if current < min(10, total) or len(samples) < 3:
+            self.eta_text.set(self.t["eta_estimating"])
+            return
+        first_current, first_elapsed = samples[0]
+        steps = current - first_current
+        remaining = (max(0, math.ceil((elapsed-first_elapsed)/steps*(total-current)))
+                     if steps > 0 else None)
         if remaining is None:
             self.eta_text.set(self.t["eta_estimating"])
             return
@@ -4493,25 +4993,29 @@ end run
         self.progress.configure(mode="determinate", maximum=max(total, 1), value=current)
         key = "calibration_apply" if apply else "calibration_progress"
         self.progress_text.set(self.t[key].format(current=current, total=total, name=path.name))
+        local_progress = self.__dict__.get("calibration_progress")
+        if local_progress is not None and not apply:
+            local_progress.stop()
+            local_progress.configure(mode="determinate", maximum=max(total, 1), value=current)
 
     def filter_results(self, _event=None) -> None:
         self._render_results_table()
 
     @staticmethod
     def _matches_rating_filter(rating: int, selected_rating: int | None) -> bool:
+        if selected_rating == -1:
+            return rating in RETAINED_RATINGS
         return selected_rating is None or rating == selected_rating
 
     @staticmethod
     def _mapped_rating(tier: int, backup: int, featured: int) -> int:
-        """Map presentation/XMP ratings without changing the three internal tiers."""
-        if tier == 0:
-            return 0
-        if tier == 1:
-            return 1
-        if tier == 2:
-            return backup
-        if tier == 3:
-            return featured
+        """Keep fixed 1/2/3 semantics, including callers with old mappings.
+
+        The two arguments remain for source compatibility; they no longer
+        remap a manual two-star photo into an automatic/featured value.
+        """
+        if tier in (0, 1, 2, 3):
+            return tier
         raise ValueError(f"Unknown internal rating tier: {tier}")
 
     @staticmethod
@@ -4519,11 +5023,7 @@ end run
         return int(value.rstrip("★"))
 
     def _output_rating(self, tier: int) -> int:
-        return self._mapped_rating(
-            tier,
-            self._star_value(self.backup_star.get()),
-            self._star_value(self.featured_star.get()),
-        )
+        return self._mapped_rating(tier, 2, 3)
 
     def _star_mapping(self) -> dict[str, int]:
         return {
@@ -4533,10 +5033,6 @@ end run
         }
 
     def _on_star_mapping_changed(self, _event=None) -> None:
-        backup = self._star_value(self.backup_star.get())
-        featured = self._star_value(self.featured_star.get())
-        if featured <= backup:
-            self.featured_star.set(f"{min(5, backup + 1)}★")
         self._refresh_rating_presentation()
         if self.results:
             self._render_results_table()
@@ -4546,40 +5042,25 @@ end run
                 self.status.set(self._completion_status(counts))
 
     def _refresh_rating_presentation(self) -> None:
-        """Refresh only labels/outputs; the culling engine still stores tiers 0–3."""
-        backup = self._star_value(self.backup_star.get())
-        featured = self._star_value(self.featured_star.get())
-        if featured <= backup:
-            featured = min(5, backup + 1)
-            self.featured_star.set(f"{featured}★")
-        self.featured_star_menu.configure(values=tuple(f"{value}★" for value in range(backup + 1, 6)))
+        """One fixed policy for the grid, table, manual buttons and XMP."""
+        self.backup_star.set("2★")
+        self.featured_star.set("3★")
+        self.backup_star_menu.configure(values=("2★",), state="disabled")
+        self.featured_star_menu.configure(values=("3★",), state="disabled")
         previous_tier = self.rating_filters.get(self.rating_filter.get())
         if self.language == "zh":
-            self.legend_text.set(f"1★ 初选复核　{backup}★ 优质备用　{featured}★ 精选推荐　— 未入选")
-            rating_hint = (
-                f"评级说明：1★ 初选复核（已选，建议人工确认） · "
-                f"{backup}★ 优质备用 · {featured}★ 精选推荐"
-            )
-            filters = {
-                self.t["filter_all"]: None,
-                self.t["filter_one"]: 1,
-                f"仅 {backup}★": 2,
-                f"仅 {featured}★": 3,
-                self.t["filter_zero"]: 0,
-            }
+            rating_hint = "1★ 原片保留 · 2★ 人工确认（AI 不标） · 3★ 精修候选 · 有星原片合计为交付数量"
         else:
-            self.legend_text.set(f"1★ Review  ·  {backup}★ Strong backup  ·  {featured}★ Best  ·  — Not selected")
-            rating_hint = (
-                f"Ratings: 1★ review (selected; confirm manually) · "
-                f"{backup}★ backup · {featured}★ best"
-            )
-            filters = {
-                self.t["filter_all"]: None,
-                self.t["filter_one"]: 1,
-                f"{backup}★ only": 2,
-                f"{featured}★ only": 3,
-                self.t["filter_zero"]: 0,
-            }
+            rating_hint = "1★ retained original · 2★ manual only · 3★ retouch candidate · delivery count includes every starred photo"
+        self.legend_text.set(self.t["legend"])
+        filters = {
+            self.t["filter_all"]: None,
+            self.t["filter_retained"]: -1,
+            self.t["filter_one"]: 1,
+            self.t["filter_two"]: 2,
+            self.t["filter_three"]: 3,
+            self.t["filter_zero"]: 0,
+        }
         self.rating_filters = filters
         self.rating_filter_menu.configure(values=tuple(filters))
         if hasattr(self, "grid_hint"):
@@ -4598,14 +5079,14 @@ end run
         featured = self._output_rating(3)
         if self.language == "zh":
             self.stats_text.set(
-                f"1★ 初选复核 {counts[1]}　{backup}★ 优质备用 {counts[2]}　"
-                f"{featured}★ 精选推荐 {counts[3]}　已选合计 "
+                f"1★ 原片保留 {counts[1]}　{backup}★ 人工确认 {counts[2]}　"
+                f"{featured}★ 精修候选 {counts[3]}　保留原片合计 "
                 f"{counts[1] + counts[2] + counts[3]}　未入选 {counts[0]}　共 {len(self.results)} 张"
             )
         else:
             self.stats_text.set(
-                f"1★ Review {counts[1]}   {backup}★ Backup {counts[2]}   "
-                f"{featured}★ Featured {counts[3]}   Selected "
+                f"1★ Retained {counts[1]}   {backup}★ Manual {counts[2]}   "
+                f"{featured}★ Retouch {counts[3]}   Retained total "
                 f"{counts[1] + counts[2] + counts[3]}   Not selected {counts[0]}   Total {len(self.results)}"
             )
         return counts
@@ -4614,13 +5095,19 @@ end run
         selected = counts[1] + counts[2] + counts[3]
         featured = self._output_rating(3)
         if self.language == "zh":
+            if self.results and self.results[0].rule_version:
+                try:
+                    minimum = int(self.target.get())
+                except (ValueError, AttributeError):
+                    minimum = None
+                return wedding_selection_summary(self.results, minimum) + "；请复核后再写入星级。"
             return (
                 f"分析完成：共 {len(self.results)} 张，已选 {selected} 张，"
-                f"其中 {featured}★ 精选 {counts[3]} 张；请复核后再写入 XMP。"
+                f"其中 {featured}★ 精修候选 {counts[3]} 张；请检查后再写入 XMP。"
             )
         return (
             f"Analysis complete: {len(self.results)} total, {selected} selected, "
-            f"including {counts[3]} featured {featured}★ picks. Review before writing XMP."
+            f"including {counts[3]} retouch candidates at {featured}★. Check before writing XMP."
         )
 
     def _render_results_table(self) -> None:
@@ -4640,7 +5127,7 @@ end run
         self.grid_visible_limit = max(72, min(self.grid_visible_limit, max(len(self.results), 72)))
         self._schedule_grid_render()
 
-    def show_results(self, results: list[PhotoResult]) -> None:
+    def show_results(self, results: list[PhotoResult], *, selected_index: int | None = None) -> None:
         self.analysis_running = False
         self.set_workflow_stage(4)
         self.results = results
@@ -4662,13 +5149,19 @@ end run
         selected = counts[1] + counts[2] + counts[3]
         featured = self._output_rating(3)
         if self.language == "zh":
-            self.task_import_summary.set(f"已选 {selected} 张 · {featured}★ 精选 {counts[3]} 张")
+            self.task_import_summary.set(f"保留原片 {selected} 张 · {featured}★ 精修候选 {counts[3]} 张")
         else:
-            self.task_import_summary.set(f"Selected {selected} · {counts[3]} featured {featured}★")
+            self.task_import_summary.set(f"Retained {selected} · {counts[3]} retouch candidates at {featured}★")
         self.export_selected_button.configure(state="normal")
         self.refresh_lightroom_guard(schedule_next=False)
-        if results:
-            self._select_result_index(0)
+        visible = [int(value) for value in self.table.get_children()]
+        if visible:
+            preferred = selected_index if selected_index is not None else visible[0]
+            self._select_result_index(next((index for index in visible if index >= preferred), visible[-1]))
+        else:
+            self.preview = None
+            self.preview_label.configure(image="", text="当前筛选条件没有照片")
+            self.detail.configure(text="")
 
     @staticmethod
     def _log_record(item: PhotoResult, index: int) -> dict[str, object]:
@@ -4680,7 +5173,11 @@ end run
             "rating": item.suggested_rating,
             "score": round(item.score, 2),
             "frame_sharpness": None if item.sharpness is None else round(item.sharpness, 2),
+            "perceptual_hash": item.perceptual_hash,
+            "highlight_clip": item.highlight_clip,
+            "shadow_clip": item.shadow_clip,
             "subject_sharpness": None if item.subject_sharpness is None else round(item.subject_sharpness, 2),
+            "subject_luminance": item.subject_luminance,
             "frontal_faces": item.frontal_face_count,
             "smiling_faces": item.smiling_face_count,
             "open_eye_faces": item.open_eye_face_count,
@@ -4694,6 +5191,12 @@ end run
             "calibration_confidence": None if item.calibration_confidence is None else round(item.calibration_confidence, 4),
             "scene_softness_protected": item.scene_protected,
             "scene_coverage_protected": item.coverage_protected,
+            "rule_version": item.rule_version,
+            "rule_ids": ",".join(item.rule_ids),
+            "content_type": item.content_type,
+            "max_auto_rating": item.max_auto_rating,
+            "content_evidence": json.dumps(item.content_evidence, ensure_ascii=False),
+            "person_evidence": dict(item.person_evidence),
             "reasons": "；".join(item.reasons),
         }
 
@@ -4709,8 +5212,13 @@ end run
         }
         target_text = self.target.get().strip()
         return {
-            "version": 5,
-            "selection_policy": "scene-minimum-3plus-dynamic-density-v7-scene-rules",
+            "version": 7,
+            "rating_policy": RATING_POLICY_VERSION,
+            "automatic_ratings": [0, 1, 3],
+            "manual_confirmation_rating": 2,
+            "manual_ratings": {str(path): rating for path, rating in self.manual_ratings.items()},
+            "selection_policy": ("wedding-v2-240-evidence-gates" if self.scene_type.get() == "婚礼"
+                                 else "scene-minimum-3plus-dynamic-density-v7-scene-rules"),
             "task": {
                 "id": self.current_task_id,
                 "name": self.current_task_name,
@@ -4727,14 +5235,25 @@ end run
                     "max": int(self.target_max.get()) if self.target_max.get().strip() else None,
                 },
                 "scene_type": self.scene_type.get(),
+                "wedding_rule_version": RULE_VERSION,
+                "wedding_content_type": self.wedding_content_type.get(),
+                "content_model_enabled": self.content_model_enabled.get(),
+                "content_model_name": self.content_model_name.get(),
+                "content_review_mode": "limited" if self.content_model_enabled.get() else "base",
+                "content_budget_target_seconds": min(600, max(30, len(self.results) * .12)),
             },
             "source_folders": sorted({str(path.parent) for path in self.imported_files}),
             "counts": counts,
             "tier_to_xmp_rating": self._star_mapping(),
             "personal_calibration": None if self.calibration_profile is None else {
-                "version": 1,
+                "version": 3,
                 "training_examples": self.calibration_profile.training_examples,
                 "validation_auc": round(self.calibration_profile.validation_auc, 4),
+                "objective": getattr(self.calibration_profile, "objective", "featured"),
+                "scene_type": getattr(self.calibration_profile, "scene_type", ""),
+                "validation_precision": getattr(self.calibration_profile, "validation_precision", None),
+                "validation_recall": getattr(self.calibration_profile, "validation_recall", None),
+                "validation_scope": getattr(self.calibration_profile, "validation_scope", "burst_holdout"),
             },
             "selected_total": int(counts["1"]) + int(counts["2"]) + int(counts["3"]),
             "photos": [
@@ -4758,6 +5277,23 @@ end run
         )
         os.replace(temporary, self.current_log_path)
 
+    def _freeze_analysis_baseline(self) -> None:
+        """Save the completion result before later manual edits rewrite logs.
+
+        Any preserved manual stars remain explicitly recorded in the payload;
+        evaluation excludes them rather than calling them initial AI advice.
+        A second completion never overwrites an existing baseline.
+        """
+        if self.current_log_path is None or not self.current_log_path.is_file():
+            return
+        destination = self.current_log_path.parent / "baselines" / self.current_log_path.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with destination.open("x", encoding="utf-8") as stream:
+                json.dump(self._analysis_log_payload(), stream, ensure_ascii=False, indent=2)
+        except FileExistsError:
+            pass
+
     def _choose_export_options(self) -> tuple[frozenset[int], Path | None] | None:
         """Choose rating tiers and destination in one compact dialog."""
         dialog = tk.Toplevel(self)
@@ -4772,7 +5308,7 @@ end run
         content = ttk.Frame(dialog, style="Paper.TFrame", padding=22)
         content.pack(fill="both", expand=True)
         ttk.Label(content, text="导出已选图片", style="PanelTitle.TLabel").pack(anchor="w")
-        ttk.Label(content, text="选择星级（可多选）", style="PanelMuted.TLabel").pack(anchor="w", pady=(5, 12))
+        ttk.Label(content, text="交付全部保留原片：勾选所有有星照片；只要精修候选：仅勾 3 星。", style="PanelMuted.TLabel", wraplength=420).pack(anchor="w", pady=(5, 12))
         counts = {
             tier: sum(item.suggested_rating == tier for item in self.results)
             for tier in (1, 2, 3)
@@ -4784,7 +5320,9 @@ end run
             count = sum(counts[tier] for tier in choices if choices[tier].get())
             summary.set(f"将导出 {count} 张照片" if count else "请至少勾选一种星级")
 
-        for tier, name in ((1, "初选复核"), (2, "优质备用"), (3, "精选推荐")):
+        for tier, name in RATING_LABELS["zh"].items():
+            if tier == 0:
+                continue
             ttk.Checkbutton(
                 content,
                 text=f"{self._output_rating(tier)}★  {name}  ·  {counts[tier]} 张",
@@ -4839,6 +5377,8 @@ end run
             self.export_cancel_event.set()
             self.status.set("正在取消导出…")
             return
+        if self._task_operation_running():
+            return
         if not self.results:
             return
         export_options = self._choose_export_options()
@@ -4886,6 +5426,8 @@ end run
                 self.ui_events.put(("selected_export_cancelled", None))
             except (OSError, ValueError) as exc:
                 self.ui_events.put(("selected_export_failed", str(exc)))
+            except Exception:
+                self.ui_events.put(("selected_export_failed", "导出发生异常；请重试，原片未改动。"))
 
         threading.Thread(
             target=copy_in_background,
@@ -4924,6 +5466,7 @@ end run
             "smiling_faces", "open_eye_faces", "face_coverage", "closest_face_distance",
             "eye_detection_mode", "eye_penalty", "must_keep_id", "median_luminance",
             "relative_exposure_ev", "calibration_confidence", "scene_softness_protected", "scene_coverage_protected", "reasons",
+            "rule_version", "rule_ids", "content_type", "max_auto_rating", "content_evidence",
         ]
         try:
             with destination.open("w", encoding="utf-8-sig", newline="") as stream:
@@ -4958,6 +5501,7 @@ end run
                     errors="replace",
                     timeout=2,
                     check=False,
+                    **hidden_subprocess_options(),
                 )
                 process_names = {
                     row[0].strip().casefold()
@@ -5004,7 +5548,7 @@ end run
 
     def refresh_lightroom_guard(self, schedule_next: bool = True) -> None:
         self.running_metadata_editors = self._metadata_editors_running()
-        can_write = bool(self.results) and not self.running_metadata_editors
+        can_write = bool(self.results) and not self.running_metadata_editors and not self._task_operation_running()
         state = "normal" if can_write else "disabled"
         for button in (self.write_button, self.restore_button):
             button.configure(state=state)
@@ -5055,21 +5599,28 @@ end run
             (path for path in item.pair_paths if path.suffix.lower() in {".jpg", ".jpeg"}),
             item.path,
         )
-        if not self._set_preview_from_path(preview_path):
-            self.preview_label.configure(image="", text=self.t["raw_preview"])
+        if self._preview_is_cached(preview_path):
+            if not self._set_preview_from_path(preview_path):
+                self.preview_label.configure(image="", text=self.t["raw_preview"])
+        else:
+            self.preview_label.configure(image="", text="正在准备预览")
+            self._preview_warmup.prioritize([preview_path], request=True)
         sharpness = item.subject_sharpness if item.subject_sharpness is not None else (item.sharpness or 0)
         score_label = self.t["score_subject"] if item.subject_sharpness is not None else self.t["score_frame"]
-        details = f"{item.path.name}\n{score_label.format(score=item.score, sharpness=sharpness)}\n" + ("\n".join(item.reasons) or self.t["best"])
+        review_status = ("已内容复核（模型辅助，仍需人工确认）" if item.content_evidence.get("status") == "ok"
+                         else "仅基础检测 · 未完成内容模型复核")
+        details = f"{item.path.name}\n{score_label.format(score=item.score, sharpness=sharpness)}\n{review_status}\n" + ("\n".join(item.reasons) or self.t["best"])
         self.detail.configure(text=details)
 
     def set_manual_rating(self, rating: int) -> None:
-        if self.export_running:
+        if self._task_operation_running():
             return
         if self.selected is None:
             return
+        selected_index = next((index for index, item in enumerate(self.results) if item is self.selected), None)
         self.selected.suggested_rating = rating
         self.manual_ratings[self.selected.path] = rating
-        self.show_results(self.results)
+        self.show_results(self.results, selected_index=selected_index)
         self.status.set(self.t["not_written"])
         try:
             self._write_automatic_log()
@@ -5078,7 +5629,7 @@ end run
         self._write_task_history("已人工调整" if self.language == "zh" else "Manually adjusted")
 
     def confirm_write(self) -> None:
-        if self.export_running:
+        if self._task_operation_running():
             return
         if not self.ensure_metadata_editors_closed():
             return
@@ -5129,11 +5680,12 @@ end run
             else "Overwrite every existing rating? Camera RAW sidecars and embedded JPEG, DNG, TIFF or HEIC ratings will be replaced after automatic backup.",
         ):
             return
-        try:
-            outcomes = write_ratings(ratings, mode=mode)
-        except (OSError, RuntimeError, ValueError) as exc:
-            messagebox.showerror("星级写入失败" if self.language == "zh" else "Rating write failed", str(exc))
-            return
+        self._begin_metadata_operation(
+            "星级写入", lambda **options: write_ratings(ratings, mode=mode, **options),
+            self._ratings_written,
+        )
+
+    def _ratings_written(self, outcomes: dict[Path, str]) -> None:
         updated = sum(value in {"created", "updated", "embedded-updated"} for value in outcomes.values())
         skipped = sum(value == "skipped-existing-rating" for value in outcomes.values())
         message = (
@@ -5167,7 +5719,7 @@ end run
 
     def repair_legacy_heic_ratings(self) -> None:
         """Migrate obsolete sidecar ratings without a new AI pass."""
-        if self.export_running:
+        if self._task_operation_running():
             return
         if not self.ensure_metadata_editors_closed():
             return
@@ -5182,11 +5734,12 @@ end run
             "每张原文件会先完整备份到 .event-cull-backups，照片像素不会重新编码。",
         ):
             return
-        try:
-            outcomes = migrate_legacy_embedded_ratings(candidates)
-        except (OSError, RuntimeError, ValueError) as exc:
-            messagebox.showerror("照片星级修复失败", str(exc))
-            return
+        self._begin_metadata_operation(
+            "照片星级修复", lambda **options: migrate_legacy_embedded_ratings(candidates, **options),
+            self._legacy_ratings_repaired,
+        )
+
+    def _legacy_ratings_repaired(self, outcomes: dict[Path, str]) -> None:
         updated = sum(value == "embedded-updated" for value in outcomes.values())
         skipped = sum(value == "skipped-existing-rating" for value in outcomes.values())
         message = f"照片星级修复完成：已写入 {updated} 张，保留已有嵌入星级 {skipped} 张。"
@@ -5195,23 +5748,131 @@ end run
         self._refresh_legacy_heic_repair_button()
 
     def confirm_restore(self) -> None:
-        if self.export_running:
+        if self._task_operation_running():
             return
         if not self.ensure_metadata_editors_closed():
             return
         if not messagebox.askyesno(self.t["restore_confirm"], self.t["restore_confirm_detail"]):
             return
-        outcomes = restore_managed_ratings([item.path for item in self.results])
+        photos = [item.path for item in self.results]
+        self._begin_metadata_operation(
+            "星级还原", lambda **options: restore_managed_ratings(photos, **options),
+            self._ratings_restored,
+        )
+
+    def _ratings_restored(self, outcomes: dict[Path, str]) -> None:
         restored = sum(value in {"removed-sidecar", "restored"} for value in outcomes.values())
         skipped = len(outcomes) - restored
         if restored == 0:
-            messagebox.showinfo(self.t["restore_confirm"], self.t["restore_nothing"])
+            if not self._close_after_operations:
+                messagebox.showinfo(self.t["restore_confirm"], self.t["restore_nothing"])
             return
         message = self.t["restored"].format(restored=restored, skipped=skipped)
         self.status.set(message)
         self._set_xmp_result(f"✓ {message}")
         self.xmp_notice.set(self.lr_instructions)
         self._write_task_history("已还原 XMP" if self.language == "zh" else "XMP restored")
+
+    def _begin_metadata_operation(
+        self, title: str, operation: Callable[..., dict[Path, str]],
+        completed: Callable[[dict[Path, str]], None],
+    ) -> None:
+        """One serialized worker for write, restore and legacy migration."""
+        if self._task_operation_running():
+            return
+        self.metadata_running = True
+        self.metadata_cancel_event.clear()
+        self._metadata_prior_states = [
+            (widget, widget.cget("state")) for widget in (
+                self.new_task_button, self.choose_button, self.choose_files_button,
+                self.analyze_button, self.calibration_button, self.picker_settings_button,
+                self.write_button, self.restore_button, self.repair_legacy_heic_button,
+                self.export_selected_button, self.write_mode_menu, self.backup_star_menu,
+                self.featured_star_menu, *self.manual_rating_buttons.values(),
+            )
+        ]
+        for widget, _state in self._metadata_prior_states:
+            widget.configure(state="disabled")
+        self.metadata_cancel_button.configure(state="normal")
+        self.metadata_cancel_button.pack(fill="x", pady=(6, 0), before=self.export_selected_button)
+        self.progress.configure(mode="determinate", maximum=1, value=0)
+        self.progress_text.set(f"正在准备{title}…")
+        self.status.set(f"正在{title}；可停止后续照片的处理。")
+
+        def work() -> None:
+            try:
+                outcomes = operation(
+                    cancel_event=self.metadata_cancel_event,
+                    progress_callback=lambda current, total, path: self.ui_events.put(
+                        ("metadata_progress", (current, total, path))),
+                )
+                result = (title, completed, outcomes, None, False)
+            except MetadataCancelled as exc:
+                result = (title, completed, exc.outcomes, None, True)
+            except Exception as exc:
+                result = (title, completed, {}, str(exc), False)
+            self.ui_events.put(("metadata_finished", result))
+
+        threading.Thread(target=work, name="event-cull-metadata", daemon=True).start()
+
+    def _finish_metadata_operation(
+        self, title: str, completed: Callable[[dict[Path, str]], None],
+        outcomes: dict[Path, str], error: str | None, cancelled: bool,
+    ) -> None:
+        self.metadata_running = False
+        for widget, state in self._metadata_prior_states:
+            widget.configure(state=state)
+        self._metadata_prior_states = []
+        self.metadata_cancel_button.pack_forget()
+        self.refresh_lightroom_guard(schedule_next=False)
+        if error:
+            message = f"{title}失败；此前已完成的改动和备份会保留。"
+            self.status.set(message)
+            self.progress_text.set(f"{title}失败")
+            self._set_xmp_result(message)
+            if not self._close_after_operations:
+                messagebox.showerror(f"{title}失败", f"{error}\n\n{message}")
+        elif cancelled:
+            message = f"已停止{title}，已处理 {len(outcomes)} 张；已完成的改动和备份会保留。"
+            self.status.set(message)
+            self.progress_text.set("星级处理已停止")
+            self._set_xmp_result(message)
+        else:
+            self.progress_text.set(f"{title}完成")
+            completed(outcomes)
+
+    def _cancel_metadata(self) -> None:
+        self.metadata_cancel_event.set()
+        self.metadata_cancel_button.configure(state="disabled")
+        self.status.set("正在停止：当前照片处理完成后停止后续操作。")
+
+    def _request_close(self) -> None:
+        # Let the current metadata transaction/copy finish before closing;
+        # terminating daemon workers immediately could leave partial files.
+        if any(self.__dict__.get(name, False) for name in (
+            "metadata_running", "export_running", "analysis_running", "calibration_running",
+        )):
+            if self._close_after_operations:
+                return
+            if not messagebox.askyesno("停止后退出", "仍在处理照片。停止当前任务，等待正在执行的步骤结束后退出？"):
+                return
+            self._close_after_operations = True
+            self.metadata_cancel_event.set()
+            self.export_cancel_event.set()
+            self.cancel_event.set()
+            self.pause_event.clear()
+            self.status.set("正在停止文件操作，完成后自动退出…")
+            self._close_when_file_operations_finish()
+            return
+        self.destroy()
+
+    def _close_when_file_operations_finish(self) -> None:
+        if any(self.__dict__.get(name, False) for name in (
+            "metadata_running", "export_running", "analysis_running", "calibration_running",
+        )):
+            self.after(100, self._close_when_file_operations_finish)
+        else:
+            self.destroy()
 
 def _run_packaging_smoke_test() -> None:
     """Exercise the frozen Windows shell and its primary navigation in CI."""
@@ -5246,6 +5907,9 @@ def _run_packaging_smoke_test() -> None:
     from tempfile import TemporaryDirectory
     source_dir = TemporaryDirectory(prefix="MiaoXuan-Smoke-Source-")
     try:
+        # Packaging checks must not create synthetic tasks in user history.
+        app._write_task_history = lambda *_args, **_kwargs: None
+        app._write_automatic_log = lambda: None
         imported_photo = Path(source_dir.name) / "import.jpg"
         Image.new("RGB", (32, 32), "#4682b4").save(imported_photo)
         if not app._load_selected_files([imported_photo]):
@@ -5265,11 +5929,38 @@ def _run_packaging_smoke_test() -> None:
             if not widget.winfo_exists() or not str(widget.cget("command")):
                 raise RuntimeError(f"Missing or unbound Windows button: {name}")
         mark(f"controls-verified-{verify_button_wiring(app)}")
+        imported_snapshot = tuple(app.imported_files)
         for name in ("export_nav_button", "calibration_nav_button", "cull_nav_button", "history_button"):
             before = set(app.winfo_children())
             getattr(app, name).invoke()
             mark(f"invoked-{name}")
             app.update()
+            if name != "history_button":
+                learning = name == "calibration_nav_button"
+                if any(bool(widget.winfo_ismapped()) == learning for widget in (
+                    app.task_header, app.workflow_band, app.decision_panel,
+                )):
+                    raise RuntimeError("Navigation failed to hide/restore task-only chrome")
+                if learning and int(app.calibration_panel.grid_info()["columnspan"]) != 2:
+                    raise RuntimeError("Calibration page did not use the full workspace")
+                if tuple(app.imported_files) != imported_snapshot:
+                    raise RuntimeError("Workspace navigation changed the imported task")
+                mark(f"workspace-chrome-verified-{name}")
+                if learning:
+                    # Check the smallest supported window with an active
+                    # learning progress view, not just the default geometry.
+                    geometry = app.geometry()
+                    app.geometry("1180x720")
+                    app.calibration_activity.grid()
+                    app.update_idletasks()
+                    panel_bottom = app.calibration_panel.winfo_rooty() + app.calibration_panel.winfo_height()
+                    for control in (app.calibration_button, app.calibration_history_button, app.calibration_stop_button):
+                        if control.winfo_rooty() + control.winfo_height() > panel_bottom:
+                            raise RuntimeError("Learning controls were clipped at the minimum window size")
+                    app.calibration_activity.grid_remove()
+                    app.geometry(geometry)
+                    app.update_idletasks()
+                    mark("calibration-minimum-window-verified")
             if name == "history_button":
                 windows = [child for child in app.winfo_children() if isinstance(child, tk.Toplevel) and child not in before]
                 if len(windows) != 1:
@@ -5287,22 +5978,151 @@ def _run_packaging_smoke_test() -> None:
             if len(windows) != 1:
                 raise RuntimeError(f"{name} did not open its window")
             mark(f"{name}-buttons-verified-{verify_button_wiring(windows[0])}")
+            original_target = app.target.get()
+            if name == "picker_settings_button":
+                windows[0].geometry("980x720")
+                app.update()
+                form = app._picker_form_canvas
+                form.yview_moveto(0)
+                stack = [form]
+                combo = None
+                while stack:
+                    widget = stack.pop()
+                    stack.extend(widget.winfo_children())
+                    if isinstance(widget, ttk.Combobox):
+                        combo = widget
+                if combo is None:
+                    raise RuntimeError("Picker form has no scene/use selector")
+                original_choice = combo.get()
+                combo.event_generate("<MouseWheel>", delta=-120)
+                app.update()
+                if form.yview()[0] <= 0 or combo.get() != original_choice:
+                    raise RuntimeError("Picker wheel did not scroll, or changed a selection")
+                mark("picker-wheel-scroll-verified")
+                if tk.TkVersion >= 9:
+                    form.yview_moveto(0)
+                    combo.event_generate("<TouchpadScroll>", delta=(-20 & 0xffff))
+                    app.update()
+                    down = form.yview()[0]
+                    if down <= 0 or combo.get() != original_choice:
+                        raise RuntimeError("Picker precise trackpad scroll was not handled")
+                    combo.event_generate("<TouchpadScroll>", delta=20)
+                    app.update()
+                    if form.yview()[0] >= down:
+                        raise RuntimeError("Picker upward trackpad scroll was not handled")
+                    before_horizontal = form.yview()
+                    combo.event_generate("<TouchpadScroll>", delta=4 << 16)
+                    app.update()
+                    if form.yview() != before_horizontal:
+                        raise RuntimeError("Horizontal trackpad scroll moved the vertical form")
+                    mark("picker-trackpad-scroll-verified")
+                app.target.set("")
+                app.wedding_content_type.set("正式合影")
+                app.content_model_enabled.set(False)
+                app.show_wedding_rules(windows[0])
+                app.update()
+                catalogue_window = app._wedding_rules_dialog
+                stack = [catalogue_window]
+                found_last_rule = False
+                while stack:
+                    widget = stack.pop()
+                    stack.extend(widget.winfo_children())
+                    if isinstance(widget, tk.Text) and "W240" in widget.get("1.0", "end"):
+                        found_last_rule = True
+                if not found_last_rule or len(wedding_rules()) != 240:
+                    raise RuntimeError("Bundled wedding rule catalogue is incomplete")
+                verify_button_wiring(catalogue_window)
+                catalogue_window.destroy()
+                mark("wedding-rules-240-verified")
             windows[0].destroy()
+            if name == "picker_settings_button" and app.target.get() != original_target:
+                raise RuntimeError("Cancelled picker settings changed the saved target")
+            if name == "picker_settings_button" and (
+                app.wedding_content_type.get() != "自动（保守）" or app.content_model_enabled.get()
+            ):
+                raise RuntimeError("Cancelled picker settings changed the wedding/model options")
             mark(f"closed-{name}")
             app.update()
-        from event_cull.xmp import _read_embedded_rating, restore_managed_rating, write_rating
+        from event_cull.xmp import _read_embedded_rating
+
+        def check_metadata_worker(title, operation) -> None:
+            completed = []
+            app._begin_metadata_operation(title, operation, lambda outcomes: completed.append(outcomes))
+            deadline = time.monotonic() + 20
+            while app.metadata_running:
+                app.update()
+                if time.monotonic() > deadline:
+                    app.metadata_cancel_event.set()
+                    raise RuntimeError("Background metadata operation timed out")
+                time.sleep(0.005)
+            if not completed or app.metadata_cancel_button.winfo_ismapped():
+                raise RuntimeError("Metadata operation failed to restore its UI state")
+
         with TemporaryDirectory() as directory:
             photo = Path(directory) / "测试照片.jpg"
             Image.new("RGB", (32, 32), "#4682b4").save(photo)
-            mark("writing-jpeg-rating")
-            write_rating(photo, 3)
-            mark("reading-jpeg-rating")
-            if _read_embedded_rating(photo) != 3:
-                raise RuntimeError("Bundled Windows ExifTool rating round-trip failed")
+            # Shared metadata boundary: automatic 1/3 and reserved manual 2
+            # must survive real embedded XMP round-trips in the frozen app.
+            for rating in (1, 3, 2):
+                mark(f"writing-jpeg-rating-{rating}")
+                check_metadata_worker("星级写入", lambda rating=rating, **options:
+                                      write_ratings({photo: rating}, mode="safe" if rating == 1 else "managed", **options))
+                if _read_embedded_rating(photo) != rating:
+                    raise RuntimeError(f"Bundled ExifTool {rating}-star rating round-trip failed")
+                mark(f"jpeg-rating-{rating}-round-trip-verified")
             mark("restoring-jpeg-rating")
-            restore_managed_rating(photo)
+            check_metadata_worker("星级还原", lambda **options: restore_managed_ratings([photo], **options))
         mark("exiftool-verified")
-        print("MiaoXuan Windows packaging smoke passed")
+        mark("background-metadata-verified")
+        # Exercise native Tk geometry at the reported RAW-batch size. No user
+        # files or analysis results are involved in this synthetic wall.
+        app.results = [PhotoResult(path=imported_photo, score=62, suggested_rating=1) for _ in range(2764)]
+        app.photo_view_mode.set("grid")
+        app._render_photo_grid()
+        app.update_idletasks()
+        if not app._virtual_grid_rows or app.photo_grid_inner.winfo_height() > 5000:
+            raise RuntimeError("Large photo grid did not create bounded visible rows")
+        app.photo_grid_canvas.yview_moveto(0.9)
+        app._render_virtual_grid_window()
+        app.update_idletasks()
+        if app._virtual_grid_range[0] < 300:
+            raise RuntimeError("Large photo grid lost its virtual scroll extent")
+        mark("large-grid-2764-verified")
+        # Rating the photo being reviewed must retain that photo, or select
+        # its visible neighbour when it no longer matches the current filter.
+        index = app._virtual_grid_range[0] * app._virtual_grid_layout[0] + 1
+        app._select_result_index(index)
+        selected = app.results[index]
+        app.set_manual_rating(3)
+        if app.selected is not selected or selected.suggested_rating != 3:
+            raise RuntimeError("Manual rating lost the current selection")
+        app.set_manual_rating(2)
+        if app.selected is not selected or app._output_rating(selected.suggested_rating) != 2:
+            raise RuntimeError("Manual confirmation did not retain its reserved two stars")
+        mark("manual-two-stars-verified")
+        app.rating_filter.set(app.t["filter_one"])
+        app.set_manual_rating(0)
+        if app.active_result_index != index + 1:
+            raise RuntimeError("Manual rating did not select the next matching photo")
+        mark("manual-selection-and-filter-verified")
+        # Validate the actual shipped native runtime and both GGUF files, not
+        # just a successful asset lookup. Synthetic input never touches photos.
+        from event_cull.wedding_content import BundledWeddingContentModel
+        import numpy as np
+        mark("bundled-content-starting")
+        content_model = BundledWeddingContentModel()
+        try:
+            for index in range(2):
+                evidence = content_model.inspect(np.full((128, 192, 3), 170, dtype=np.uint8))
+                if evidence.get("status") != "ok":
+                    raise RuntimeError(f"Bundled native content inference failed: {evidence.get('error')}")
+                mark(f"bundled-content-observation-{index + 1}-verified")
+        finally:
+            content_model.close()
+        if content_model.runtime.process is None or content_model.runtime.process.poll() is None:
+            raise RuntimeError("Bundled model process was not released")
+        mark("bundled-content-process-closed")
+        print(f"MiaoXuan {APP_VERSION} packaging smoke passed ({sys.platform})")
     finally:
         mark("destroying")
         app.destroy()

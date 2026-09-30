@@ -14,6 +14,7 @@ from core.best_photo_finder.errors import (
 from core.best_photo_finder.models import TechnicalMetrics
 from core.model_provisioning import AESTHETIC_MODEL, resolve_snapshot
 from core.image_features.face_analysis import FaceAnalysisService
+from core.image_features.landmarker_runtime import TasksLandmarker
 from core.runtime_paths import resolve_face_landmarker_model_path
 import contextlib
 import sys
@@ -77,62 +78,16 @@ class FaceLandmarkerBackend(Protocol):
         """Release native MediaPipe resources."""
 
 
-class MediaPipeTasksFaceLandmarker:
+class MediaPipeTasksFaceLandmarker(TasksLandmarker):
     """Small adapter around MediaPipe Tasks' model-backed Face Landmarker."""
 
     def __init__(self, model_path: Path) -> None:
-        mediapipe = _require_module("mediapipe")
         try:
-            tasks = mediapipe.tasks
-            vision = tasks.vision
-            # MediaPipe 1.0.1 aborts on macOS CPU graphs (upstream #6356).
-            # Metal requires four-channel pixel buffers, including for RGB input.
-            self._use_metal = sys.platform == "darwin"
-            base_options = tasks.BaseOptions(
-                model_asset_path=str(model_path),
-                delegate=(
-                    tasks.BaseOptions.Delegate.GPU
-                    if self._use_metal
-                    else tasks.BaseOptions.Delegate.CPU
-                ),
-            )
-            options = vision.FaceLandmarkerOptions(
-                base_options=base_options,
-                running_mode=vision.RunningMode.IMAGE,
-                num_faces=10,
-            )
-            self._landmarker = vision.FaceLandmarker.create_from_options(options)
-            self._image_type = mediapipe.Image
-            self._image_format = (
-                mediapipe.ImageFormat.SRGBA
-                if self._use_metal
-                else mediapipe.ImageFormat.SRGB
-            )
+            super().__init__(model_path, module_loader=_require_module, platform=sys.platform)
         except (AttributeError, ValueError, RuntimeError) as exc:
-            version = getattr(mediapipe, "__version__", "unknown")
             raise MissingDependencyError(
-                "MediaPipe Tasks Face Landmarker could not be initialized "
-                f"(detected version: {version}, model: {model_path})."
+                f"MediaPipe Tasks Face Landmarker could not be initialized (model: {model_path})."
             ) from exc
-
-    def detect_landmarks(self, rgb_image) -> Sequence[Sequence[object]]:
-        try:
-            import numpy as np
-        except ImportError as exc:
-            raise MissingDependencyError(
-                "Missing optional dependency 'numpy'. Install the required extras before running the selector."
-            ) from exc
-        if self._use_metal:
-            pixels = np.empty((*rgb_image.shape[:2], 4), dtype=np.uint8)
-            pixels[..., :3] = rgb_image
-            pixels[..., 3] = 255
-        else:
-            pixels = np.ascontiguousarray(rgb_image)
-        image = self._image_type(image_format=self._image_format, data=pixels)
-        return self._landmarker.detect(image).face_landmarks
-
-    def close(self) -> None:
-        self._landmarker.close()
 
 
 def _create_face_landmarker(model_path: Path) -> FaceLandmarkerBackend:

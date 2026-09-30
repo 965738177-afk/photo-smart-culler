@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -132,6 +133,76 @@ AESTHETIC_MODEL = ManagedModel(
         extra_files=("preprocessor_config.json",),
     ),
     allow_patterns=(*CONFIG_PATTERNS, PICKLED_WEIGHTS_PATTERN),
+)
+
+# Experimental image-only semantic evidence. It uses the same download owner,
+# but is not in the desktop's required-model registry until selection and speed
+# acceptance pass. No startup probe silently adds a 1.5 GB product dependency.
+SEMANTIC_RETENTION_MODEL = ManagedModel(
+    key="semantic_retention_experiment",
+    repo_id="google/siglip2-base-patch16-224",
+    revision="75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2",
+    label="Experimental local semantic region comparison (SigLIP2)",
+    approx_download_mb=1432,
+    validator=_transformers_validator(
+        model_type="siglip", weight_glob=SAFETENSORS_PATTERN,
+        extra_files=("preprocessor_config.json",),
+    ),
+    allow_patterns=("config.json", "preprocessor_config.json", "model.safetensors", "README.md"),
+)
+
+# The text tower shares the exact image checkpoint/cache; only the tokenizer
+# files are additional. Neither experimental component is a startup dependency.
+SEMANTIC_RETENTION_TEXT_MODEL = ManagedModel(
+    key="semantic_retention_text_experiment",
+    repo_id=SEMANTIC_RETENTION_MODEL.repo_id,
+    revision=SEMANTIC_RETENTION_MODEL.revision,
+    label="Experimental local content comparison (SigLIP2 text)",
+    approx_download_mb=1470,
+    validator=_transformers_validator(
+        model_type="siglip", weight_glob=SAFETENSORS_PATTERN,
+        extra_files=("tokenizer.json", "tokenizer_config.json"),
+    ),
+    allow_patterns=(*SEMANTIC_RETENTION_MODEL.allow_patterns, "tokenizer.json",
+                    "tokenizer_config.json", "tokenizer.model", "special_tokens_map.json"),
+)
+
+TINY_VISION_SHA256 = "9339ee3d736344d0ddcaa6c03edc9f89688f08caaea5401220885233da726fcc"
+TINY_CONFIG_SHA256 = "c586d856dbd5589b67525db9e791ee0917402405672c7773aead373efb7d7bca"
+TINY_PROCESSOR_SHA256 = "910e70b3956ac9879ebc90b22fb3bc8a75b6a0677814500101a4c072bd7857bd"
+
+
+def _validate_tiny_vision(model: ManagedModel, snapshot: Path) -> None:
+    """Only the pinned small CLIP architecture and safetensors may be used."""
+    _transformers_validator(model_type="clip", weight_glob="model.safetensors",
+                            extra_files=("preprocessor_config.json", "README.md"))(model, snapshot)
+    config = json.loads((snapshot / "config.json").read_text(encoding="utf-8"))
+    vision = config.get("vision_config", {})
+    expected = {"hidden_size": 256, "num_hidden_layers": 10, "num_attention_heads": 4,
+                "intermediate_size": 1024, "image_size": 224, "patch_size": 16, "num_channels": 3}
+    if any(vision.get(key) != value for key, value in expected.items()) or config.get("auto_map"):
+        raise ModelDownloadError("Tiny vision architecture differs from the pinned experiment")
+    for name, expected_hash in (("model.safetensors",TINY_VISION_SHA256),
+                               ("config.json",TINY_CONFIG_SHA256),
+                               ("preprocessor_config.json",TINY_PROCESSOR_SHA256)):
+        digest = hashlib.sha256()
+        with (snapshot / name).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != expected_hash:
+            raise ModelDownloadError(f"Tiny vision {name} SHA-256 differs")
+
+
+# Experimental only: never a new required GUI/startup download. The author
+# model card declares MIT; bundling still requires preserving its notices.
+TINY_RETENTION_MODEL = ManagedModel(
+    key="tiny_retention_vision_experiment",
+    repo_id="wkcn/TinyCLIP-ViT-8M-16-Text-3M-YFCC15M",
+    revision="a2a8c6eaa2549ad66eb7c31b85022bf58273a26c",
+    label="Experimental local trainable TinyCLIP image tower",
+    approx_download_mb=94,
+    validator=_validate_tiny_vision,
+    allow_patterns=("config.json", "preprocessor_config.json", "model.safetensors", "README.md"),
 )
 
 MODEL_REGISTRY: dict[str, ManagedModel] = {

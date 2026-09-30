@@ -9,6 +9,7 @@ on:
       - "requirements-mvp.txt"
       - "MiaoXuan-Windows.spec"
       - "scripts/prepare_windows_exiftool.py"
+      - "scripts/prepare_bundled_content.py"
       - ".github/workflows/windows-culler.yml"
   push:
     branches: [main, "windows-culler*"]
@@ -18,6 +19,7 @@ on:
       - "requirements-mvp.txt"
       - "MiaoXuan-Windows.spec"
       - "scripts/prepare_windows_exiftool.py"
+      - "scripts/prepare_bundled_content.py"
       - ".github/workflows/windows-culler.yml"
 
 permissions:
@@ -43,6 +45,8 @@ jobs:
           python -m pip check
       - name: Prepare checksum-verified Windows metadata writer
         run: python scripts/prepare_windows_exiftool.py
+      - name: Prepare checksum-verified offline vision runtime and weights
+        run: python scripts/prepare_bundled_content.py --platform win32-amd64
       - name: Generate Windows icon
         run: |
           @'
@@ -68,14 +72,25 @@ jobs:
           trace = Path('build/windows-smoke-trace.txt').resolve()
           environment = dict(os.environ, MIAOXUAN_SMOKE_TRACE=str(trace))
           try:
-              completed = subprocess.run([str(executable), '--packaging-smoke-test'], env=environment, timeout=45, check=False)
+              completed = subprocess.run([str(executable), '--packaging-smoke-test'], env=environment, timeout=600, check=False)
           except subprocess.TimeoutExpired:
               raise AssertionError('Packaged app timed out; stages: ' + (trace.read_text(encoding='utf-8') if trace.exists() else '<not started>'))
           faults = trace.with_suffix('.faults.txt')
           assert completed.returncode == 0, f'Packaged app smoke failed: {completed.returncode}; stages: {trace.read_text(encoding="utf-8") if trace.exists() else "<not started>"}; faults: {faults.read_text(encoding="utf-8") if faults.exists() else "<none>"}'
           '@ | python -
       - name: Zip portable Windows application
-        run: Compress-Archive -Path 'dist/秒选-Windows' -DestinationPath 'dist/秒选-Windows-x64.zip'
+        # PowerShell Compress-Archive cannot safely handle individual >2GB files.
+        # The shipped GGUF weights need a ZIP64-capable archive writer.
+        run: |
+          @'
+          from pathlib import Path
+          import zipfile
+          root = Path('dist/秒选-Windows')
+          with zipfile.ZipFile('dist/秒选-Windows-x64.zip', 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in root.rglob('*'):
+                  if path.is_file():
+                      archive.write(path, str(path.relative_to(root.parent)))
+          '@ | python -
       - uses: actions/upload-artifact@v4
         with:
           name: MiaoXuan-Windows-x64

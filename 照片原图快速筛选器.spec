@@ -4,6 +4,7 @@ from PyInstaller.utils.hooks import collect_all
 from pathlib import Path
 import os
 import re
+from event_cull.bundled_inference import build_asset_tuples
 
 version_source = Path('event_cull/build_info.py').read_text(encoding='utf-8')
 version_match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)', version_source)
@@ -14,16 +15,21 @@ APP_VERSION = version_match.group(1)
 datas = [
     ('event_cull/models/emotion-ferplus-8.onnx', 'event_cull/models'),
     ('event_cull/data/wedding_must_keep_shots.csv', 'event_cull/data'),
+    ('docs/wedding-content-selection-policy-v2-240.md', 'docs'),
     ('event_cull/data/general_must_keep_shots.csv', 'event_cull/data'),
     ('event_cull/data/other_must_keep_shots.csv', 'event_cull/data'),
     ('assets/branding/miaoxuan-logo.png', 'assets/branding'),
+    ('assets/models/face_landmarker.task', 'models'),
+    ('assets/models/pose_landmarker_lite.task', 'models'),
 ]
 if os.environ.get('MIAOXUAN_INTERNAL_BUILD') == '1':
     datas.append(('event_cull/internal_build_marker.txt', 'event_cull'))
 for exiftool_file in Path('event_cull/vendor/exiftool').rglob('*'):
     if exiftool_file.is_file():
         datas.append((str(exiftool_file), str(exiftool_file.parent)))
-binaries = []
+offline_datas, offline_binaries = build_asset_tuples()
+datas += offline_datas
+binaries = offline_binaries
 hiddenimports = []
 datas += collect_data_files('cv2')
 tmp_ret = collect_all('tkinterdnd2')
@@ -31,7 +37,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 # Personal calibration uses an inference-only ONNX model. Avoid collecting the
 # complete PyTorch training runtime, which previously added hundreds of MB.
-for package in ('cryptography', 'keyring', 'qrcode', 'pillow_heif'):
+for package in ('cryptography', 'keyring', 'qrcode', 'pillow_heif', 'mediapipe'):
     tmp_ret = collect_all(package)
     datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

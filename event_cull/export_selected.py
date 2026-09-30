@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from event_cull.engine import PhotoResult
+from event_cull.rating_policy import RATING_POLICY_VERSION, RETAINED_RATINGS
 
 
 EXPORT_MARKER = ".event-cull-export.json"
@@ -23,7 +24,7 @@ class ExportCancelled(Exception):
 @dataclass(frozen=True)
 class ExportSelection:
     photo_count: int
-    review_count: int
+    review_count: int  # Legacy field name: count of retained one-star originals.
     files_by_folder: dict[Path, tuple[Path, ...]]
 
     @property
@@ -39,10 +40,10 @@ class ExportResult:
 
 
 def collect_selected_files(
-    results: Sequence[PhotoResult], included_tiers: frozenset[int] = frozenset({1, 2, 3})
+    results: Sequence[PhotoResult], included_tiers: frozenset[int] = RETAINED_RATINGS
 ) -> ExportSelection:
     """Export only the photographer's chosen nonzero rating tiers."""
-    if not included_tiers or not included_tiers <= {1, 2, 3}:
+    if not included_tiers or not included_tiers <= RETAINED_RATINGS:
         raise ValueError("请至少选择一种有效星级")
     grouped: dict[Path, dict[Path, None]] = {}
     photo_count = review_count = 0
@@ -165,6 +166,7 @@ def export_selected_files(
             (root / EXPORT_MARKER).write_text(
                 json.dumps({
                     "version": 1,
+                    "rating_policy": RATING_POLICY_VERSION,
                     "complete": True,
                     "selected_photos": selection.photo_count,
                     "copied_files": selection.file_count,

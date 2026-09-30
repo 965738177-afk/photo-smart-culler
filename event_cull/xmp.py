@@ -16,10 +16,13 @@ import tempfile
 import threading
 import subprocess
 import sys
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 from xml.etree import ElementTree as ET
+
+from event_cull.platform_paths import hidden_subprocess_options
 
 XMP = "adobe:ns:meta/"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -40,6 +43,32 @@ HEIC_BACKUP_MANIFEST = ".event-cull-heic-metadata.json"
 EMBEDDED_EXTENSIONS = HEIC_EXTENSIONS | {".jpg", ".jpeg", ".tif", ".tiff", ".dng"}
 EMBEDDED_BACKUP_MANIFEST = ".event-cull-embedded-metadata.json"
 PAIRED_RAW_EXTENSIONS = {".arw", ".cr2", ".cr3", ".dng", ".nef", ".orf", ".raf", ".rw2"}
+
+
+class MetadataCancelled(RuntimeError):
+    """Stop between files; completed metadata changes and backups remain."""
+
+    def __init__(self, outcomes: dict[Path, str]):
+        super().__init__("已停止星级处理")
+        self.outcomes = outcomes
+
+
+def _rating_batch(
+    photos: list[Path], operation: Callable[[Path], str], *,
+    cancel_event: threading.Event | None = None,
+    progress_callback: Callable[[int, int, Path], None] | None = None,
+) -> dict[Path, str]:
+    outcomes: dict[Path, str] = {}
+    if cancel_event is not None and cancel_event.is_set():
+        raise MetadataCancelled(outcomes)
+    backup_existing_sidecars(photos)
+    for index, photo in enumerate(photos, start=1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise MetadataCancelled(outcomes)
+        outcomes[photo] = operation(photo)
+        if progress_callback is not None:
+            progress_callback(index, len(photos), photo)
+    return outcomes
 
 
 def _write_lightroom_xmp(tree: ET.ElementTree, sidecar: Path) -> None:
@@ -183,6 +212,7 @@ def _run_bundled_exiftool(*arguments: str) -> str:
             errors="replace",
             input=input_text,
             timeout=180,
+            **hidden_subprocess_options(),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("照片元数据写入超时，请检查原片所在磁盘并重试") from exc
@@ -326,7 +356,10 @@ def legacy_managed_embedded_photos(photos: list[Path]) -> list[Path]:
     return matches
 
 
-def migrate_legacy_embedded_ratings(photos: list[Path]) -> dict[Path, str]:
+def migrate_legacy_embedded_ratings(
+    photos: list[Path], *, cancel_event: threading.Event | None = None,
+    progress_callback: Callable[[int, int, Path], None] | None = None,
+) -> dict[Path, str]:
     """Embed ratings already written by old versions without re-analysing.
 
     The migration is intentionally opt-in from the UI.  It only trusts the
@@ -334,15 +367,13 @@ def migrate_legacy_embedded_ratings(photos: list[Path]) -> dict[Path, str]:
     any existing embedded HEIC rating in preference to the legacy value.
     """
     candidates = legacy_managed_embedded_photos(photos)
-    backup_existing_sidecars(candidates)
-    outcomes: dict[Path, str] = {}
-    for photo in candidates:
+
+    def migrate(photo: Path) -> str:
         tree = ET.parse(sidecar_path(photo))
         rating = int(_description(tree).get(RATING_KEY, "0"))
         current = _read_embedded_rating(photo)
         if current:
-            outcomes[photo] = "skipped-existing-rating"
-            continue
+            return "skipped-existing-rating"
         _backup_embedded_before_write(photo, current, rating)
         _run_bundled_exiftool(
             "-overwrite_original",
@@ -350,8 +381,9 @@ def migrate_legacy_embedded_ratings(photos: list[Path]) -> dict[Path, str]:
             str(photo),
         )
         _retire_obsolete_managed_sidecar(photo)
-        outcomes[photo] = "embedded-updated"
-    return outcomes
+        return "embedded-updated"
+
+    return _rating_batch(candidates, migrate, cancel_event=cancel_event, progress_callback=progress_callback)
 
 
 def _write_embedded_rating(photo: Path, rating: int, mode: str) -> str:
@@ -459,13 +491,12 @@ def write_rating(photo: Path, rating: int, *, mode: str = "safe") -> str:
 
 
 def write_ratings(
-    ratings: dict[Path, int], *, mode: str = "safe"
+    ratings: dict[Path, int], *, mode: str = "safe",
+    cancel_event: threading.Event | None = None,
+    progress_callback: Callable[[int, int, Path], None] | None = None,
 ) -> dict[Path, str]:
-    backup_existing_sidecars(list(ratings))
-    return {
-        photo: write_rating(photo, rating, mode=mode)
-        for photo, rating in ratings.items()
-    }
+    return _rating_batch(list(ratings), lambda photo: write_rating(photo, ratings[photo], mode=mode),
+                         cancel_event=cancel_event, progress_callback=progress_callback)
 
 
 def restore_managed_rating(photo: Path) -> str:
@@ -512,6 +543,8 @@ def restore_managed_rating(photo: Path) -> str:
     return "restored"
 
 
-def restore_managed_ratings(photos: list[Path]) -> dict[Path, str]:
-    backup_existing_sidecars(photos)
-    return {photo: restore_managed_rating(photo) for photo in photos}
+def restore_managed_ratings(
+    photos: list[Path], *, cancel_event: threading.Event | None = None,
+    progress_callback: Callable[[int, int, Path], None] | None = None,
+) -> dict[Path, str]:
+    return _rating_batch(photos, restore_managed_rating, cancel_event=cancel_event, progress_callback=progress_callback)

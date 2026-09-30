@@ -1,4 +1,4 @@
-"""Local, user-specific visual calibration for featured culling picks.
+"""Local, user-specific visual calibration with explicit learning objectives.
 
 The profile stores only a small classifier and its normalization statistics.
 It never stores source pixels and never writes photo metadata.
@@ -11,29 +11,40 @@ import json
 import os
 import re
 import zlib
+import copy
+from dataclasses import replace
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from uuid import uuid4
 
 import cv2
 import numpy as np
 
-from event_cull.engine import IMAGE_EXTENSIONS, PhotoResult, _load_preview
+from event_cull.engine import IMAGE_EXTENSIONS, AnalysisOptions, PhotoResult, _load_preview
 from event_cull.source_scan import scan_source_images
+from event_cull.rating_policy import AUTOMATIC_RATINGS, automatic_rating
 from event_cull.platform_paths import application_data_dir
 from event_cull.deep_features import (
     PIPELINE_ID as DEEP_PIPELINE_ID,
+    LEGACY_PIPELINE_ID as LEGACY_DEEP_PIPELINE_ID,
+    CPU_PIPELINE_ID as CPU_DEEP_PIPELINE_ID,
     DeepFeatureUnavailable,
     encode_images,
     preferred_backend,
 )
 
 
-PROFILE_VERSION = 2
+PROFILE_VERSION = 3
 PROFILE_FILENAME = "personal-calibration-v1.json"
 MIN_VALIDATION_AUC = 0.60
+MIN_RETENTION_AGREEMENT = 0.75
 _RATING_PATTERN = re.compile(rb"xmp:Rating=[\"'](-?\d+)[\"']")
 HANDCRAFTED_PIPELINE_ID = "handcrafted-visual-v1"
+FEATURE_DIMENSIONS = {HANDCRAFTED_PIPELINE_ID: 256, LEGACY_DEEP_PIPELINE_ID: 328,
+                      DEEP_PIPELINE_ID: 832, CPU_DEEP_PIPELINE_ID: 832}
+FEATURE_BATCH_SIZE = 16
 
 
 class CalibrationError(RuntimeError):
@@ -51,6 +62,13 @@ class CalibrationProfile:
     positive_examples: int
     validation_auc: float
     feature_pipeline: str = HANDCRAFTED_PIPELINE_ID
+    objective: str = "featured"  # v1/v2 profiles retain their original meaning.
+    scene_type: str = ""
+    validation_precision: float | None = None
+    validation_recall: float | None = None
+    validation_f1: float | None = None
+    validation_examples: int = 0
+    validation_scope: str = "burst_holdout"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -64,11 +82,18 @@ class CalibrationProfile:
             "positive_examples": self.positive_examples,
             "validation_auc": self.validation_auc,
             "feature_pipeline": self.feature_pipeline,
+            "objective": self.objective,
+            "scene_type": self.scene_type,
+            "validation_precision": self.validation_precision,
+            "validation_recall": self.validation_recall,
+            "validation_f1": self.validation_f1,
+            "validation_examples": self.validation_examples,
+            "validation_scope": self.validation_scope,
         }
 
     @classmethod
     def from_dict(cls, value: object) -> "CalibrationProfile":
-        if not isinstance(value, dict) or value.get("version") not in {1, PROFILE_VERSION}:
+        if not isinstance(value, dict) or value.get("version") not in {1, 2, PROFILE_VERSION}:
             raise CalibrationError("选片偏好校准文件版本不兼容。")
         try:
             mean = tuple(float(item) for item in value["mean"])
@@ -84,11 +109,26 @@ class CalibrationProfile:
                 positive_examples=int(value["positive_examples"]),
                 validation_auc=float(value["validation_auc"]),
                 feature_pipeline=str(value.get("feature_pipeline") or HANDCRAFTED_PIPELINE_ID),
+                objective=str(value.get("objective") or "featured"),
+                scene_type=str(value.get("scene_type") or ""),
+                validation_precision=value.get("validation_precision"),
+                validation_recall=value.get("validation_recall"),
+                validation_f1=value.get("validation_f1"),
+                validation_examples=int(value.get("validation_examples") or 0),
+                validation_scope=str(value.get("validation_scope") or "burst_holdout"),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CalibrationError("选片偏好校准文件不完整。") from exc
         if not mean or len(mean) != len(scale) or len(mean) != len(weights):
             raise CalibrationError("选片偏好校准特征维度无效。")
+        numbers = [*mean, *scale, *weights, profile.bias, profile.validation_auc]
+        if (not np.isfinite(numbers).all() or any(item <= 0 for item in scale)
+                or profile.objective not in {"featured", "retention"}
+                or not 0 <= profile.validation_auc <= 1):
+            raise CalibrationError("选片偏好校准参数无效。")
+        for metric in (profile.validation_precision, profile.validation_recall, profile.validation_f1):
+            if metric is not None and (not isinstance(metric, (int, float)) or not np.isfinite(metric) or not 0 <= metric <= 1):
+                raise CalibrationError("选片偏好校准验证指标无效。")
         return profile
 
     def probability(self, image: np.ndarray) -> float:
@@ -98,6 +138,8 @@ class CalibrationProfile:
     def probability_for_feature(self, values: np.ndarray) -> float:
         if len(values) != len(self.weights):
             raise CalibrationError("选片偏好校准特征与当前版本不匹配。请重新导入一次校准结果。")
+        if not np.isfinite(values).all():
+            raise CalibrationError("选片偏好校准特征含无效数值。")
         normalized = (values - np.asarray(self.mean)) / np.asarray(self.scale)
         return _sigmoid(float(normalized @ np.asarray(self.weights) + self.bias))
 
@@ -119,9 +161,15 @@ def load_profile(path: Path | None = None) -> CalibrationProfile | None:
 def save_profile(profile: CalibrationProfile, path: Path | None = None) -> Path:
     destination = path or default_profile_path()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(".tmp")
-    temporary.write_text(json.dumps(profile.to_dict(), ensure_ascii=False), encoding="utf-8")
-    os.replace(temporary, destination)
+    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+    # Validate before replacing a working local preference file.
+    payload = profile.to_dict()
+    CalibrationProfile.from_dict(payload)
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
     return destination
 
 
@@ -136,7 +184,21 @@ def read_xmp_rating(path: Path) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def exported_selection_stems(folder: Path) -> set[str]:
+def exported_selection_files(folder: Path, *, recursive: bool = True) -> tuple[Path, ...]:
+    """Collect supported feedback photos once; sidecars are never examples.
+
+    Direct scans let an explicitly selected RAW directory remain independent
+    of its rendered-export subdirectory. Recursive remains the existing default.
+    """
+    try:
+        paths = folder.rglob("*") if recursive else folder.iterdir()
+        return tuple(path for path in paths
+                     if not path.name.startswith(".") and path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+    except OSError as exc:
+        raise CalibrationError("无法读取人工选片文件夹。") from exc
+
+
+def exported_selection_stems(folder: Path, *, recursive: bool = True) -> set[str]:
     """Return the names of frames a photographer deliberately kept.
 
     The feedback signal is the photographer exporting (or collecting) a frame,
@@ -144,16 +206,7 @@ def exported_selection_stems(folder: Path) -> set[str]:
     and photographers may use flags or collections instead of a star value.
     Matching by filename works for both rendered JPGs and selected originals.
     """
-    stems: set[str] = set()
-    try:
-        files = folder.rglob("*")
-    except OSError as exc:
-        raise CalibrationError("无法读取人工选片文件夹。") from exc
-    for path in files:
-        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
-            continue
-        stems.add(path.stem.casefold())
-    return stems
+    return {path.stem.casefold() for path in exported_selection_files(folder, recursive=recursive)}
 
 
 def _log_rows(log_path: Path) -> dict[str, tuple[str, int]]:
@@ -248,22 +301,84 @@ def _feature_matrix(images: list[np.ndarray], pipeline: str) -> np.ndarray:
     handcrafted = np.vstack([_visual_descriptor(image) for image in images]).astype(np.float32)
     if pipeline == HANDCRAFTED_PIPELINE_ID:
         return handcrafted
-    if pipeline != DEEP_PIPELINE_ID:
+    if pipeline not in {DEEP_PIPELINE_ID, LEGACY_DEEP_PIPELINE_ID, CPU_DEEP_PIPELINE_ID}:
         raise CalibrationError("选片偏好校准特征版本不兼容。请重新导入一次校准结果。")
     try:
-        deep_values, _backend = encode_images(images)
+        if pipeline == CPU_DEEP_PIPELINE_ID:
+            deep_values, _backend = encode_images(images, backend="cpu")
+            if _backend != "cpu":
+                raise DeepFeatureUnavailable("CPU-only feature contract returned another backend.")
+        else:
+            deep_values, _backend = encode_images(images)
     except DeepFeatureUnavailable as exc:
         raise CalibrationError("深度评分组件不可用；请重新更新选片偏好校准。") from exc
     if len(deep_values) != len(handcrafted):
         raise CalibrationError("深度评分没有返回完整的画面特征。")
+    if pipeline == LEGACY_DEEP_PIPELINE_ID:
+        deep_values = deep_values.reshape(len(deep_values), 72, 8).mean(axis=2)
     return np.hstack((handcrafted, deep_values)).astype(np.float32)
+
+
+def _feature_rows(
+    paths: list[Path], pipeline: str, *,
+    progress_callback: Callable[[int, int, Path], None] | None = None,
+    checkpoint: Callable[[], None] | None = None,
+) -> Iterator[tuple[int, np.ndarray]]:
+    """Share bounded image batches between training and applying preferences.
+
+    Retain small feature vectors, never the entire batch of full-size previews.
+    Check cancellation outside the decode exception handler so it propagates.
+    """
+    def decode(path):
+        try:
+            return _load_preview(path)
+        except Exception:
+            return None
+
+    # The same shared decoder, bounded to one feature batch in memory. Serial
+    # RAW reads made an otherwise compact encoder take ~15 minutes on 5,000
+    # photos. Do not create an unbounded future/image list to gain concurrency.
+    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="calibration-preview") as executor:
+        for start in range(0, len(paths), FEATURE_BATCH_SIZE):
+            if checkpoint:
+                checkpoint()
+            batch = paths[start:start + FEATURE_BATCH_SIZE]
+            futures = [executor.submit(decode, path) for path in batch]
+            images, indexes = [], []
+            try:
+                for offset, future in enumerate(futures):
+                    if checkpoint:
+                        checkpoint()
+                    image = future.result()
+                    if image is not None and image.size:
+                        images.append(image)
+                        indexes.append(start + offset)
+                    image = None
+                    if progress_callback:
+                        progress_callback(start + offset + 1, len(paths), batch[offset])
+            finally:
+                for future in futures:
+                    future.cancel()
+                futures.clear()
+                future = None
+            if checkpoint:
+                checkpoint()
+            if images:
+                features = _feature_matrix(images, pipeline)
+                if len(features) != len(indexes):
+                    raise CalibrationError("选片偏好校准未返回完整特征。")
+                images.clear()
+                if checkpoint:
+                    checkpoint()
+                yield from zip(indexes, features)
+                indexes.clear()
 
 
 def _sigmoid(value: float) -> float:
     return 1.0 / (1.0 + np.exp(-np.clip(value, -35.0, 35.0)))
 
 
-def _fit_classifier(features: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+def _fit_classifier(features: np.ndarray, labels: np.ndarray, *, checkpoint=None) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     mean = features.mean(axis=0)
     scale = np.maximum(features.std(axis=0), 1e-4)
     values = (features - mean) / scale
@@ -271,12 +386,35 @@ def _fit_classifier(features: np.ndarray, labels: np.ndarray) -> tuple[np.ndarra
     positive = max(1, int(labels.sum()))
     negative = max(1, len(labels) - positive)
     sample_weights = np.where(labels > 0, len(labels) / (2 * positive), len(labels) / (2 * negative))
+    # Correlated thumbnail/color channels can give hundreds of redundant
+    # dimensions. A fixed 0.16 step then oscillates instead of fitting logistic
+    # loss. Backtracking checks the actual regularized loss, without adding a
+    # platform-specific training dependency or silently dropping features.
+    def loss(w, b):
+        logits = values @ w + b
+        return float(np.mean((np.logaddexp(0, logits) - labels * logits) * sample_weights)
+                     + .006 * (w @ w))
     bias = 0.0
-    for _ in range(360):
+    step = .16
+    current_loss = loss(weights, bias)
+    for iteration in range(360):
+        if checkpoint and iteration % 20 == 0:
+            checkpoint()
         probabilities = 1.0 / (1.0 + np.exp(-np.clip(values @ weights + bias, -35.0, 35.0)))
         error = (probabilities - labels) * sample_weights
-        weights -= 0.16 * ((values.T @ error) / len(labels) + 0.012 * weights)
-        bias -= 0.16 * float(error.mean())
+        gradient = (values.T @ error) / len(labels) + .012 * weights
+        bias_gradient = float(error.mean())
+        trial_step = min(.16, step * 1.2)
+        for _ in range(32):
+            trial_weights = weights - trial_step * gradient
+            trial_bias = bias - trial_step * bias_gradient
+            trial_loss = loss(trial_weights, trial_bias)
+            if trial_loss <= current_loss + 1e-12:
+                weights, bias, current_loss, step = trial_weights, trial_bias, trial_loss, trial_step
+                break
+            trial_step *= .5
+        else:
+            break
     return mean, scale, weights, bias
 
 
@@ -288,6 +426,12 @@ def _roc_auc(labels: np.ndarray, scores: np.ndarray) -> float:
     order = np.argsort(scores, kind="mergesort")
     ranks = np.empty(len(scores), dtype=np.float64)
     ranks[order] = np.arange(1, len(scores) + 1, dtype=np.float64)
+    # Ties must get their average rank, otherwise a constant predictor appears
+    # better/worse solely because the filenames were enumerated in a new order.
+    sorted_scores = scores[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(sorted_scores)) + 1]
+    for start, end in zip(starts, np.r_[starts[1:], len(scores)]):
+        ranks[order[start:end]] = (start + 1 + end) / 2
     return float((ranks[labels == 1].sum() - positives * (positives + 1) / 2) / (positives * negatives))
 
 
@@ -327,7 +471,7 @@ def _balanced_group_holdout(groups: list[str], labels: np.ndarray) -> np.ndarray
         candidate = np.asarray([group in held_groups for group in groups], dtype=bool)
         if _has_class_balance(candidate, labels):
             return candidate
-    raise CalibrationError("最高星级样本分布过于集中，无法进行按连拍组隔离的校验。")
+    raise CalibrationError("人工留片样本分布过于集中，无法进行按连拍组隔离的校验。")
 
 
 def train_profile(
@@ -335,24 +479,53 @@ def train_profile(
     featured_rating: int,
     *,
     feature_pipeline: str = HANDCRAFTED_PIPELINE_ID,
+    objective: str = "featured",
+    scene_type: str = "",
+    validation_scope: str = "burst_holdout",
+    checkpoint: Callable[[], None] | None = None,
 ) -> CalibrationProfile:
     if len(samples) < 80:
         raise CalibrationError("可用于校准的原图不足 80 张。")
     labels = np.asarray([int(rating == featured_rating) for _feature, rating, _group in samples], dtype=np.int8)
     positive_count = int(labels.sum())
     if positive_count < 12 or positive_count == len(labels):
-        raise CalibrationError("最高星级样本不足，至少需要 12 张。")
+        raise CalibrationError("人工留片样本至少需要 12 张，且必须有未保留照片用于对比。")
     features = np.vstack([feature for feature, _rating, _group in samples]).astype(np.float64)
+    if not np.isfinite(features).all():
+        raise CalibrationError("画面特征含无效数值，保留旧学习结果。")
     groups = [group for _feature, _rating, group in samples]
     held_out = _balanced_group_holdout(groups, labels)
-    mean, scale, weights, bias = _fit_classifier(features[~held_out], labels[~held_out])
+    training = ~held_out
+    if validation_scope == "continuous_100_frame_blocks":
+        ordered = list(dict.fromkeys(groups))
+        held_groups = {group for group, held in zip(groups, held_out) if held}
+        held_blocks = {index for index, group in enumerate(ordered) if group in held_groups}
+        forbidden = held_blocks | {index + offset for index in held_blocks for offset in (-1,1)}
+        positions = {group:index for index,group in enumerate(ordered)}
+        training = np.asarray([positions[group] not in forbidden for group in groups])
+        if (labels[training].sum() < 8 or training.sum()-labels[training].sum() < 8):
+            raise CalibrationError("隔离相邻连续片段后，训练样本不足；不降低验证标准启用学习。")
+    mean, scale, weights, bias = _fit_classifier(features[training], labels[training], checkpoint=checkpoint)
     validation_values = (features[held_out] - mean) / scale
-    validation = _roc_auc(labels[held_out], validation_values @ weights + bias)
+    validation_scores = validation_values @ weights + bias
+    validation = _roc_auc(labels[held_out], validation_scores)
     if validation < MIN_VALIDATION_AUC:
         raise CalibrationError(
             f"这批资料的分组验证区分度只有 {validation:.0%}，不足以安全启用选片偏好校准。"
         )
-    mean, scale, weights, bias = _fit_classifier(features, labels)
+    # Match the retention fraction from TRAINING labels; never tune a threshold
+    # against the held-out filenames. AUC is not selection accuracy.
+    take = max(1, min(int(held_out.sum()), round(held_out.sum() * labels[training].mean())))
+    chosen = np.argsort(-validation_scores, kind="stable")[:take]
+    hit = int(labels[held_out][chosen].sum())
+    precision = hit / take
+    recall = hit / max(1, int(labels[held_out].sum()))
+    if objective == "retention" and (precision < MIN_RETENTION_AGREEMENT or recall < MIN_RETENTION_AGREEMENT):
+        raise CalibrationError(
+            f"原片学习留出验证：一致率 {precision:.1%}、找回率 {recall:.1%}，"
+            f"未达到各 {MIN_RETENTION_AGREEMENT:.0%} 的启用门槛；未替换当前偏好，保留基础筛选。"
+        )
+    mean, scale, weights, bias = _fit_classifier(features, labels, checkpoint=checkpoint)
     return CalibrationProfile(
         mean=tuple(float(value) for value in mean),
         scale=tuple(float(value) for value in scale),
@@ -363,7 +536,29 @@ def train_profile(
         positive_examples=positive_count,
         validation_auc=validation,
         feature_pipeline=feature_pipeline,
+        objective=objective, scene_type=scene_type,
+        validation_precision=precision, validation_recall=recall,
+        validation_f1=2 * precision * recall / max(precision + recall, 1e-12),
+        validation_examples=int(held_out.sum()), validation_scope=validation_scope,
     )
+
+
+def blocked_validation_groups(groups: list[str], minimum_frames: int = 100) -> list[str]:
+    """Keep whole bursts in coarse continuous blocks for honest validation.
+
+    Hash groups can fragment one scene. These larger blocks reduce adjacent
+    frame leakage; they are not a claim of semantic scene/identity recognition.
+    Used ONLY for splitting labels, never as an input to the classifier.
+    """
+    blocks, block, count, previous = [], 0, 0, None
+    for group in groups:
+        if count >= minimum_frames and group != previous:
+            block += 1
+            count = 0
+        blocks.append(f"continuous-block-{block}")
+        count += 1
+        previous = group
+    return blocks
 
 
 def build_profile(
@@ -372,13 +567,16 @@ def build_profile(
     original_folders: list[Path],
     *,
     progress_callback: Callable[[int, int, Path], None] | None = None,
+    checkpoint: Callable[[], None] | None = None,
 ) -> CalibrationProfile:
     """Build a profile from an app log, kept filenames, and originals."""
     rows = _log_rows(log_path)
     selected_stems = exported_selection_stems(exported_folder)
     if not selected_stems:
         raise CalibrationError("人工选片文件夹中没有读取到 JPG 或 RAW 文件名。")
-    featured_rating = 3
+    # Final original deliveries teach retention, not retouch candidacy. There
+    # is no evidence here that every exported original is an ideal final hero.
+    featured_rating = 1
     if not set(rows).intersection(selected_stems):
         raise CalibrationError("人工选片文件名与筛选日志没有匹配；请确认导出时没有重命名照片。")
     sources = _source_previews(original_folders, set(rows), excluded_folders=[exported_folder])
@@ -387,29 +585,45 @@ def build_profile(
     for index, (stem, path) in enumerate(items, start=1):
         group, _old_rating = rows[stem]
         source_rows.append((stem, group, path, featured_rating if stem in selected_stems else 0))
-        if progress_callback:
-            progress_callback(index, len(items), path)
-    images: list[np.ndarray] = []
-    usable_rows: list[tuple[str, str, Path, int]] = []
-    for row in source_rows:
-        try:
-            images.append(_load_preview(row[2]))
-            usable_rows.append(row)
-        except Exception:
-            continue
+    if selected_stems - set(sources):
+        raise CalibrationError("人工结果存在无法唯一对应的原片，不能安全学习；请检查重命名或同名文件。")
+    blocks = blocked_validation_groups([row[1] for row in source_rows])
+    # Small feedback sets cannot form several 100-frame blocks. Keep the old
+    # whole-burst split and explicitly report its weaker validation scope.
+    blocked = len(set(blocks)) >= 5
+    if not blocked:
+        blocks = [row[1] for row in source_rows]
     pipeline = _preferred_feature_pipeline()
+
+    def samples_for(selected_pipeline):
+        return [
+            (feature, source_rows[index][3], blocks[index])
+            for index, feature in _feature_rows(
+                [row[2] for row in source_rows], selected_pipeline,
+                progress_callback=progress_callback, checkpoint=checkpoint,
+            )
+        ]
+
     try:
-        features = _feature_matrix(images, pipeline)
+        samples = samples_for(pipeline)
     except CalibrationError:
         # A damaged optional deep runtime must never block the proven local
         # pipeline. The saved profile records the fallback explicitly.
         pipeline = HANDCRAFTED_PIPELINE_ID
-        features = _feature_matrix(images, pipeline)
-    samples = [
-        (feature, row[3], row[1])
-        for feature, row in zip(features, usable_rows)
-    ]
-    return train_profile(samples, featured_rating, feature_pipeline=pipeline)
+        samples = samples_for(pipeline)
+    if checkpoint:
+        checkpoint()
+    scene_type = "通用"
+    if log_path.suffix.lower() == ".json":
+        payload = json.loads(log_path.read_text(encoding="utf-8"))
+        scene_type = str((payload.get("settings") or {}).get("scene_type") or scene_type)
+    profile = train_profile(samples, featured_rating, feature_pipeline=pipeline,
+                            objective="retention", scene_type=scene_type,
+                            validation_scope="continuous_100_frame_blocks" if blocked else "burst_holdout",
+                            checkpoint=checkpoint)
+    if checkpoint:
+        checkpoint()
+    return profile
 
 
 def apply_profile(
@@ -417,31 +631,32 @@ def apply_profile(
     profile: CalibrationProfile,
     *,
     progress_callback: Callable[[int, int, Path], None] | None = None,
+    checkpoint: Callable[[], None] | None = None,
+    protected_paths: frozenset[Path] = frozenset(),
+    options: AnalysisOptions | None = None,
 ) -> int:
-    """Re-rank only the featured tier; selection coverage remains untouched."""
-    existing_featured = sum(item.suggested_rating == 3 for item in results)
-    candidates = [item for item in results if item.suggested_rating > 0]
+    """Apply only the saved objective; old retouch profiles stay retouch-only."""
+    if getattr(profile, "objective", "featured") == "retention":
+        return _apply_retention_profile(results, profile, options=options,
+                                        progress_callback=progress_callback, checkpoint=checkpoint,
+                                        protected_paths=protected_paths)
+    existing_featured = sum(item.suggested_rating == 3 and item.path not in protected_paths for item in results)
+    # Existing/manual two-star photos must never be promoted or demoted by
+    # this automatic pass, even if a caller did not supply protected_paths.
+    candidates = [item for item in results if item.suggested_rating in AUTOMATIC_RATINGS - {0}
+                  and item.path not in protected_paths and not item.featured_blocked
+                  and item.max_auto_rating >= 3]
     if not candidates or existing_featured == 0:
         return 0
-    candidates_with_images: list[tuple[PhotoResult, np.ndarray]] = []
-    for index, item in enumerate(candidates, start=1):
-        visual = next((path for path in item.pair_paths if path.suffix.lower() in {".jpg", ".jpeg"}), item.path)
-        try:
-            candidates_with_images.append((item, _load_preview(visual)))
-        except Exception:
-            continue
-        if progress_callback:
-            progress_callback(index, len(candidates), item.path)
-    try:
-        features = _feature_matrix(
-            [image for _item, image in candidates_with_images], profile.feature_pipeline
-        )
-    except CalibrationError:
-        raise
+    paths = [next((path for path in item.pair_paths if path.suffix.lower() in {".jpg", ".jpeg"}), item.path)
+             for item in candidates]
     probabilities: dict[Path, float] = {}
-    for (item, _image), feature in zip(candidates_with_images, features):
+    for index, feature in _feature_rows(paths, profile.feature_pipeline,
+                                       progress_callback=progress_callback, checkpoint=checkpoint):
+        item = candidates[index]
         probability = profile.probability_for_feature(feature)
-        item.calibration_confidence = probability
+        # Legacy retouch profiles must not leak a retention score into the
+        # shared original selection strategy on a later ranking pass.
         probabilities[item.path] = probability
     if not probabilities:
         raise CalibrationError("当前照片无法生成校准特征，已保留原有推荐。")
@@ -460,14 +675,95 @@ def apply_profile(
         reverse=True,
     )[:existing_featured]
     featured_paths = {item.path for item in ranked}
+    if checkpoint:
+        checkpoint()
     for item in results:
+        if item.path in protected_paths:
+            continue
         if item.suggested_rating == 3 and item.path not in featured_paths:
-            item.suggested_rating = 2
-            item.reasons = [reason for reason in item.reasons if reason not in {"本组最佳", "Best in group"}]
-            item.reasons.append("选片偏好校准后保留为优质备用" if profile.featured_rating else "Selection preference tuning kept this as a backup")
+            item.suggested_rating = automatic_rating(retained=True, featured=False)
+            item.reasons = [reason for reason in item.reasons if reason not in {
+                "本组最佳", "Best in group", "精修候选：本组优选", "Retouch candidate: best in group",
+            }]
+            item.reasons.append("偏好校准后保留原片，未列为精修候选")
         elif item.path in featured_paths:
             item.suggested_rating = 3
-            item.reasons = [reason for reason in item.reasons if reason not in {"本组最佳", "Best in group"}]
+            item.reasons = [reason for reason in item.reasons if reason not in {
+                "本组最佳", "Best in group", "精修候选：本组优选", "Retouch candidate: best in group", "原片保留",
+            }]
             confidence = probabilities[item.path]
             item.reasons.append(f"选片偏好校准 3★ 置信度 {confidence:.0%}")
     return len(featured_paths)
+
+
+def _apply_retention_profile(results, profile, *, options, progress_callback, checkpoint, protected_paths):
+    """Transactionally change original delivery, preserving manual decisions.
+
+    Originals are scored even when the base rules did not select them. Technical
+    hard gates still run, and a learned original score NEVER upgrades retouch
+    evidence. Use the engine's groups and rating policy, not a second culler.
+    """
+    from event_cull import engine
+    options = options or AnalysisOptions(scene_type=profile.scene_type or "通用")
+    if not options.ai_selection_enabled or (profile.scene_type and profile.scene_type != options.scene_type):
+        return 0
+    protected = protected_paths | frozenset(item.path for item in results if item.suggested_rating == 2)
+    working = copy.deepcopy([item for item in results if item.path not in protected])
+    if not working:
+        return 0
+    missing, indexes = [], []
+    for index, item in enumerate(working):
+        if checkpoint:
+            checkpoint()
+        if item.visual_feature_pipeline == profile.feature_pipeline and item.visual_features:
+            item.calibration_confidence = profile.probability_for_feature(np.asarray(item.visual_features))
+        else:
+            missing.append(next((p for p in item.pair_paths if p.suffix.lower() in {".jpg", ".jpeg"}), item.path))
+            indexes.append(index)
+    for index, feature in _feature_rows(missing, profile.feature_pipeline,
+                                       progress_callback=progress_callback, checkpoint=checkpoint):
+        working[indexes[index]].calibration_confidence = profile.probability_for_feature(feature)
+    if any(item.calibration_confidence is None for item in working):
+        raise CalibrationError("部分原片无法生成学习特征，已保留完整基础结果。")
+    manual_kept = sum(item.suggested_rating > 0 for item in results if item.path in protected)
+    original_count = sum(item.suggested_rating > 0 for item in results)
+    floor = max(0, (options.target_keep_count if options.target_keep_count is not None else original_count) - manual_kept)
+    ceiling = max(floor, (options.target_keep_max_count if options.target_keep_max_count is not None else original_count) - manual_kept)
+    # Learn delivery density, not a demand to fill every slot of the maximum.
+    # Only TRAINING positive counts contribute; the user's minimum/maximum
+    # remain authoritative. A 20% original delivery should not automatically
+    # become 24% just because 1,200 is an allowed ceiling for 5,000 frames.
+    learned_count = round(len(results) * profile.positive_examples / max(1, profile.training_examples)) - manual_kept
+    desired = max(floor, min(ceiling, learned_count))
+    # Engine uses a minimum of one when passed zero. A fully manual pool needs
+    # no automatic slots at all; don't add a hidden extra original.
+    if desired == 0:
+        for item in working:
+            item.suggested_rating = 0
+    else:
+        selection_reasons = {engine._message(options, key) for key in ("target", "review", "backup", "best", "single_scene")}
+        for item in working:
+            item.reasons = [reason for reason in item.reasons if reason not in selection_reasons]
+        by_group = {}
+        for item in working:
+            by_group.setdefault(item.group_id, []).append(item)
+        engine._assign_tiered_ratings(list(by_group.values()), replace(options, target_keep_count=floor,
+                                                                      target_keep_max_count=desired))
+    if checkpoint:
+        checkpoint()
+    updated = {item.path: item for item in working}
+    for item in results:
+        if item.path in updated:
+            replacement = updated[item.path]
+            item.suggested_rating = replacement.suggested_rating
+            item.calibration_confidence = replacement.calibration_confidence
+            item.reasons = replacement.reasons
+            item.featured_blocked = replacement.featured_blocked
+            item.max_auto_rating = replacement.max_auto_rating
+            item.rule_ids = replacement.rule_ids
+            item.rule_version = replacement.rule_version
+            item.content_type = replacement.content_type
+            item.relative_exposure_ev = replacement.relative_exposure_ev
+            item.scene_protected = replacement.scene_protected
+            item.coverage_protected = replacement.coverage_protected
+    return sum(item.suggested_rating > 0 for item in working)

@@ -25,7 +25,7 @@ def test_target_count_keeps_one_lead_per_group_before_filling_global_slots(monke
 
     results = engine.analyze_folder(tmp_path, AnalysisOptions(target_keep_count=2))
 
-    assert [item.suggested_rating for item in results] == [3, 0, 2, 0]
+    assert [item.suggested_rating for item in results] == [3, 0, 1, 0]
 
 
 def test_single_capture_stays_in_review_instead_of_becoming_an_unrated_reject(monkeypatch, tmp_path: Path):
@@ -39,7 +39,7 @@ def test_single_capture_stays_in_review_instead_of_becoming_an_unrated_reject(mo
     results = engine.analyze_folder(tmp_path)
 
     assert results[0].suggested_rating == 3
-    assert "本组最佳" in results[0].reasons
+    assert "精修候选：本组优选" in results[0].reasons
 
 
 def test_relative_subject_darkening_is_a_flash_misfire_and_is_not_selected(tmp_path: Path):

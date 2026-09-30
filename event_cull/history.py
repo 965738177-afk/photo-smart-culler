@@ -45,6 +45,8 @@ def load_history(path: Path | None = None) -> list[dict[str, object]]:
     try:
         payload = json.loads(source.read_text(encoding="utf-8"))
         records = payload.get("tasks", []) if isinstance(payload, dict) else []
+        if not isinstance(records, list):
+            return []
         return [record for record in records if isinstance(record, dict)]
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return []

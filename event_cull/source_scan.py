@@ -14,7 +14,7 @@ _CURATED_FOLDER_NAMES = {"选", "已选", "selected"}
 
 
 def scan_source_images(
-    folders: Iterable[Path], *, excluded_folders: Iterable[Path] = ()
+    folders: Iterable[Path], *, excluded_folders: Iterable[Path] = (),recursive: bool = True
 ) -> list[Path]:
     """Find originals without re-importing app exports or nested selections.
 
@@ -37,10 +37,12 @@ def scan_source_images(
                     and name.casefold() not in _CURATED_FOLDER_NAMES
                     and not (Path(parent) / name / EXPORT_MARKER).is_file()
                 ]
+                if not recursive:
+                    directories[:] = []
                 files.extend(
                     Path(parent, name)
                     for name in sorted(filenames, key=str.casefold)
-                    if Path(name).suffix.lower() in IMAGE_EXTENSIONS
+                    if not name.startswith(".") and Path(name).suffix.lower() in IMAGE_EXTENSIONS
                 )
         except OSError:
             continue

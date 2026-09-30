@@ -63,13 +63,14 @@ def test_result_filter_can_show_all_or_one_exact_rating():
     assert EventCullApp._matches_rating_filter(0, 0)
 
 
-def test_chinese_filter_names_make_the_one_star_review_tier_explicit():
-    assert TEXT["zh"]["filter_one"] == "仅 1★ 初选复核"
+def test_chinese_filter_names_make_retention_and_manual_confirmation_explicit():
+    assert TEXT["zh"]["filter_one"] == "仅 1★ 原片保留"
+    assert TEXT["zh"]["filter_two"] == "仅 2★ 人工确认"
 
 
-def test_output_star_mapping_keeps_engine_tiers_but_supports_four_and_five_stars():
+def test_output_star_mapping_cannot_repurpose_reserved_manual_two_stars():
     assert [EventCullApp._mapped_rating(tier, 2, 3) for tier in range(4)] == [0, 1, 2, 3]
-    assert [EventCullApp._mapped_rating(tier, 4, 5) for tier in range(4)] == [0, 1, 4, 5]
+    assert [EventCullApp._mapped_rating(tier, 4, 5) for tier in range(4)] == [0, 1, 2, 3]
 
 
 def test_repeat_import_appends_without_duplicate_files(tmp_path: Path):
@@ -281,6 +282,7 @@ def test_picker_summary_makes_active_detection_rules_explicit():
 
 def test_start_analysis_opens_rule_confirmation_before_any_analysis_work():
     app = object.__new__(EventCullApp)
+    app.analysis_running = False
     app.imported_files = [Path("/photos/IMG_0001.ARW")]
     app.picker_settings_confirmed = False
     app.show_picker_settings = lambda: setattr(app, "settings_opened", True)

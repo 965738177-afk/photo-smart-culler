@@ -15,6 +15,7 @@ import os
 import platform
 import re
 import subprocess
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,6 +46,10 @@ MCowBQYDK2VwAyEA1CAsOl2e38HRIYgTtYoRNbbw2ovbZWBUgjff1txk82o=
 
 class LicenseError(RuntimeError):
     """A concise error that is safe to show in the desktop UI."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class AccessState(str, Enum):
@@ -192,12 +197,17 @@ def evaluate_lease(lease: LicenseLease | None, *, now: datetime | None = None) -
 def license_label(decision: LicenseDecision) -> str:
     """Short status for the always-visible desktop authorization entry."""
     lease = decision.lease
+    # A cached lifetime entitlement remains activated when its offline window
+    # expires; verification is still required by the unchanged access gate.
+    if lease is not None and lease.plan is LicensePlan.LIFETIME:
+        if decision.allows_analysis:
+            return "已激活"
+        if decision.state is AccessState.OFFLINE_GRACE_EXPIRED:
+            return "已激活 · 待验证"
     if not decision.allows_analysis or lease is None:
         return "开始试用 / 激活"
     if lease.team_name:
         return "团队授权"
-    if lease.plan is LicensePlan.LIFETIME:
-        return "永久版已激活"
     if lease.subscription_until is None:
         return "授权有效"
     remaining = max(0, int((lease.subscription_until - datetime.now(UTC)).total_seconds()))
@@ -216,6 +226,8 @@ class LicenseService:
     def __init__(self, *, api_url: str | None = None) -> None:
         configured = os.environ.get("MIAOXUAN_LICENSE_API_URL", "")
         self.api_url = (api_url or configured or LICENSE_API_URL).rstrip("/")
+        self._secret_cache: dict[str, str | None] = {}
+        self._secret_lock = threading.RLock()
 
     @staticmethod
     def _keyring():
@@ -235,18 +247,31 @@ class LicenseService:
         return keyring, KeyringError
 
     def _read_secret(self, account: str) -> str | None:
-        keyring, keyring_error = self._keyring()
-        try:
-            return keyring.get_password(KEYRING_SERVICE, account)
-        except keyring_error as exc:
-            raise LicenseError("无法读取系统安全凭据，请检查当前用户的系统账户权限。") from exc
+        with self._secret_lock:
+            if account in self._secret_cache:
+                return self._secret_cache[account]
+            keyring, keyring_error = self._keyring()
+            try:
+                value = keyring.get_password(KEYRING_SERVICE, account)
+            except keyring_error as exc:
+                raise LicenseError("无法读取系统安全凭据，请检查当前用户的系统账户权限。") from exc
+            self._secret_cache[account] = value
+            return value
 
     def _write_secret(self, account: str, value: str) -> None:
-        keyring, keyring_error = self._keyring()
-        try:
-            keyring.set_password(KEYRING_SERVICE, account, value)
-        except keyring_error as exc:
-            raise LicenseError("无法写入系统安全凭据，请检查当前用户的系统账户权限。") from exc
+        with self._secret_lock:
+            keyring, keyring_error = self._keyring()
+            try:
+                if platform.system() == "Darwin":
+                    # keyring's macOS setter deletes/recreates the item,
+                    # resetting its ACL; SecItemUpdate preserves that ACL.
+                    from event_cull.secure_store import update_macos_secret
+                    update_macos_secret(KEYRING_SERVICE, account, value)
+                else:
+                    keyring.set_password(KEYRING_SERVICE, account, value)
+            except (keyring_error, RuntimeError) as exc:
+                raise LicenseError("无法写入系统安全凭据，请检查当前用户的系统账户权限。") from exc
+            self._secret_cache[account] = value
 
     def device_id(self) -> str:
         existing = self._read_secret(DEVICE_ID_ACCOUNT)
@@ -441,7 +466,7 @@ class LicenseService:
                 detail = json.loads(exc.read()).get("detail")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 detail = None
-            raise LicenseError(str(detail or "授权服务暂时不可用，请稍后重试。")) from exc
+            raise LicenseError(str(detail or "授权服务暂时不可用，请稍后重试。"), status_code=exc.code) from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise LicenseError("无法连接授权服务，请检查网络后重试。") from exc
         if not isinstance(data, dict):
@@ -494,6 +519,7 @@ class LicenseController:
     def __init__(self, *, frozen: bool | None = None, service: LicenseService | None = None) -> None:
         self.frozen = bool(getattr(__import__("sys"), "frozen", False)) if frozen is None else frozen
         self.service = service or LicenseService()
+        self._refresh_lock = threading.Lock()
         try:
             self.lease = self.service.cached_lease()
         except LicenseError:
@@ -528,8 +554,28 @@ class LicenseController:
         return self.lease
 
     def refresh(self) -> LicenseLease:
-        self.lease = self.service.refresh()
-        return self.lease
+        # Manual and scheduled renewals share the same boundary. A temporary
+        # network failure must not erase a still-valid signed offline lease.
+        with self._refresh_lock:
+            try:
+                self.lease = self.service.refresh()
+            except LicenseError as exc:
+                if exc.status_code in {401, 403}:
+                    self.lease = None
+                    self.service._write_secret(LEASE_ACCOUNT, "")
+                raise
+            return self.lease
+
+    def refresh_due(self, *, now: datetime | None = None) -> bool:
+        """Renew signed leases daily or before a shorter server window ends."""
+        if not self.frozen or INTERNAL_DEVELOPER_BUILD or self.lease is None:
+            return False
+        now = now or datetime.now(UTC)
+        return (
+            now - self.lease.issued_at >= timedelta(hours=24)
+            or (self.lease.offline_until is not None
+                and self.lease.offline_until - now <= timedelta(hours=4))
+        )
 
 
 def _email(value: str) -> str:

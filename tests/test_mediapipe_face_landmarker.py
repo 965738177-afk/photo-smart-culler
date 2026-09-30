@@ -92,7 +92,7 @@ def test_tasks_adapter_converts_rgb_array_and_returns_landmarks(
     )
     model_path = tmp_path / "face_landmarker.task"
     adapter = MediaPipeTasksFaceLandmarker(model_path)
-    rgb = np.arange(60, dtype=np.uint8).reshape(4, 5, 3)[:, ::-1]
+    rgb = np.arange(96, dtype=np.uint8).reshape(4, 8, 3)[:, ::-1]
 
     assert adapter.detect_landmarks(rgb) == expected_landmarks
     assert created["options"].base_options.model_asset_path == str(model_path)

@@ -2,6 +2,10 @@ sample*/
 !tests/samples/
 /models/
 
+# Pinned offline content assets are reproduced by a build-time preparation
+# script; keep multi-GB weights and native runtime downloads out of Git.
+event_cull/vendor/content/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

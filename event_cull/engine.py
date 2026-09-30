@@ -12,7 +12,9 @@ import tempfile
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from collections import deque
+import copy
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable
@@ -21,6 +23,14 @@ from uuid import uuid4
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
+from event_cull.rating_policy import automatic_rating
+from event_cull.wedding_rules import (
+    CONTENT_TYPES, RULE_VERSION, add_evidence, apply_evidence_gates, eye_neutral,
+)
+from event_cull.wedding_content import (
+    ContentModelCancelled, LocalWeddingContentModel, BundledWeddingContentModel, validate_observation,
+)
+from event_cull.bundled_inference import InferenceBudgetExpired
 
 try:
     import rawpy
@@ -36,7 +46,7 @@ RAW_EXTENSIONS = {".arw", ".cr2", ".cr3", ".dng", ".nef", ".orf", ".raf", ".rw2"
 HEIC_EXTENSIONS = {".heic", ".heif"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", *HEIC_EXTENSIONS, *RAW_EXTENSIONS}
 ATMOSPHERE_PORTRAIT_SCENE = "男生氛围写真"
-ANALYSIS_CACHE_VERSION = 13
+ANALYSIS_CACHE_VERSION = 15
 MAX_ANALYSIS_WORKERS = 8
 _DETECTORS = threading.local()
 _EMOTION_MODEL = Path("event_cull/models/emotion-ferplus-8.onnx")
@@ -72,9 +82,9 @@ MESSAGES = {
         "soft_scene": "连续场景整体偏柔，可能是头纱或前景遮挡，保留代表画面复核",
         "scene_coverage": "连续场景保底：不依赖人脸，保留代表画面复核",
         "single_scene": "独立场景代表：无相似连拍，保留供复核",
-        "best": "本组最佳",
-        "backup": "优质备用",
-        "review": "初选复核",
+        "best": "精修候选：本组优选",
+        "backup": "人工确认",
+        "review": "原片保留",
         "target": "未进入目标选图数量",
         "failed": "无法分析：{error}",
     },
@@ -99,9 +109,9 @@ MESSAGES = {
         "soft_scene": "The continuous scene is uniformly soft, possibly through a veil or foreground layer; keep a representative frame for review",
         "scene_coverage": "Continuous-scene safeguard: keep a representative frame regardless of face detection",
         "single_scene": "Independent scene representative: no similar burst, retained for review",
-        "best": "Best in group",
-        "backup": "Strong backup",
-        "review": "Review selection",
+        "best": "Retouch candidate: best in group",
+        "backup": "Manual confirmation",
+        "review": "Retained original",
         "target": "Outside the target selection count",
         "failed": "Could not analyze: {error}",
     },
@@ -164,6 +174,19 @@ class AnalysisOptions:
     fill_with_similar: bool = False
     scene_type: str = "通用"
     language: str = "zh"
+    wedding_content_type: str = "自动（保守）"
+    content_model_enabled: bool = False
+    content_model_name: str = "qwen3-vl:4b"
+    # Keep the historical API opt-in full mode; the desktop explicitly chooses
+    # bounded review. Disabling the model still uses the unchanged fast path.
+    content_review_mode: str = "full"
+    # Supplied only for an applicable personal profile. Share the analysis
+    # preview, so preference scoring never needs a second full RAW pass.
+    calibration_feature_pipeline: str = ""
+    # Experimental until independent retention and speed gates pass. Enabling
+    # this never enables the language model or changes a user's active profile.
+    human_analysis_enabled: bool = False
+    human_face_recovery_enabled: bool = False
 
 
 @dataclass
@@ -193,6 +216,16 @@ class PhotoResult:
     scene_protected: bool = False
     coverage_protected: bool = False
     must_keep_id: str | None = None
+    # Derived on every ranking pass, never reused from the feature cache.
+    featured_blocked: bool = False
+    max_auto_rating: int = 3
+    rule_version: str = ""
+    rule_ids: list[str] = field(default_factory=list)
+    content_type: str = "auto"
+    content_evidence: dict = field(default_factory=dict)
+    visual_features: list[float] = field(default_factory=list)
+    visual_feature_pipeline: str = ""
+    person_evidence: dict = field(default_factory=dict)
 
     @property
     def display_name(self) -> str:
@@ -224,15 +257,22 @@ def _representatives(paths: list[Path]) -> list[tuple[Path, list[Path]]]:
 
 def _paths_for_selected_files(paths: list[Path]) -> list[Path]:
     """Include companions so dropping either half of RAW+JPG keeps the pair."""
+    requested: dict[Path, set[str]] = {}
     expanded: set[Path] = set()
     for path in paths:
         if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
-        expanded.update(
-            sibling
-            for sibling in path.parent.glob(f"{path.stem}.*")
-            if sibling.is_file() and sibling.suffix.lower() in IMAGE_EXTENSIONS
-        )
+        expanded.add(path)
+        requested.setdefault(path.parent, set()).add(path.stem.casefold())
+    # One directory scan per source, not one glob per frame (quadratic for
+    # 5,000 imports). Literal stems also avoid glob metacharacter mispairing.
+    for folder, stems in requested.items():
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                sibling = Path(entry.path)
+                if (sibling.stem.casefold() in stems and sibling.suffix.lower() in IMAGE_EXTENSIONS
+                        and entry.is_file()):
+                    expanded.add(sibling)
     return sorted(expanded)
 
 
@@ -477,6 +517,11 @@ def _eye_policy(
     if not options.detect_closed_eyes:
         return EyePolicy("disabled")
 
+    if options.scene_type == "婚礼" and CONTENT_TYPES.get(options.wedding_content_type) in {
+        "documentary", "portrait", "dynamic", "details",
+    }:
+        return EyePolicy("wedding_content_eye_neutral")
+
     if options.scene_type == "美食":
         return EyePolicy("food_no_eye_check")
 
@@ -509,12 +554,16 @@ def _eye_policy(
         return EyePolicy(f"{mode_prefix}_no_face")
     if face_coverage < 0.05:
         return EyePolicy(f"{mode_prefix}_small_face", reason_key="eye_skip")
-    if closest_face_distance is not None and closest_face_distance < 1.5:
+    if closest_face_distance is not None and closest_face_distance < 1.5 and (
+        options.scene_type != "婚礼" or face_count <= 2
+    ):
         return EyePolicy(f"{mode_prefix}_intimate", reason_key="eye_intimate")
     if face_count >= 3:
         if open_eye_count == 0:
             return EyePolicy(f"{mode_prefix}_group_all_closed", penalty=8.0, reason_key="eye_group_closed")
         if open_eye_count < face_count:
+            if options.scene_type == "婚礼":
+                return EyePolicy(f"{mode_prefix}_group", reason_key="expression")
             return EyePolicy(f"{mode_prefix}_group", reason_key="eye_group_tolerated")
         return EyePolicy(f"{mode_prefix}_group")
     if open_eye_count == 0:
@@ -632,7 +681,11 @@ def _face_metrics(
         clear_faces,
         key=lambda item: item[0][2] * item[0][3],
         reverse=True,
-    )[:8]
+    )
+    # Wedding group comparisons need a matching numerator and denominator:
+    # examining only eight faces makes a ten-person group look partly closed.
+    if options.scene_type != "婚礼":
+        smile_candidates = smile_candidates[:8]
     for (x, y, width, height), _sharpness in smile_candidates:
         upper_face = gray[y : y + height // 2, x : x + width]
         eye_minimum = (max(10, width // 8), max(10, height // 10))
@@ -690,6 +743,7 @@ def _face_metrics(
         face_coverage,
         closest_face_distance,
         eye_policy,
+        distinct,
     )
 
 
@@ -752,9 +806,14 @@ def _write_analysis_cache(items: dict[str, dict]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _human_model_signature(*, recover_faces=False):
+    from src.core.image_features.human_analysis import model_signature
+    return model_signature(recover_faces=recover_faces)
+
+
 def _cache_signature(source: Path, options: AnalysisOptions) -> dict:
     stat = source.stat()
-    return {
+    signature = {
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
         "blur_floor": options.blur_floor,
@@ -764,13 +823,54 @@ def _cache_signature(source: Path, options: AnalysisOptions) -> dict:
         "detect_exposure": options.detect_exposure,
         "scene_type": options.scene_type,
         "language": options.language,
+        "wedding_rule_version": RULE_VERSION if options.scene_type == "婚礼" else "",
+        "wedding_content_type": options.wedding_content_type,
+        "content_model_enabled": options.content_model_enabled,
+        "content_model_name": options.content_model_name,
+        "calibration_feature_pipeline": options.calibration_feature_pipeline,
+        "human_analysis_enabled": options.human_analysis_enabled,
+        "human_model_signature": (_human_model_signature(recover_faces=True) if options.human_face_recovery_enabled
+                                  else _human_model_signature()) if options.human_analysis_enabled else "",
     }
+    if options.human_face_recovery_enabled:
+        from src.core.image_features.face_analysis import FACE_REGION_PIPELINE
+        signature["human_face_region_pipeline"] = FACE_REGION_PIPELINE
+    return signature
 
 
 def _result_from_cache(photo: Path, pairs: list[Path], record: dict, signature: dict) -> PhotoResult | None:
     if record.get("signature") != signature:
         return None
     try:
+        visual = record.get("visual_features") or []
+        visual_pipeline = str(record.get("visual_feature_pipeline") or "")
+        wanted_pipeline = signature.get("calibration_feature_pipeline", "")
+        # The feature builder owns descriptor dimensions, including opt-in
+        # provider-isolated versions. Same-length-but-wrong-version is rejected
+        # separately by the signature and wanted-pipeline checks below.
+        from event_cull.calibration import FEATURE_DIMENSIONS as dimensions
+        if (not isinstance(visual, list) or any(not isinstance(v, (int,float)) for v in visual)
+                or (visual and not np.isfinite(visual).all())
+                or (wanted_pipeline and (visual_pipeline != wanted_pipeline or not visual))
+                or (visual and visual_pipeline in dimensions and len(visual) != dimensions[visual_pipeline])):
+            return None
+        evidence = record.get("content_evidence", {})
+        if not isinstance(evidence, dict):
+            return None
+        person = record.get("person_evidence", {})
+        if signature.get("human_analysis_enabled"):
+            from src.core.image_features.human_analysis import validate_observation as validate_person
+            validate_person(person,require_details=True)
+            if (signature.get("human_face_region_pipeline")
+                    and person.get("region_pipeline") != signature["human_face_region_pipeline"]):
+                return None
+        if evidence.get("status") == "ok":
+            validate_observation(evidence, {f"W{i:03}" for i in range(1, 241)})
+            if (evidence.get("content_type") not in CONTENT_TYPES.values()
+                    or type(evidence.get("section")) is not int or not 5 <= evidence["section"] <= 22):
+                return None
+        if not isinstance(record["reasons"], list) or any(not isinstance(reason, str) for reason in record["reasons"]):
+            return None
         legacy_eye_hints = {"疑似闭眼，请复核", "Possible closed eyes — review"}
         reasons = [
             _message(AnalysisOptions(language=signature.get("language", "zh")), "closed")
@@ -818,6 +918,10 @@ def _result_from_cache(photo: Path, pairs: list[Path], record: dict, signature: 
                 if record.get("must_keep_id")
                 else None
             ),
+            content_evidence=dict(evidence),
+            visual_features=visual,
+            visual_feature_pipeline=visual_pipeline,
+            person_evidence=dict(person),
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -827,7 +931,8 @@ def _cache_record(result: PhotoResult, signature: dict) -> dict:
     return {
         "signature": signature,
         "score": result.score,
-        "reasons": result.reasons,
+        # Ranking adds reasons later. Never let it contaminate base evidence.
+        "reasons": list(result.reasons),
         "sharpness": result.sharpness,
         "highlight_clip": result.highlight_clip,
         "shadow_clip": result.shadow_clip,
@@ -843,6 +948,10 @@ def _cache_record(result: PhotoResult, signature: dict) -> dict:
         "median_luminance": result.median_luminance,
         "subject_luminance": result.subject_luminance,
         "must_keep_id": result.must_keep_id,
+        "content_evidence": dict(result.content_evidence),
+        "visual_features": list(result.visual_features),
+        "visual_feature_pipeline": result.visual_feature_pipeline,
+        "person_evidence": dict(result.person_evidence),
     }
 
 
@@ -887,7 +996,8 @@ def _must_keep_rule_exempts_eye_penalty(rule: MustKeepShot) -> bool:
     )
 
 
-def _analyze(path: Path, pairs: list[Path], options: AnalysisOptions) -> PhotoResult:
+def _analyze(path: Path, pairs: list[Path], options: AnalysisOptions,
+             content_model: LocalWeddingContentModel | None = None, *, human_model=None) -> PhotoResult:
     image = _load_preview(_analysis_source(path, pairs))
     if max(image.shape[:2]) > 1600:
         scale = 1600 / max(image.shape[:2])
@@ -947,7 +1057,9 @@ def _analyze(path: Path, pairs: list[Path], options: AnalysisOptions) -> PhotoRe
         )
     quality = min(effective_sharpness / max(options.blur_floor, 1), 3.0) * 25
     quality += (1 - min(highlights + shadows, 0.5) / 0.5) * 25
-    if options.prefer_people and options.scene_type != ATMOSPHERE_PORTRAIT_SCENE:
+    neutral_type = (options.scene_type == "婚礼" and CONTENT_TYPES.get(options.wedding_content_type) in {
+        "documentary", "portrait", "dynamic", "details"})
+    if options.prefer_people and options.scene_type != ATMOSPHERE_PORTRAIT_SCENE and not neutral_type:
         quality += _people_priority_bonus(frontal_faces, smiling_faces)
     result = PhotoResult(
         path,
@@ -969,11 +1081,43 @@ def _analyze(path: Path, pairs: list[Path], options: AnalysisOptions) -> PhotoRe
         median_luminance=median_luminance,
         subject_luminance=subject_luminance,
     )
+    if human_model is not None:
+        try:
+            result.person_evidence = human_model.inspect(
+                cv2.cvtColor(image,cv2.COLOR_BGR2RGB), face_regions=metrics[9] if len(metrics)>9 else ())
+        except AnalysisCancelled:
+            raise
+        except Exception as exc:
+            # A model failure is not a photo defect, and must be retried rather
+            # than permanently cached as absent people or closed eyes.
+            result.person_evidence = {"status":"error","error":str(exc)[:160]}
+    if options.calibration_feature_pipeline:
+        # Calibration owns the descriptor/model, analysis owns decoding. A
+        # broken optional encoder must not make a readable photo a failed row.
+        from event_cull.calibration import CalibrationError, _feature_matrix
+        try:
+            result.visual_features = _feature_matrix([image], options.calibration_feature_pipeline)[0].tolist()
+            result.visual_feature_pipeline = options.calibration_feature_pipeline
+        except CalibrationError:
+            pass
     if _subject_motion_fault(result, options):
         blur_reason = _message(options, "blur")
         if blur_reason not in result.reasons:
             result.reasons.append(blur_reason)
+    if severe_underexposure and _lit_wedding_subject(result, options):
+        result.reasons = [reason for reason in result.reasons if reason != _message(options, "under")]
+        result.reasons.append("暗背景但人物亮度与清晰度通过：不按整体阴影比例淘汰"
+                              if options.language == "zh" else "Dark background with a measurable usable face")
     _apply_must_keep_rule(result, options)
+    if content_model is not None:
+        if _has_hard_fault(result, options):
+            result.content_evidence = {"status": "skipped", "error": "技术检查未通过，未运行内容模型"}
+        else:
+            # Share the already decoded preview; RAW/HEIC is never decoded twice.
+            result.content_evidence = content_model.inspect(
+                image, CONTENT_TYPES.get(options.wedding_content_type, "auto"))
+            if not neutral_type and eye_neutral(result, options):
+                result.score -= _people_priority_bonus(frontal_faces, smiling_faces) if options.prefer_people else 0
     return result
 
 
@@ -982,15 +1126,26 @@ def _analyze_cached(
     pairs: list[Path],
     options: AnalysisOptions,
     cache: dict[str, dict],
+    content_model: LocalWeddingContentModel | None = None,
+    *, human_model=None,
 ) -> tuple[PhotoResult, str, dict | None]:
     source = _analysis_source(photo, pairs)
     key = str(source.resolve())
     signature = _cache_signature(source, options)
+    if content_model is not None:
+        signature["content_fingerprint"] = content_model.fingerprint
     cached = _result_from_cache(photo, pairs, cache.get(key, {}), signature)
     if cached is not None:
         return cached, key, None
-    result = _analyze(photo, pairs, options)
-    return result, key, _cache_record(result, signature)
+    if human_model is not None:
+        result = _analyze(photo,pairs,options,content_model,human_model=human_model)
+    else:
+        result = (_analyze(photo, pairs, options) if content_model is None
+                  else _analyze(photo, pairs, options, content_model))
+    # Transient failures must be retried after the service/model becomes ready.
+    cacheable = (result.content_evidence.get("status") not in {"error", "unavailable"}
+                 and result.person_evidence.get("status") != "error")
+    return result, key, _cache_record(result, signature) if cacheable else None
 
 
 def _same_group(previous: PhotoResult, current: PhotoResult, options: AnalysisOptions) -> bool:
@@ -998,7 +1153,19 @@ def _same_group(previous: PhotoResult, current: PhotoResult, options: AnalysisOp
         return False
     if previous.path.parent.resolve() != current.path.parent.resolve():
         return False
-    gap = current.path.stat().st_mtime - previous.path.stat().st_mtime
+    if options.scene_type == "婚礼":
+        # Different observed subjects/categories are a safe split, never proof
+        # that the same people have been recognised across different groups.
+        a, b = previous.content_evidence, current.content_evidence
+        if a.get("status") == b.get("status") == "ok" and (
+            a["content_type"] != b["content_type"] or a["section"] != b["section"]
+        ):
+            return False
+    try:
+        gap = current.path.stat().st_mtime - previous.path.stat().st_mtime
+    except OSError:
+        # An external move during analysis must not crash all completed rows.
+        return False
     distance = _hamming(previous.perceptual_hash or 0, current.perceptual_hash or 0)
     return (
         gap <= options.burst_gap_seconds and distance <= options.similarity_threshold
@@ -1088,6 +1255,27 @@ def _people_focus_issue(item: PhotoResult, options: AnalysisOptions) -> bool:
     )
 
 
+def _background_only_motion_evidence(item: PhotoResult, options: AnalysisOptions) -> bool:
+    """An uncertain small subject passes absolute focus but loses to background.
+
+    Shared by hard rejection and shortlist eligibility, so rescuing an original
+    cannot accidentally promote the same ambiguous evidence to three stars.
+    """
+    return bool(
+        options.scene_type == "婚礼"
+        and options.detect_blur
+        and item.eye_detection_mode in {"scene_small_face", "scene_uncertain"}
+        and item.face_coverage < .05
+        and item.frontal_face_count >= 2
+        and item.open_eye_face_count == 0
+        and item.sharpness is not None
+        and item.subject_sharpness is not None
+        and item.subject_sharpness >= _scene_blur_floor(options)
+        and item.subject_sharpness < options.blur_floor * 8
+        and item.subject_sharpness < item.sharpness * 0.45
+    )
+
+
 def _subject_motion_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
     """Reject a soft multi-person subject despite sharp background texture.
 
@@ -1096,6 +1284,11 @@ def _subject_motion_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
     detections and no reliable eye evidence before treating this as a hard
     fault, keeping single distant faces and environmental images conservative.
     """
+    # Small/uncertain Haar crops plus a sharper leafy background do not prove
+    # motion blur when the measured subject already passes the absolute floor.
+    # The same shared predicate blocks shortlist promotion below.
+    if _background_only_motion_evidence(item, options):
+        return False
     return bool(
         options.detect_blur
         and item.frontal_face_count >= 2
@@ -1108,6 +1301,8 @@ def _subject_motion_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
 
 
 def _group_expression_issue(item: PhotoResult, options: AnalysisOptions | None = None) -> bool:
+    if options is not None and eye_neutral(item, options):
+        return False
     if options is not None and options.scene_type == ATMOSPHERE_PORTRAIT_SCENE:
         return False
     # Treat a confirmed mixed result as risky.  When the eye cascade finds no
@@ -1206,6 +1401,7 @@ def _has_exposure_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
         and item.shadow_clip >= options.severe_clip_fraction
         and item.median_luminance is not None
         and item.median_luminance <= 50
+        and not _lit_wedding_subject(item, options)
     )
     exposure_fault = (
         severe_overexposure
@@ -1216,6 +1412,18 @@ def _has_exposure_fault(item: PhotoResult, options: AnalysisOptions) -> bool:
         )
     )
     return exposure_fault
+
+
+def _lit_wedding_subject(item: PhotoResult, options: AnalysisOptions) -> bool:
+    """Dark background is not underexposure when a measured face is usable.
+
+    No face/unknown subject, a dark subject, severe clipping or relative flash
+    failure still follows the original hard gate. This does not identify people
+    on stage or silently exempt all documentary images.
+    """
+    return (options.scene_type == "婚礼" and item.frontal_face_count > 0
+            and item.subject_luminance is not None and 55 <= item.subject_luminance <= 215
+            and item.subject_sharpness is not None and item.subject_sharpness >= _scene_blur_floor(options))
 
 
 def _protect_scene_minimum(
@@ -1266,22 +1474,32 @@ def _ranking_score(item: PhotoResult, options: AnalysisOptions) -> float:
     focus_penalty = 35.0 if _people_focus_issue(item, options) else 0.0
     expression_penalty = 18.0 if _group_expression_issue(item, options) else 0.0
     eye_penalty = item.eye_penalty if _has_scene_rules(options) else 0.0
-    return item.score - focus_penalty - expression_penalty - eye_penalty
+    content_penalty = (3 - item.max_auto_rating) * 30.0 if options.scene_type == "婚礼" else 0.0
+    return item.score - focus_penalty - expression_penalty - eye_penalty - content_penalty
 
 
 def _review_priority(item: PhotoResult, options: AnalysisOptions) -> float:
     """Prefer an open-eyed alternative without hard-rejecting ambiguous poses."""
+    if item.calibration_confidence is not None:
+        # This confidence describes ORIGINAL delivery, never retouch quality.
+        # Keep technical/shortlist gates separate from a learned retention rank.
+        return item.calibration_confidence * 100 + _ranking_score(item, options) * .01
     closed_eye_penalty = item.eye_penalty if _has_scene_rules(options) and item.eye_penalty else (
         12.0
         if item.frontal_face_count > 0 and _message(options, "closed") in item.reasons
         else 0.0
     )
+    if eye_neutral(item, options):
+        closed_eye_penalty = 0.0
     smile_priority = (
         min(item.smiling_face_count, 2) * 24.0
         if options.prefer_people and options.scene_type != ATMOSPHERE_PORTRAIT_SCENE
         else 0.0
     )
-    return item.score + smile_priority - closed_eye_penalty
+    if eye_neutral(item, options):
+        smile_priority = 0.0
+    content_penalty = (3 - item.max_auto_rating) * 30.0 if options.scene_type == "婚礼" else 0.0
+    return item.score + smile_priority - closed_eye_penalty - content_penalty
 
 
 def _diverse_selection(
@@ -1402,6 +1620,21 @@ def _density_selection(
             selected_paths.add(item.path)
             selected_per_group[item.group_id] = selected_per_group.get(item.group_id, 0) + 1
 
+    if any(item.calibration_confidence is not None for item in candidates):
+        # Hash fragments are not true story beats. Do not force one slot per
+        # fragment ahead of learned original-delivery preferences. Explicit
+        # labelled must-keep moments are still protected by the caller.
+        for item in sorted(candidates, key=priority, reverse=True):
+            add(item)
+        if options.fill_with_similar and len(selected) < limit:
+            for item in sorted(candidates, key=priority, reverse=True):
+                if len(selected) >= limit:
+                    break
+                if item.path not in selected_paths:
+                    selected.append(item)
+                    selected_paths.add(item.path)
+        return selected
+
     # Scene completeness precedes both singleton coverage and global score:
     # 3-5 consecutive frames keep at least one representative, and 6+ keep at
     # least two when the target count can accommodate all scene minimums.
@@ -1484,7 +1717,7 @@ def _density_selection(
 
 def _three_star_score(item: PhotoResult, options: AnalysisOptions) -> float:
     """Within a scene, prefer a clear smile and complete group expressions."""
-    if options.scene_type == ATMOSPHERE_PORTRAIT_SCENE:
+    if options.scene_type == ATMOSPHERE_PORTRAIT_SCENE or eye_neutral(item, options):
         return _ranking_score(item, options)
     return (
         _ranking_score(item, options)
@@ -1493,10 +1726,62 @@ def _three_star_score(item: PhotoResult, options: AnalysisOptions) -> float:
     )
 
 
+def _mark_wedding_group_shortlist(group: list[PhotoResult], options: AnalysisOptions) -> None:
+    """Conservative shortlist gate, not a claim of gaze or confirmed blinking.
+
+    Only compare technically sound frames within the existing burst. Unknown
+    eye measurements stay available for review, never become hard rejects.
+    Couples, documentary details and atmospheric portraits retain their policy.
+    """
+    if options.scene_type != "婚礼" or not options.prefer_people:
+        return
+    documentary_ids = {rule.identifier for rule in _must_keep_shots("婚礼")
+                       if any(word in rule.special_rule for word in
+                              ("情绪", "动态", "背影", "侧影", "不跑个体", "看稿", "化妆"))}
+    portraits = [item for item in group if item.frontal_face_count >= 3
+                 and item.must_keep_id not in documentary_ids
+                 and not eye_neutral(item, options)
+                 and not _has_hard_fault(item, options)
+                 and not _people_focus_issue(item, options)]
+    if not portraits:
+        return
+    complete = []
+    for item in portraits:
+        if options.detect_closed_eyes and (
+            item.open_eye_face_count < item.frontal_face_count
+            or item.eye_detection_mode in {"scene_uncertain", "scene_small_face"}
+        ):
+            item.featured_blocked = True
+            item.reasons.append("合影睁眼证据不完整：保留复核，不自动精选" if options.language == "zh"
+                                else "Group eye evidence incomplete: review, not automatic shortlist")
+        else:
+            complete.append(item)
+    if not complete:
+        return
+    # Head count first prevents a turned-away face from improving the smile
+    # ratio. This is burst-relative evidence, not facial identity tracking.
+    def expression_key(item: PhotoResult) -> tuple[int, float]:
+        return (item.frontal_face_count,
+                item.smiling_face_count / max(1, item.frontal_face_count))
+    best = max(expression_key(item) for item in complete)
+    for item in group:
+        if (item.frontal_face_count >= 2 and item.must_keep_id not in documentary_ids
+                and not eye_neutral(item, options)
+                and expression_key(item) < best):
+            item.featured_blocked = True
+            item.max_auto_rating = min(item.max_auto_rating, 2)
+            item.reasons.append("同组合影有正面人数或笑脸比例更完整的照片，当前仅保留原片" if options.language == "zh"
+                                else "A group alternative has fuller frontal-face or smile evidence")
+
+
 def _assign_tiered_ratings(
     groups: list[list[PhotoResult]], options: AnalysisOptions
 ) -> None:
-    """Assign cumulative 1★, 2★, and 3★ tiers from one target count."""
+    """Choose retained originals, then promote a subset to retouch candidates.
+
+    Automatic output is 0/1/3 only. Two stars are reserved for manual review.
+    Quality checks and duplicate selection happen before either star is given.
+    """
     eligible: list[PhotoResult] = []
     for group_id, group in enumerate(groups, 1):
         _mark_relative_exposure_outliers(group, options)
@@ -1505,9 +1790,27 @@ def _assign_tiered_ratings(
         for item in group:
             item.group_id = group_id
             item.suggested_rating = 0
+            item.featured_blocked = False
             _apply_must_keep_rule(item, options)
+            technical_fault = _has_hard_fault(item, options)
+            apply_evidence_gates(item, options, technical_fault=technical_fault)
+            if _background_only_motion_evidence(item, options):
+                # Block only the retouch shortlist: do not add a ranking penalty
+                # that would undo the original-photo rescue at the delivery cap.
+                item.featured_blocked = True
+                add_evidence(item, "W008", "远景小脸对焦与表情证据不可靠，仅保留原片，不自动精选")
+            if options.scene_type == "婚礼" and _people_focus_issue(item, options):
+                item.max_auto_rating = min(item.max_auto_rating, 1)
+                item.featured_blocked = True
+                add_evidence(item, "W011", "主体疑似失焦，不用背景清晰度升级精选")
             if not _has_hard_fault(item, options):
                 eligible.append(item)
+        _mark_wedding_group_shortlist(group, options)
+        for item in group:
+            # A shared eligibility gate also constrains preference calibration.
+            item.featured_blocked |= (_has_hard_fault(item, options)
+                                     or _people_focus_issue(item, options)
+                                     or _group_expression_issue(item, options))
 
     if not options.ai_selection_enabled:
         # Still perform local quality checks and grouping, but leave every
@@ -1532,12 +1835,31 @@ def _assign_tiered_ratings(
         options,
         priority=lambda item: _review_priority(item, options),
     )
+    # Correct only the representative inside an already selected burst; don't
+    # make group portraits globally displace ceremony, detail or emotion shots.
+    if options.scene_type == "婚礼" and options.prefer_people:
+        indices_by_group: dict[int, list[int]] = {}
+        for index, item in enumerate(one_star_or_more):
+            indices_by_group.setdefault(item.group_id, []).append(index)
+        for group in groups:
+            alternatives = [item for item in group if item.frontal_face_count >= 3
+                            and not item.featured_blocked]
+            if not alternatives:
+                continue
+            best = max(alternatives, key=lambda item: _three_star_score(item, options))
+            selected_indices = indices_by_group.get(best.group_id, [])
+            if selected_indices and not any(one_star_or_more[index] is best for index in selected_indices):
+                index = min(selected_indices, key=lambda index: _review_priority(one_star_or_more[index], options))
+                if one_star_or_more[index].featured_blocked:
+                    one_star_or_more[index] = best
 
     # Per-burst and duplicate caps make the review wall manageable, but they
     # must not silently reduce an explicit minimum target.  If there are
     # enough eligible photos, relax those caps only until that floor is met.
     required_floor = min(target_floor, len(ranked))
-    if len(one_star_or_more) < required_floor:
+    if len(one_star_or_more) < required_floor and (
+        options.scene_type != "婚礼" or options.fill_with_similar
+    ):
         selected_paths = {item.path for item in one_star_or_more}
         for item in ranked:
             if len(one_star_or_more) >= required_floor:
@@ -1552,6 +1874,9 @@ def _assign_tiered_ratings(
         # while the whitelist guards irreplaceable scene beats. Technical
         # hard faults were removed from ``eligible`` above and remain excluded.
         selected_paths = {item.path for item in one_star_or_more}
+        retained_moments: set[tuple[str, int]] = {
+            (item.must_keep_id, item.group_id) for item in one_star_or_more if item.must_keep_id
+        }
         for item in sorted(
             (item for item in eligible if item.must_keep_id),
             key=lambda candidate: (
@@ -1560,27 +1885,27 @@ def _assign_tiered_ratings(
             ),
             reverse=True,
         ):
+            if options.scene_type == "婚礼":
+                key = (item.must_keep_id, item.group_id)
+                if key in retained_moments:
+                    continue
+                retained_moments.add(key)
             if item.path not in selected_paths:
                 one_star_or_more.append(item)
                 selected_paths.add(item.path)
 
-    selected_by_group: dict[int, list[PhotoResult]] = {}
-    for item in one_star_or_more:
-        selected_by_group.setdefault(item.group_id, []).append(item)
-
-    # Three stars are the photographer's fast first-pass shortlist.  Ten per
-    # cent made that list too sparse to be useful on a real event: many strong
-    # review picks never reached the shortlist even though they were visibly
-    # better than the floor of the selected set.  One fifth leaves room for
-    # 1★/2★ review while surfacing enough genuinely strong candidates.
-    tier_target = max(target, len(one_star_or_more))
-    three_target = min((tier_target + 4) // 5, len(one_star_or_more))
+    # At most one candidate per similar group and one fifth of the actual
+    # retained pool (rounded up). A larger requested target cannot inflate
+    # this shortlist, and missing quality evidence never forces a promotion.
+    three_target = (len(one_star_or_more) + 4) // 5
     best_per_group: dict[int, PhotoResult] = {}
     three_candidates = [
         item
         for item in one_star_or_more
         if not _people_focus_issue(item, options)
         and not _group_expression_issue(item, options)
+        and not item.featured_blocked
+        and item.max_auto_rating >= 3
     ]
     for item in sorted(
         three_candidates,
@@ -1594,48 +1919,24 @@ def _assign_tiered_ratings(
         reverse=True,
     )[:three_target]
 
-    burst_leads = [
-        max(items, key=lambda item: _three_star_score(item, options))
-        for group_id, items in selected_by_group.items()
-        if len(groups[group_id - 1]) >= 2
-    ]
-    mandatory_two = list({item.path: item for item in [*three_star, *burst_leads]}.values())
-    two_target = min(
-        max((tier_target + 2) // 3, len(mandatory_two)),
-        len(one_star_or_more),
-    )
-    two_star_or_more = mandatory_two
-    two_paths = {item.path for item in two_star_or_more}
-    for item in sorted(
-        one_star_or_more,
-        key=lambda candidate: _ranking_score(candidate, options),
-        reverse=True,
-    ):
-        if len(two_star_or_more) >= two_target:
-            break
-        if item.path not in two_paths:
-            two_star_or_more.append(item)
-            two_paths.add(item.path)
-
     one_paths = {item.path for item in one_star_or_more}
-    two_paths = {item.path for item in two_star_or_more}
     three_paths = {item.path for item in three_star}
     singleton_group_ids = {
         group_id for group_id, group in enumerate(groups, start=1) if len(group) == 1
     }
     single_scene_reason = _message(options, "single_scene")
     for item in eligible:
-        if item.path in three_paths:
-            item.suggested_rating = 3
-            item.reasons.append(_message(options, "best"))
-        elif item.path in two_paths:
-            item.suggested_rating = 2
-            item.reasons.append(_message(options, "backup"))
-        elif item.path in one_paths:
-            item.suggested_rating = 1
-            item.reasons.append(_message(options, "review"))
-        else:
+        item.suggested_rating = automatic_rating(
+            retained=item.path in one_paths,
+            featured=item.path in three_paths,
+            ceiling=item.max_auto_rating,
+        )
+        if item.path not in one_paths:
             item.reasons.append(_message(options, "target"))
+        if item.suggested_rating:
+            item.reasons.append(_message(options, {1: "review", 2: "backup", 3: "best"}[item.suggested_rating]))
+            if options.scene_type == "婚礼":
+                add_evidence(item, "W046", "同组去重后保留代表；目标张数不强制补重复照片")
         if item.suggested_rating > 0 and item.group_id in singleton_group_ids:
             if single_scene_reason not in item.reasons:
                 item.reasons.append(single_scene_reason)
@@ -1651,12 +1952,125 @@ def analyze_folder(
     return analyze_paths(list(folder.iterdir()), options, progress_callback, pause_event, cancel_event)
 
 
+def _result_groups(results: list[PhotoResult], options: AnalysisOptions) -> list[list[PhotoResult]]:
+    groups: list[list[PhotoResult]] = []
+    for result in results:
+        same = bool(groups) and _same_group(groups[-1][-1], result, options)
+        if same and options.scene_type == "婚礼":
+            same = _same_group(groups[-1][0], result, options)
+        if not same:
+            groups.append([])
+        groups[-1].append(result)
+    return groups
+
+
+def _review_budget_seconds(total: int) -> float:
+    """User's speed target, not a guarantee for slow storage/RAW decoders."""
+    return max(30.0, min(600.0, total * .12))
+
+
+def _review_candidates(results: list[PhotoResult], options: AnalysisOptions) -> list[PhotoResult]:
+    # Provisional ranking must not contaminate cached base evidence or add
+    # selection reasons twice. Copies contain metrics only, never image pixels.
+    groups = _result_groups(copy.deepcopy(results), replace(options, content_model_enabled=False))
+    _assign_tiered_ratings(groups, replace(options, content_model_enabled=False))
+    originals = {item.path: item for item in results}
+    leaders, alternates = [], []
+    for group in groups:
+        eligible = sorted((item for item in group if not _has_hard_fault(item, options)),
+                          key=lambda item: (item.suggested_rating == 3, item.suggested_rating > 0,
+                                            _three_star_score(item, options)), reverse=True)
+        if not eligible or not any(item.suggested_rating for item in eligible):
+            continue
+        leaders.append(originals[eligible[0].path])
+        if len(eligible) > 1:
+            alternates.append(originals[eligible[1].path])
+
+    def spread(items):
+        # Spend a small budget across the whole timeline rather than just the
+        # first preparation frames. All leaders precede second choices.
+        intervals = deque([(0, len(items))])
+        while intervals:
+            left, right = intervals.popleft()
+            if left >= right:
+                continue
+            middle = (left + right) // 2
+            yield items[middle]
+            intervals.extend(((left, middle), (middle + 1, right)))
+
+    return [*spread(leaders), *spread(alternates)]
+
+
+def _limited_content_review(results, options, cache, started, checkpoint,
+                            cancel_event, pause_event, phase_callback):
+    """Reuse the decoder, metrics and model; no second full-folder analysis.
+
+    Only selected review candidates need a fresh full-detail preview. Holding
+    5,000 decoded images just to avoid these few reads would exhaust memory.
+    Successful content observations have their own cache entry; they never
+    overwrite the fast feature cache or become false evidence for other frames.
+    """
+    candidates = _review_candidates(results, options)
+    deadline = started + _review_budget_seconds(len(results)) - 5.0
+    for item in results:
+        item.content_evidence = {"status": "not_reviewed", "error": "仅基础检测；限时复核未覆盖此照片"}
+    if not candidates or time.monotonic() >= deadline:
+        return
+    model = BundledWeddingContentModel(options.content_model_name, cancel_event, pause_event)
+    if model.runtime is not None:
+        model.runtime.deadline = deadline
+    reviewed = 0
+    try:
+        for item in candidates:
+            checkpoint()
+            if time.monotonic() >= deadline:
+                break
+            if phase_callback is not None:
+                phase_callback(reviewed, len(candidates), item.path, max(0, deadline - time.monotonic()))
+            try:
+                source = _analysis_source(item.path, item.pair_paths)
+                key = str(source.resolve()) + "::content-review"
+                signature = _cache_signature(source, options)
+                signature["content_fingerprint"] = model.fingerprint
+                cached = _result_from_cache(item.path, item.pair_paths, cache.get(key, {}), signature)
+                if cached is not None and cached.content_evidence.get("status") == "ok":
+                    item.content_evidence = dict(cached.content_evidence)
+                else:
+                    # Same shared read-only RAW/HEIC path as the first pass.
+                    image = _load_preview(source)
+                    if time.monotonic() >= deadline:
+                        break
+                    item.content_evidence = model.inspect(image, CONTENT_TYPES.get(options.wedding_content_type, "auto"))
+                    del image
+                    if item.content_evidence.get("status") == "ok":
+                        cache[key] = _cache_record(item, signature)
+                if item.content_evidence.get("status") == "ok":
+                    reviewed += 1
+                    neutral_type = CONTENT_TYPES.get(options.wedding_content_type) in {
+                        "documentary", "portrait", "dynamic", "details"}
+                    if options.prefer_people and not neutral_type and eye_neutral(item, options):
+                        item.score -= _people_priority_bonus(item.frontal_face_count, item.smiling_face_count)
+                elif not model.ready:
+                    break  # Missing/error component must not delay every frame.
+            except InferenceBudgetExpired:
+                item.content_evidence = {"status": "not_reviewed", "error": "限时复核预算结束；仅基础检测"}
+                break
+            except ContentModelCancelled as exc:
+                raise AnalysisCancelled() from exc
+            except Exception as exc:
+                item.content_evidence = {"status": "error", "error": str(exc)[:160]}
+    finally:
+        model.close()
+
+
 def analyze_paths(
     paths: list[Path],
     options: AnalysisOptions = AnalysisOptions(),
     progress_callback: Callable[[int, int, Path], None] | None = None,
     pause_event: threading.Event | None = None,
     cancel_event: threading.Event | None = None,
+    *,
+    phase_callback: Callable[[int, int, Path, float], None] | None = None,
 ) -> list[PhotoResult]:
     """Analyze exactly the dropped photos, automatically pairing RAW+JPG."""
     if options.picks_per_group < 1:
@@ -1677,10 +2091,22 @@ def analyze_paths(
         and options.target_keep_max_count < options.target_keep_count
     ):
         raise ValueError("target_keep_max_count must be at least target_keep_count")
+    if options.content_review_mode not in {"limited", "full"}:
+        raise ValueError("unsupported content review mode")
+    if type(options.human_face_recovery_enabled) is not bool or (
+            options.human_face_recovery_enabled and not options.human_analysis_enabled):
+        raise ValueError("face recovery requires enabled human evidence")
+    started = time.monotonic()
+    limited = (options.content_model_enabled and options.scene_type == "婚礼"
+               and options.content_review_mode == "limited")
+    base_options = replace(options, content_model_enabled=False) if limited else options
     entries = _representatives(_paths_for_selected_files(paths))
     cache = _load_analysis_cache()
     ordered_results: list[PhotoResult | None] = [None] * len(entries)
     total = len(entries)
+    content_model = (BundledWeddingContentModel(options.content_model_name, cancel_event, pause_event)
+                     if total and options.scene_type == "婚礼" and options.content_model_enabled and not limited else None)
+    human_model = None
 
     def wait_if_paused() -> None:
         while pause_event is not None and pause_event.is_set():
@@ -1689,6 +2115,10 @@ def analyze_paths(
             time.sleep(0.15)
         if cancel_event is not None and cancel_event.is_set():
             raise AnalysisCancelled()
+    if total and options.human_analysis_enabled:
+        from src.core.image_features.human_process import HumanProcessService
+        human_model = HumanProcessService(checkpoint=wait_if_paused,
+                                          recover_faces=options.human_face_recovery_enabled)
 
     if total:
         worker_count = min(_analysis_worker_count(), total)
@@ -1698,7 +2128,12 @@ def analyze_paths(
 
         def submit(index: int) -> None:
             photo, pairs = entries[index]
-            futures[index] = executor.submit(_analyze_cached, photo, pairs, options, cache)
+            args = (photo, pairs, base_options, cache)
+            if human_model is not None:
+                futures[index] = executor.submit(_analyze_cached,*args,content_model,human_model=human_model)
+            else:
+                futures[index] = executor.submit(_analyze_cached, *args) if content_model is None else (
+                    executor.submit(_analyze_cached, *args, content_model))
 
         try:
             wait_if_paused()
@@ -1712,6 +2147,10 @@ def analyze_paths(
                     ordered_results[index] = result
                     if new_record is not None:
                         cache[cache_key] = new_record
+                except ContentModelCancelled as exc:
+                    raise AnalysisCancelled() from exc
+                except AnalysisCancelled:
+                    raise
                 except Exception as exc:
                     ordered_results[index] = PhotoResult(
                         photo,
@@ -1725,17 +2164,27 @@ def analyze_paths(
                     submit(next_submit)
                     next_submit += 1
         finally:
-            executor.shutdown(wait=True, cancel_futures=True)
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+            finally:
+                if content_model is not None:
+                    content_model.close()
+                if human_model is not None:
+                    human_model.close()
 
     results = [result for result in ordered_results if result is not None]
+    wait_if_paused()
+    if limited:
+        _limited_content_review(results, options, cache, started, wait_if_paused,
+                                cancel_event, pause_event, phase_callback)
+    elif not options.content_model_enabled:
+        for item in results:
+            item.content_evidence = {"status": "base_only", "error": "快速筛选：未进行内容模型复核"}
+    wait_if_paused()
     try:
         _write_analysis_cache(cache)
     except OSError:
         pass
-    groups: list[list[PhotoResult]] = []
-    for result in results:
-        if not groups or not _same_group(groups[-1][-1], result, options):
-            groups.append([])
-        groups[-1].append(result)
+    groups = _result_groups(results, options)
     _assign_tiered_ratings(groups, options)
     return results

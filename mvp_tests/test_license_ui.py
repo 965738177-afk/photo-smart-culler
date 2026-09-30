@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+import threading
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 from event_cull import license_ui
@@ -60,6 +62,7 @@ def test_purchase_buttons_open_the_official_checkout_with_the_selected_plan_and_
 def test_license_error_survives_until_tk_callback_runs():
     dialog = object.__new__(license_ui.LicenseDialog)
     dialog._controls = []
+    dialog.bind = lambda *args, **kwargs: None
     callbacks = []
     failures = []
     dialog.after = lambda _delay, callback: callbacks.append(callback)
@@ -77,6 +80,57 @@ def test_license_error_survives_until_tk_callback_runs():
     callbacks[0]()
 
     assert failures == ["server unavailable"]
+
+
+def test_refresh_error_is_visible_in_top_status_and_purchase_feedback():
+    class Value:
+        def set(self, value):
+            self.value = value
+
+    dialog = object.__new__(license_ui.LicenseDialog)
+    dialog.detail = Value()
+    dialog.payment_note = Value()
+    dialog.refresh_view = lambda: None
+
+    dialog._failed("无法连接授权服务，请检查网络后重试。")
+
+    assert dialog.detail.value == dialog.payment_note.value
+    assert "无法连接授权服务" in dialog.detail.value
+
+
+def test_background_request_never_calls_tk_after_window_closes():
+    main_thread = threading.get_ident()
+    release = threading.Event()
+    completed = threading.Event()
+    delivered = []
+
+    class Window:
+        def bind(self, _event, callback, **_kwargs):
+            self.on_destroy = callback
+            return "binding"
+
+        def after(self, _delay, callback):
+            assert threading.get_ident() == main_thread
+            self.poll = callback
+            return "timer"
+
+        def after_cancel(self, timer):
+            assert threading.get_ident() == main_thread
+            assert timer == "timer"
+
+    window = Window()
+
+    def request():
+        release.wait(1)
+        completed.set()
+        return "authorized"
+
+    license_ui._run_background(window, request, delivered.append, delivered.append)
+    window.on_destroy(SimpleNamespace(widget=window))
+    release.set()
+    assert completed.wait(1)
+    window.poll()
+    assert delivered == []
 
 
 def test_team_email_verification_expands_inline_without_a_second_tk_window():
@@ -183,6 +237,7 @@ def test_team_code_response_reenables_confirmation_button():
     ):
         setattr(dialog, name, Control())
     dialog._controls = [dialog.team_send_button, dialog.team_activate_button, dialog.team_button]
+    dialog.bind = lambda *args, **kwargs: None
     callbacks = []
     dialog.after = lambda _delay, callback: callbacks.append(callback)
 

@@ -39,6 +39,7 @@ def test_windows_editor_guard_detects_lightroom(monkeypatch):
     calls = []
 
     def fake_run(command, **kwargs):
+        assert kwargs["creationflags"] == 0x08000000
         calls.append(command)
         return SimpleNamespace(returncode=0, stdout='"Lightroom.exe","1324","Console","1","456,000 K"\n')
 
@@ -65,6 +66,7 @@ def test_windows_exiftool_uses_utf8_argument_file(monkeypatch, tmp_path):
     assert captured["command"] == [str(root / "exiftool.exe"), "-charset", "filename=UTF8", "-@", "-"]
     assert captured["input"] == "-XMP-xmp:Rating\nC:\\照片\\测试.HEIC\n"
     assert captured["encoding"] == "utf-8"
+    assert captured["creationflags"] == 0x08000000
 
 
 def test_windows_exiftool_missing_companion_fails_closed(monkeypatch, tmp_path):

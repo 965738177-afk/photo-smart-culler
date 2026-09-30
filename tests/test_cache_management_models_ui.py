@@ -84,7 +84,7 @@ def test_model_management_slots_exist_on_the_main_window():
     assert callable(MainWindow._clear_downloaded_models_action)
 
 
-def test_deleting_models_makes_the_next_run_re_check_what_is_installed():
+def test_deleting_models_makes_the_next_run_re_check_what_is_installed(monkeypatch):
     """Deleting the weights must invalidate the cached "what is missing" answer.
 
     ``AppController._model_environment`` is resolved once per process. If models
@@ -94,6 +94,9 @@ def test_deleting_models_makes_the_next_run_re_check_what_is_installed():
     """
 
     from ui.controllers.cache_controller import CacheController
+    # Testing an environment reset must NEVER delete the user's real weights.
+    monkeypatch.setattr("core.model_provisioning.clear_model_caches",lambda:())
+    monkeypatch.setattr("core.model_provisioning.model_cache_usage_bytes",lambda:0)
 
     class _AppController:
         def __init__(self):
