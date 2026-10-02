@@ -4,7 +4,6 @@
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files
-from event_cull.bundled_inference import build_asset_tuples
 
 
 datas = [
@@ -23,9 +22,9 @@ if not (exiftool_root / "exiftool.exe").is_file() or not (exiftool_root / "exift
     raise SystemExit("Run scripts/prepare_windows_exiftool.py before packaging")
 datas.extend((str(path), str(path.parent)) for path in exiftool_root.rglob("*") if path.is_file())
 
-offline_datas, offline_binaries = build_asset_tuples()
-datas += offline_datas
-binaries = offline_binaries
+# Match the Mac fast release: no unvalidated multi-GB content model in the
+# installer. Existing small image-analysis models and ExifTool stay bundled.
+binaries = []
 hiddenimports = ["keyring.backends.Windows"]
 datas += collect_data_files("cv2")
 for package in ("tkinterdnd2", "cryptography", "keyring", "qrcode", "pillow_heif", "mediapipe"):

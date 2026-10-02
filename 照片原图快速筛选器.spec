@@ -4,7 +4,6 @@ from PyInstaller.utils.hooks import collect_all
 from pathlib import Path
 import os
 import re
-from event_cull.bundled_inference import build_asset_tuples
 
 version_source = Path('event_cull/build_info.py').read_text(encoding='utf-8')
 version_match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)', version_source)
@@ -27,9 +26,10 @@ if os.environ.get('MIAOXUAN_INTERNAL_BUILD') == '1':
 for exiftool_file in Path('event_cull/vendor/exiftool').rglob('*'):
     if exiftool_file.is_file():
         datas.append((str(exiftool_file), str(exiftool_file.parent)))
-offline_datas, offline_binaries = build_asset_tuples()
-datas += offline_datas
-binaries = offline_binaries
+# The optional 3.3 GB Qwen runtime has no demonstrated selection-quality gain.
+# Keep it out of the standard fast release; the base image and metadata models
+# listed above remain bundled.
+binaries = []
 hiddenimports = []
 datas += collect_data_files('cv2')
 tmp_ret = collect_all('tkinterdnd2')

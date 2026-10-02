@@ -53,7 +53,6 @@ from event_cull.wedding_rules import (
     selection_summary as wedding_selection_summary,
 )
 from event_cull.wedding_content import MODEL_NAMES
-from event_cull.bundled_inference import bundled_status
 from event_cull.deep_features import status_label as deep_status_label
 from event_cull.history import load_history, task_name as history_task_name, upsert_task
 from event_cull.licensing import LicenseController, LicenseError, license_label
@@ -453,7 +452,6 @@ class EventCullApp(TkinterDnD.Tk):
         self.wedding_content_type = tk.StringVar(value="自动（保守）")
         self.content_model_enabled = tk.BooleanVar(value=False)
         self.content_model_name = tk.StringVar(value=MODEL_NAMES[0])
-        self.content_model_status = tk.StringVar(value=bundled_status()[1])
         self.ai_selection_enabled = tk.BooleanVar(value=True)
         self.priority_more_faces = tk.BooleanVar(value=True)
         self.fill_with_similar = tk.BooleanVar(value=False)
@@ -2512,7 +2510,9 @@ class EventCullApp(TkinterDnD.Tk):
             scene_type=self.scene_type.get(),
             language=self.language,
             wedding_content_type=optional_value("wedding_content_type", "自动（保守）"),
-            content_model_enabled=optional_value("content_model_enabled", False),
+            # The standard installer does not ship the unvalidated multi-GB
+            # content runtime. Ignore stale task/UI values from older builds.
+            content_model_enabled=False,
             content_model_name=optional_value("content_model_name", MODEL_NAMES[0]),
             content_review_mode="limited",
         )
@@ -2862,14 +2862,11 @@ class EventCullApp(TkinterDnD.Tk):
         ttk.Combobox(content_controls, textvariable=self.wedding_content_type,
                      values=tuple(CONTENT_TYPES), state="readonly", width=22,
                      style="Picker.TCombobox").pack(side="left")
-        _, model_controls = row(wedding_section, "内置内容重点复核（限时）", "默认关闭，使用快速筛选。开启后先完成全量初筛，仅在剩余时间预算内复核少量候选；不会逐张排队细查。")
-        toggle(model_controls, self.content_model_enabled)
         model_info = tk.Frame(wedding_section, bg=palette["window"])
         model_info.pack(fill="x", pady=(8, 0))
-        tk.Label(model_info, textvariable=self.content_model_status, bg=palette["window"],
-                 fg=palette["muted"], wraplength=650, justify="left").pack(anchor="w")
-        ttk.Button(model_info, text="检查内置组件", style="PickerQuiet.TButton",
-                   command=self.check_content_model).pack(side="left", pady=10)
+        tk.Label(model_info, text="轻量版使用内置规则与小型图像检测，不附带大体积内容模型；重要照片仍请人工复核。",
+                 bg=palette["window"], fg=palette["muted"], wraplength=650,
+                 justify="left").pack(anchor="w")
         ttk.Button(model_info, text="查看 240 条规则与能力边界", style="PickerQuiet.TButton",
                    command=lambda: self.show_wedding_rules(dialog)).pack(side="left", padx=10, pady=10)
 
@@ -2939,19 +2936,6 @@ class EventCullApp(TkinterDnD.Tk):
             dialog.destroy()
 
         ttk.Button(actions, text="确认挑图规则", style="PickerPrimary.TButton", command=confirm_rules).pack(side="right", pady=12)
-
-    def check_content_model(self) -> None:
-        """Check packaged assets only; no service connection or download."""
-        if self.__dict__.get("_content_model_check_running", False):
-            return
-        self._content_model_check_running = True
-        self.content_model_status.set("正在检查软件自带组件（不联网、不上传照片）…")
-
-        def probe() -> None:
-            _ready, message = bundled_status()
-            self.ui_events.put(("content_model_checked", message))
-
-        threading.Thread(target=probe, name="wedding-model-check", daemon=True).start()
 
     def show_wedding_rules(self, parent=None) -> None:
         existing = self.__dict__.get("_wedding_rules_dialog")
@@ -4770,9 +4754,6 @@ end run
                 event, payload = self.ui_events.get_nowait()
                 if event == "license_refresh_finished":
                     self._finish_license_refresh(payload)
-                elif event == "content_model_checked":
-                    self._content_model_check_running = False
-                    self.content_model_status.set(payload)
                 elif event == "metadata_progress":
                     current, total, path = payload
                     self.progress.configure(mode="determinate", maximum=total, value=current)
@@ -5237,10 +5218,10 @@ end run
                 "scene_type": self.scene_type.get(),
                 "wedding_rule_version": RULE_VERSION,
                 "wedding_content_type": self.wedding_content_type.get(),
-                "content_model_enabled": self.content_model_enabled.get(),
+                "content_model_enabled": False,
                 "content_model_name": self.content_model_name.get(),
-                "content_review_mode": "limited" if self.content_model_enabled.get() else "base",
-                "content_budget_target_seconds": min(600, max(30, len(self.results) * .12)),
+                "content_review_mode": "base",
+                "content_budget_target_seconds": 0,
             },
             "source_folders": sorted({str(path.parent) for path in self.imported_files}),
             "counts": counts,
@@ -6105,23 +6086,13 @@ def _run_packaging_smoke_test() -> None:
         if app.active_result_index != index + 1:
             raise RuntimeError("Manual rating did not select the next matching photo")
         mark("manual-selection-and-filter-verified")
-        # Validate the actual shipped native runtime and both GGUF files, not
-        # just a successful asset lookup. Synthetic input never touches photos.
-        from event_cull.wedding_content import BundledWeddingContentModel
-        import numpy as np
-        mark("bundled-content-starting")
-        content_model = BundledWeddingContentModel()
-        try:
-            for index in range(2):
-                evidence = content_model.inspect(np.full((128, 192, 3), 170, dtype=np.uint8))
-                if evidence.get("status") != "ok":
-                    raise RuntimeError(f"Bundled native content inference failed: {evidence.get('error')}")
-                mark(f"bundled-content-observation-{index + 1}-verified")
-        finally:
-            content_model.close()
-        if content_model.runtime.process is None or content_model.runtime.process.poll() is None:
-            raise RuntimeError("Bundled model process was not released")
-        mark("bundled-content-process-closed")
+        # Source checkouts may retain developer-only GGUF files. Only the
+        # frozen release must prove that none entered the installer.
+        if getattr(sys, "frozen", False):
+            content_root = Path(sys._MEIPASS) / "event_cull/vendor/content"
+            if content_root.exists():
+                raise RuntimeError("Lightweight installer contains optional content-model assets")
+            mark("lightweight-content-assets-absent")
         print(f"MiaoXuan {APP_VERSION} packaging smoke passed ({sys.platform})")
     finally:
         mark("destroying")

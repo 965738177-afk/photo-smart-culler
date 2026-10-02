@@ -9,7 +9,6 @@ on:
       - "requirements-mvp.txt"
       - "MiaoXuan-Windows.spec"
       - "scripts/prepare_windows_exiftool.py"
-      - "scripts/prepare_bundled_content.py"
       - ".github/workflows/windows-culler.yml"
   push:
     branches: [main, "windows-culler*"]
@@ -19,7 +18,6 @@ on:
       - "requirements-mvp.txt"
       - "MiaoXuan-Windows.spec"
       - "scripts/prepare_windows_exiftool.py"
-      - "scripts/prepare_bundled_content.py"
       - ".github/workflows/windows-culler.yml"
 
 permissions:
@@ -45,8 +43,6 @@ jobs:
           python -m pip check
       - name: Prepare checksum-verified Windows metadata writer
         run: python scripts/prepare_windows_exiftool.py
-      - name: Prepare checksum-verified offline vision runtime and weights
-        run: python scripts/prepare_bundled_content.py --platform win32-amd64
       - name: Generate Windows icon
         run: |
           @'
@@ -79,8 +75,7 @@ jobs:
           assert completed.returncode == 0, f'Packaged app smoke failed: {completed.returncode}; stages: {trace.read_text(encoding="utf-8") if trace.exists() else "<not started>"}; faults: {faults.read_text(encoding="utf-8") if faults.exists() else "<none>"}'
           '@ | python -
       - name: Zip portable Windows application
-        # PowerShell Compress-Archive cannot safely handle individual >2GB files.
-        # The shipped GGUF weights need a ZIP64-capable archive writer.
+        # Zip the portable application without downloading optional GGUF weights.
         run: |
           @'
           from pathlib import Path
