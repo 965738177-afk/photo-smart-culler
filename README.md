@@ -1,3 +1,19 @@
+# 秒选 · 照片智能筛选器
+
+当前桌面版：**2.1.30**。支持本地照片初筛、相似照片 A/B 人工复核、人工评级、Lightroom 星级写入、已选原片导出及按题材累计选片偏好。
+
+- [下载安装包与安装说明](https://github.com/965738177-afk/photo-smart-culler/releases)
+- [2.1.30 A/B 复核版说明](docs/v2.1.30-ab-review-release.md)
+- [累计偏好学习说明](docs/v2.1.28-cumulative-calibration.md)
+
+本次公开备份保存 2026-10-15 的源码工作快照。现有 macOS Apple Silicon 安装包构建于 2026-10-11；此后新增的开发评测和可选模型实验不等同于已发布安装包的功能，也不代表选片准确率已提高。Windows 源码及打包配置保留，当前下载说明以各 Release 实际附件为准。
+
+桌面入口为 `event_cull/app.py`，依赖见 `requirements-mvp.txt`；开发环境中运行 `python -m event_cull.app`。分析结果需要人工复核，照片元数据在用户确认后才写入。
+
+以下保留 PhotoSort 原始项目的介绍、作者链接和许可证说明；其中上游下载链接指向原项目。
+
+---
+
 <h1 align="center">PhotoSort</h1>
 
 <p align="center">

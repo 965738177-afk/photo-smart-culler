@@ -15,10 +15,12 @@ class PreviewWarmup:
     """
 
     def __init__(self, load: Callable[[Path], object], ready: Callable[[int, Path], None], *, workers: int = 2,
-                 failed: Callable[[int, Path, str], None] | None = None):
+                 failed: Callable[[int, Path, str], None] | None = None,
+                 result_ready: Callable[[int, Path, object], None] | None = None):
         self._load = load
         self._ready = ready
         self._failed = failed
+        self._result_ready = result_ready
         self._condition = threading.Condition()
         self._pending: OrderedDict[Path, None] = OrderedDict()
         self._in_flight: set[Path] = set()
@@ -77,9 +79,11 @@ class PreviewWarmup:
                         break
                     self._condition.wait()
             try:
-                self._load(source)
+                result = self._load(source)
                 with self._condition:
                     if not self._closed and generation == self._generation:
+                        if self._result_ready is not None:
+                            self._result_ready(generation, source, result)
                         self._ready(generation, source)
             except Exception as exc:
                 # One unsupported/corrupt file cannot stop other thumbnails.

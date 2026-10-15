@@ -13,6 +13,12 @@ from event_cull.export_selected import EXPORT_MARKER
 _CURATED_FOLDER_NAMES = {"选", "已选", "selected"}
 
 
+def _is_curated_folder(name: str) -> bool:
+    """Recognize delivery folders, without excluding ordinary RAW folders."""
+    return (name.casefold() in _CURATED_FOLDER_NAMES
+            or name.endswith(("原图选好", "原图导出")))
+
+
 def scan_source_images(
     folders: Iterable[Path], *, excluded_folders: Iterable[Path] = (),recursive: bool = True
 ) -> list[Path]:
@@ -23,18 +29,26 @@ def scan_source_images(
     """
     excluded = {folder.resolve() for folder in excluded_folders}
     files: list[Path] = []
+    visited: set[Path] = set()
     for folder in folders:
         root = folder.resolve()
         if root in excluded:
             continue
         try:
             for parent, directories, filenames in os.walk(root):
+                # History may list both a root and its children. Scan each
+                # physical directory once so calibration cannot double-count.
+                directory = Path(parent).resolve()
+                if directory in visited:
+                    directories[:] = []
+                    continue
+                visited.add(directory)
                 directories[:] = [
                     name
                     for name in directories
                     if not name.startswith(".")
                     and (Path(parent) / name).resolve() not in excluded
-                    and name.casefold() not in _CURATED_FOLDER_NAMES
+                    and not _is_curated_folder(name)
                     and not (Path(parent) / name / EXPORT_MARKER).is_file()
                 ]
                 if not recursive:

@@ -7,9 +7,13 @@ It never stores source pixels and never writes photo metadata.
 from __future__ import annotations
 
 import csv
+from contextlib import closing
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import re
+import sqlite3
 import zlib
 import copy
 from dataclasses import replace
@@ -36,8 +40,9 @@ from event_cull.deep_features import (
 )
 
 
-PROFILE_VERSION = 3
+PROFILE_VERSION = 4
 PROFILE_FILENAME = "personal-calibration-v1.json"
+CORPUS_FILENAME = "personal-calibration-history-v1.sqlite3"
 MIN_VALIDATION_AUC = 0.60
 MIN_RETENTION_AGREEMENT = 0.75
 _RATING_PATTERN = re.compile(rb"xmp:Rating=[\"'](-?\d+)[\"']")
@@ -69,6 +74,7 @@ class CalibrationProfile:
     validation_f1: float | None = None
     validation_examples: int = 0
     validation_scope: str = "burst_holdout"
+    task_count: int = 1
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -89,11 +95,12 @@ class CalibrationProfile:
             "validation_f1": self.validation_f1,
             "validation_examples": self.validation_examples,
             "validation_scope": self.validation_scope,
+            "task_count": self.task_count,
         }
 
     @classmethod
     def from_dict(cls, value: object) -> "CalibrationProfile":
-        if not isinstance(value, dict) or value.get("version") not in {1, 2, PROFILE_VERSION}:
+        if not isinstance(value, dict) or value.get("version") not in {1, 2, 3, PROFILE_VERSION}:
             raise CalibrationError("选片偏好校准文件版本不兼容。")
         try:
             mean = tuple(float(item) for item in value["mean"])
@@ -116,6 +123,7 @@ class CalibrationProfile:
                 validation_f1=value.get("validation_f1"),
                 validation_examples=int(value.get("validation_examples") or 0),
                 validation_scope=str(value.get("validation_scope") or "burst_holdout"),
+                task_count=int(value.get("task_count", 1)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CalibrationError("选片偏好校准文件不完整。") from exc
@@ -124,7 +132,7 @@ class CalibrationProfile:
         numbers = [*mean, *scale, *weights, profile.bias, profile.validation_auc]
         if (not np.isfinite(numbers).all() or any(item <= 0 for item in scale)
                 or profile.objective not in {"featured", "retention"}
-                or not 0 <= profile.validation_auc <= 1):
+                or not 0 <= profile.validation_auc <= 1 or profile.task_count < 1):
             raise CalibrationError("选片偏好校准参数无效。")
         for metric in (profile.validation_precision, profile.validation_recall, profile.validation_f1):
             if metric is not None and (not isinstance(metric, (int, float)) or not np.isfinite(metric) or not 0 <= metric <= 1):
@@ -146,6 +154,23 @@ class CalibrationProfile:
 
 def default_profile_path() -> Path:
     return application_data_dir() / "calibration" / PROFILE_FILENAME
+
+
+def default_corpus_path() -> Path:
+    return application_data_dir() / "calibration" / CORPUS_FILENAME
+
+
+@dataclass(frozen=True)
+class CumulativeUpdate:
+    """The newly active profile, or a pending batch that did not pass validation."""
+
+    scene_type: str
+    profile: CalibrationProfile | None
+    task_count: int
+    example_count: int
+    positive_count: int
+    replaced_task: bool
+    pending_reason: str = ""
 
 
 def load_profile(path: Path | None = None) -> CalibrationProfile | None:
@@ -482,6 +507,7 @@ def train_profile(
     objective: str = "featured",
     scene_type: str = "",
     validation_scope: str = "burst_holdout",
+    task_count: int = 1,
     checkpoint: Callable[[], None] | None = None,
 ) -> CalibrationProfile:
     if len(samples) < 80:
@@ -496,13 +522,24 @@ def train_profile(
     groups = [group for _feature, _rating, group in samples]
     held_out = _balanced_group_holdout(groups, labels)
     training = ~held_out
-    if validation_scope == "continuous_100_frame_blocks":
+    if validation_scope in {"continuous_100_frame_blocks", "cumulative_group_holdout"}:
         ordered = list(dict.fromkeys(groups))
-        held_groups = {group for group, held in zip(groups, held_out) if held}
-        held_blocks = {index for index, group in enumerate(ordered) if group in held_groups}
-        forbidden = held_blocks | {index + offset for index in held_blocks for offset in (-1,1)}
-        positions = {group:index for index,group in enumerate(ordered)}
-        training = np.asarray([positions[group] not in forbidden for group in groups])
+        held_groups = {group for group, held in zip(groups, held_out, strict=True) if held}
+        if validation_scope == "continuous_100_frame_blocks":
+            held_blocks = {index for index, group in enumerate(ordered) if group in held_groups}
+            forbidden = held_blocks | {index + offset for index in held_blocks for offset in (-1, 1)}
+            positions = {group: index for index, group in enumerate(ordered)}
+            training = np.asarray([positions[group] not in forbidden for group in groups])
+        else:
+            # Only neighbouring blocks from the SAME task are embargoed. A
+            # different task's block number must never suppress its samples.
+            held_blocks = set()
+            for group in held_groups:
+                match = re.fullmatch(r"block:([0-9a-f]{64}):(\d+)", group)
+                if match:
+                    held_blocks.update(f"block:{match[1]}:{int(match[2]) + offset}"
+                                       for offset in (-1, 0, 1))
+            training = np.asarray([group not in held_groups and group not in held_blocks for group in groups])
         if (labels[training].sum() < 8 or training.sum()-labels[training].sum() < 8):
             raise CalibrationError("隔离相邻连续片段后，训练样本不足；不降低验证标准启用学习。")
     mean, scale, weights, bias = _fit_classifier(features[training], labels[training], checkpoint=checkpoint)
@@ -540,6 +577,7 @@ def train_profile(
         validation_precision=precision, validation_recall=recall,
         validation_f1=2 * precision * recall / max(precision + recall, 1e-12),
         validation_examples=int(held_out.sum()), validation_scope=validation_scope,
+        task_count=task_count,
     )
 
 
@@ -561,6 +599,37 @@ def blocked_validation_groups(groups: list[str], minimum_frames: int = 100) -> l
     return blocks
 
 
+def _feedback_sources(
+    log_path: Path, exported_folder: Path, original_folders: list[Path],
+) -> tuple[str, list[tuple[str, str, Path, int]], list[str], bool]:
+    """Match complete human delivery against originals without reading pixels."""
+    rows = _log_rows(log_path)
+    selected_stems = exported_selection_stems(exported_folder)
+    if not selected_stems:
+        raise CalibrationError("人工选片文件夹中没有读取到 JPG 或 RAW 文件名。")
+    if not set(rows).intersection(selected_stems):
+        raise CalibrationError("人工选片文件名与筛选日志没有匹配；请确认导出时没有重命名照片。")
+    sources = _source_previews(original_folders, set(rows), excluded_folders=[exported_folder])
+    if selected_stems - set(sources):
+        raise CalibrationError("人工结果存在无法唯一对应的原片，不能安全学习；请检查重命名或同名文件。")
+    source_rows = [
+        (stem, rows[stem][0], path, int(stem in selected_stems))
+        for stem, path in sorted(sources.items())
+    ]
+    blocks = blocked_validation_groups([row[1] for row in source_rows])
+    blocked = len(set(blocks)) >= 5
+    if not blocked:
+        blocks = [row[1] for row in source_rows]
+    scene_type = "通用"
+    if log_path.suffix.lower() == ".json":
+        try:
+            payload = json.loads(log_path.read_text(encoding="utf-8"))
+            scene_type = str((payload.get("settings") or {}).get("scene_type") or scene_type)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError) as exc:
+            raise CalibrationError("无法读取筛选日志的照片题材。") from exc
+    return scene_type, source_rows, blocks, blocked
+
+
 def build_profile(
     log_path: Path,
     exported_folder: Path,
@@ -570,29 +639,12 @@ def build_profile(
     checkpoint: Callable[[], None] | None = None,
 ) -> CalibrationProfile:
     """Build a profile from an app log, kept filenames, and originals."""
-    rows = _log_rows(log_path)
-    selected_stems = exported_selection_stems(exported_folder)
-    if not selected_stems:
-        raise CalibrationError("人工选片文件夹中没有读取到 JPG 或 RAW 文件名。")
     # Final original deliveries teach retention, not retouch candidacy. There
     # is no evidence here that every exported original is an ideal final hero.
     featured_rating = 1
-    if not set(rows).intersection(selected_stems):
-        raise CalibrationError("人工选片文件名与筛选日志没有匹配；请确认导出时没有重命名照片。")
-    sources = _source_previews(original_folders, set(rows), excluded_folders=[exported_folder])
-    source_rows: list[tuple[str, str, Path, int]] = []
-    items = sorted(sources.items())
-    for index, (stem, path) in enumerate(items, start=1):
-        group, _old_rating = rows[stem]
-        source_rows.append((stem, group, path, featured_rating if stem in selected_stems else 0))
-    if selected_stems - set(sources):
-        raise CalibrationError("人工结果存在无法唯一对应的原片，不能安全学习；请检查重命名或同名文件。")
-    blocks = blocked_validation_groups([row[1] for row in source_rows])
-    # Small feedback sets cannot form several 100-frame blocks. Keep the old
-    # whole-burst split and explicitly report its weaker validation scope.
-    blocked = len(set(blocks)) >= 5
-    if not blocked:
-        blocks = [row[1] for row in source_rows]
+    scene_type, source_rows, blocks, blocked = _feedback_sources(
+        log_path, exported_folder, original_folders,
+    )
     pipeline = _preferred_feature_pipeline()
 
     def samples_for(selected_pipeline):
@@ -613,10 +665,6 @@ def build_profile(
         samples = samples_for(pipeline)
     if checkpoint:
         checkpoint()
-    scene_type = "通用"
-    if log_path.suffix.lower() == ".json":
-        payload = json.loads(log_path.read_text(encoding="utf-8"))
-        scene_type = str((payload.get("settings") or {}).get("scene_type") or scene_type)
     profile = train_profile(samples, featured_rating, feature_pipeline=pipeline,
                             objective="retention", scene_type=scene_type,
                             validation_scope="continuous_100_frame_blocks" if blocked else "burst_holdout",
@@ -624,6 +672,231 @@ def build_profile(
     if checkpoint:
         checkpoint()
     return profile
+
+
+def _open_corpus(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=30)
+    connection.execute("PRAGMA busy_timeout=30000")
+    connection.executescript("""
+        CREATE TABLE IF NOT EXISTS feedback_tasks (
+            task_key TEXT PRIMARY KEY, scene_type TEXT NOT NULL,
+            feature_pipeline TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS feedback_examples (
+            scene_type TEXT NOT NULL, source_key TEXT NOT NULL,
+            task_key TEXT NOT NULL, signature TEXT NOT NULL,
+            group_key TEXT NOT NULL, label INTEGER NOT NULL CHECK(label IN (0, 1)),
+            feature BLOB NOT NULL, PRIMARY KEY(scene_type, source_key)
+        );
+        CREATE INDEX IF NOT EXISTS feedback_by_task ON feedback_examples(task_key);
+        CREATE TABLE IF NOT EXISTS active_profiles (
+            scene_type TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+    """)
+    return connection
+
+
+def load_cumulative_profiles(path: Path | None = None) -> dict[str, CalibrationProfile]:
+    """Read only validated profiles; a damaged history must not prevent launch."""
+    source = path or default_corpus_path()
+    if not source.is_file():
+        return {}
+    try:
+        with closing(sqlite3.connect(source, timeout=3)) as connection:
+            profiles = {}
+            for scene_type, payload in connection.execute("SELECT scene_type, payload FROM active_profiles"):
+                try:
+                    profile = CalibrationProfile.from_dict(json.loads(payload))
+                    if profile.scene_type == scene_type and profile.objective == "retention":
+                        profiles[scene_type] = profile
+                except (json.JSONDecodeError, CalibrationError):
+                    continue
+            return profiles
+    except sqlite3.Error:
+        return {}
+
+
+def load_cumulative_history(path: Path | None = None) -> dict[str, tuple[int, int, int]]:
+    """Return task/frame/retained counts, including feedback awaiting validation."""
+    source = path or default_corpus_path()
+    if not source.is_file():
+        return {}
+    try:
+        with closing(sqlite3.connect(source, timeout=3)) as connection:
+            return {
+                scene: (int(tasks), int(examples), int(positives or 0))
+                for scene, tasks, examples, positives in connection.execute(
+                    "SELECT scene_type, COUNT(DISTINCT task_key), COUNT(*), SUM(label) "
+                    "FROM feedback_examples GROUP BY scene_type"
+                )
+            }
+    except sqlite3.Error:
+        return {}
+
+
+def _task_key(log_path: Path, scene_type: str, paths: list[Path]) -> str:
+    """A task ID survives re-import; CSV falls back to its exact source set."""
+    task_id = ""
+    if log_path.suffix.lower() == ".json":
+        payload = json.loads(log_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            task = payload.get("task")
+            task_id = str((task.get("id") if isinstance(task, dict) else None)
+                          or payload.get("id") or "")
+    identity = (f"id:{task_id}" if task_id else
+                "sources:" + "\n".join(sorted(str(path.resolve()) for path in paths)))
+    return hashlib.sha256(f"{scene_type}\n{identity}".encode()).hexdigest()
+
+
+def _stored_feature(blob: bytes, pipeline: str) -> np.ndarray:
+    vector = np.frombuffer(blob, dtype="<f4")
+    if len(vector) != FEATURE_DIMENSIONS[pipeline] or not np.isfinite(vector).all():
+        raise CalibrationError("本机累计学习记录有损坏特征；未修改现有偏好。")
+    return vector.copy()
+
+
+def update_cumulative_profile(
+    log_path: Path,
+    exported_folder: Path,
+    original_folders: list[Path],
+    *,
+    path: Path | None = None,
+    progress_callback: Callable[[int, int, Path], None] | None = None,
+    checkpoint: Callable[[], None] | None = None,
+) -> CumulativeUpdate:
+    """Accumulate exact feedback examples, then atomically activate only if safe.
+
+    Re-importing a task replaces its examples. Overlapping source paths across
+    tasks are upserted, so a frame is never counted twice in one scene. Invalid
+    candidates remain in history for later learning but cannot replace the
+    previously active, validated profile. Original pixels/paths are not stored.
+    """
+    scene_type, source_rows, blocks, blocked = _feedback_sources(
+        log_path, exported_folder, original_folders,
+    )
+    if not source_rows:
+        raise CalibrationError("没有找到可与筛选日志对应的原片。")
+    task_key = _task_key(log_path, scene_type, [row[2] for row in source_rows])
+    source_keys = [hashlib.sha256(str(row[2].resolve()).encode("utf-8")).hexdigest()
+                   for row in source_rows]
+    signatures = []
+    for _, _, source, _ in source_rows:
+        try:
+            stat = source.stat()
+        except OSError as exc:
+            raise CalibrationError(f"无法读取原片状态：{source.name}") from exc
+        signatures.append(f"{stat.st_size}:{stat.st_mtime_ns}")
+    destination = path or default_corpus_path()
+    try:
+        with closing(_open_corpus(destination)) as connection:
+            known = connection.execute(
+                "SELECT feature_pipeline FROM feedback_tasks WHERE scene_type=? LIMIT 1",
+                (scene_type,),
+            ).fetchone()
+            pipeline = known[0] if known else _preferred_feature_pipeline()
+            if pipeline not in FEATURE_DIMENSIONS:
+                raise CalibrationError("旧累计特征版本不兼容，未修改当前学习记录。")
+            # Re-imported unchanged frames reuse their exact saved feature.
+            cached = {
+                key: (signature, blob)
+                for key, signature, blob in connection.execute(
+                    "SELECT source_key, signature, feature FROM feedback_examples WHERE scene_type=?",
+                    (scene_type,),
+                )
+            }
+            features: dict[int, np.ndarray] = {}
+            decode_indexes = []
+            for index, (key, signature) in enumerate(zip(source_keys, signatures, strict=True)):
+                previous = cached.get(key)
+                if previous is not None and previous[0] == signature:
+                    features[index] = _stored_feature(previous[1], pipeline)
+                    if progress_callback:
+                        progress_callback(index + 1, len(source_rows), source_rows[index][2])
+                else:
+                    decode_indexes.append(index)
+            def decode_missing(selected_pipeline: str) -> None:
+                for local_index, feature in _feature_rows(
+                    [source_rows[index][2] for index in decode_indexes], selected_pipeline,
+                    progress_callback=(None if progress_callback is None else
+                                       lambda current, total, source: progress_callback(
+                                           current, len(source_rows), source)),
+                    checkpoint=checkpoint,
+                ):
+                    features[decode_indexes[local_index]] = feature
+
+            try:
+                decode_missing(pipeline)
+            except CalibrationError:
+                if known or pipeline == HANDCRAFTED_PIPELINE_ID:
+                    raise
+                # The optional deep runtime may report ready but fail at the
+                # first actual batch. With no existing scene vectors, retry
+                # using the shared handcrafted encoder instead.
+                pipeline = HANDCRAFTED_PIPELINE_ID
+                features.clear()
+                decode_indexes = list(range(len(source_rows)))
+                decode_missing(pipeline)
+            if len(features) != len(source_rows):
+                raise CalibrationError("有原片无法生成预览特征；本次学习未保存。")
+            if checkpoint:
+                checkpoint()
+            now = datetime.now(timezone.utc).isoformat()
+            replaced_task = connection.execute(
+                "SELECT 1 FROM feedback_tasks WHERE task_key=?", (task_key,),
+            ).fetchone() is not None
+            # One transaction covers task replacement, deduplication and model
+            # activation; cancellation or I/O failure rolls it all back.
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT OR REPLACE INTO feedback_tasks VALUES (?, ?, ?, ?)",
+                (task_key, scene_type, pipeline, now),
+            )
+            connection.execute("DELETE FROM feedback_examples WHERE task_key=?", (task_key,))
+            for index, (_stem, group, _source, label) in enumerate(source_rows):
+                group_key = (f"block:{task_key}:{blocks[index].rsplit('-', 1)[-1]}"
+                             if blocked else f"burst:{task_key}:{group}")
+                vector = np.asarray(features[index], dtype="<f4")
+                connection.execute(
+                    "INSERT OR REPLACE INTO feedback_examples VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (scene_type, source_keys[index], task_key, signatures[index],
+                     group_key, label, vector.tobytes()),
+                )
+            stored = connection.execute(
+                "SELECT feature, label, group_key, task_key FROM feedback_examples "
+                "WHERE scene_type=? ORDER BY task_key, group_key, source_key",
+                (scene_type,),
+            ).fetchall()
+            task_count = len({row[3] for row in stored})
+            examples = [(_stored_feature(blob, pipeline), label, group_key)
+                        for blob, label, group_key, _task in stored]
+            positive_count = sum(label for _feature, label, _group in examples)
+            try:
+                profile = train_profile(
+                    examples, 1, feature_pipeline=pipeline, objective="retention",
+                    scene_type=scene_type, validation_scope="cumulative_group_holdout",
+                    task_count=task_count, checkpoint=checkpoint,
+                )
+                pending_reason = ""
+            except CalibrationError as exc:
+                profile = None
+                pending_reason = str(exc)
+            if checkpoint:
+                checkpoint()
+            if profile is not None:
+                connection.execute(
+                    "INSERT OR REPLACE INTO active_profiles VALUES (?, ?, ?)",
+                    (scene_type, json.dumps(profile.to_dict(), ensure_ascii=False), now),
+                )
+            connection.commit()
+            return CumulativeUpdate(
+                scene_type=scene_type, profile=profile,
+                task_count=task_count, example_count=len(examples),
+                positive_count=positive_count, replaced_task=replaced_task,
+                pending_reason=pending_reason,
+            )
+    except sqlite3.Error as exc:
+        raise CalibrationError("无法保存本机累计学习记录；原片未修改，旧偏好未替换。") from exc
 
 
 def apply_profile(

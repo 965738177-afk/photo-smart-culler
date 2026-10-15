@@ -226,6 +226,22 @@ def test_original_comparison_without_previews_never_decodes(tmp_path, monkeypatc
     assert "没有读取或解码照片" in (output / "对比摘要.md").read_text(encoding="utf-8")
 
 
+def test_app_log_nested_target_settings_are_supported(tmp_path, monkeypatch):
+    from scripts import compare_event_selection as script
+    payload = _report_payload(tmp_path, [1, 0])
+    payload["settings"] = {"target_selection_count": {"min": 1500, "max": 2560}}
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(payload), encoding="utf-8")
+    selected = tmp_path / "manual"
+    selected.mkdir()
+    (selected / "0.JPG").touch()
+    output = tmp_path / "report"
+    monkeypatch.setattr(sys, "argv", ["compare", str(baseline), str(selected), str(output),
+                                     "--confirmed-complete", "--no-previews"])
+    script.main()
+    assert "1500–2560" in (output / "对比摘要.md").read_text(encoding="utf-8")
+
+
 def test_retouch_report_without_previews_never_decodes_or_trains(tmp_path, monkeypatch):
     from scripts import compare_retouch_reference as script
     baseline = tmp_path / "baseline.json"

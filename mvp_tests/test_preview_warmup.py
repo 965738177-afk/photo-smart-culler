@@ -77,6 +77,31 @@ def test_new_task_drops_pending_and_stale_preview_events():
         pool.close()
 
 
+def test_pixel_delivery_discards_stale_ab_pair_without_decoding_on_ui_thread():
+    started, release = threading.Event(), threading.Event()
+    delivered = queue.Queue()
+    old, new = Path("old.ARW"), Path("new.ARW")
+    def load(path):
+        if path == old:
+            started.set()
+            assert release.wait(5)
+        return (path, threading.current_thread().name)
+    pool = PreviewWarmup(load, lambda _g, _p: None, workers=1,
+                         result_ready=lambda g, p, pixels: delivered.put((g, p, pixels)))
+    try:
+        pool.submit([old], 1)
+        assert started.wait(5)
+        pool.submit([new], 2)
+        release.set()
+        generation, path, pixels = delivered.get(timeout=5)
+        assert generation == 2 and path == new
+        assert pixels[1].startswith("preview-warmup-")
+        assert delivered.empty()
+    finally:
+        release.set()
+        pool.close()
+
+
 def test_corrupt_preview_reports_failure_and_does_not_stop_other_files():
     events = queue.Queue()
 

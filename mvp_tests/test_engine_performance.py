@@ -5,9 +5,24 @@ import time
 import cv2
 import numpy as np
 from PIL import Image
+import pytest
 
 import event_cull.engine as engine
 from event_cull.engine import AnalysisOptions, PhotoResult
+
+
+@pytest.mark.parametrize("suffix", [".ARW", ".JPG", ".HEIC"])
+def test_missing_original_never_starts_decoder_fallback(monkeypatch, tmp_path, suffix):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Missing originals must not launch expensive decoding")
+
+    monkeypatch.setattr(engine, "_macos_quicklook_preview", forbidden)
+    monkeypatch.setattr(cv2, "imread", forbidden)
+    monkeypatch.setattr(engine.Image, "open", forbidden)
+    if engine.rawpy is not None:
+        monkeypatch.setattr(engine.rawpy, "imread", forbidden)
+    with pytest.raises(FileNotFoundError, match="原片不存在"):
+        engine._load_preview(tmp_path / f"missing{suffix}")
 
 
 def test_jpeg_uses_reduced_decode(monkeypatch, tmp_path: Path):

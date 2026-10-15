@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from event_cull.calibration import exported_selection_files
 from event_cull.engine import _load_preview
+from event_cull.selection_compare import validate_delivery_inventory
 
 
 def _evenly_spaced(items: list, limit: int) -> list:
@@ -175,6 +176,87 @@ def build_packet(baseline: Path, evaluation: Path, manual: Path, output: Path, *
     return report
 
 
+def build_capture_packet(baseline: Path, reference: Path, inventory: Path, manual: Path,
+                         output: Path, *, per_category: int = 8, load_preview=_load_preview) -> dict:
+    """Use verified capture paths, never basename labels across renamed counters.
+
+    This is a sampled reason-gathering packet, not another accuracy evaluation.
+    Missing source files are disclosed and not substituted by exported JPEGs.
+    """
+    if not 1 <= per_category <= 24:
+        raise ValueError("每类抽样仅允许 1–24 组")
+    baseline_bytes, reference_bytes, inventory_bytes = [p.read_bytes() for p in (baseline, reference, inventory)]
+    payload, comparison, stats = [json.loads(raw) for raw in (baseline_bytes, reference_bytes, inventory_bytes)]
+    digest = hashlib.sha256(baseline_bytes).hexdigest()
+    if comparison.get("baseline_sha256") != digest or payload.get("manual_ratings"):
+        raise ValueError("需要相同冻结基线及纯自动建议")
+    folders = validate_delivery_inventory(stats)
+    if folders != {manual.resolve()}:
+        raise ValueError("人工交付目录与冻结身份核验不一致")
+    originals = {str(Path(r["folder"]) / r["file"]): r for r in payload["photos"]}
+    rows, missing = [], []
+    for row in comparison["photos"]:
+        path = row["path"]
+        if type(row.get("human_retained")) is not bool or row.get("excluded_manual") or row.get("ai_rating") not in (0, 1, 3):
+            raise ValueError("存在未知人工标签或人工改星，不能自动生成取舍样本")
+        p = Path(path)
+        if not p.is_file():
+            missing.append(path)
+            continue
+        if path not in stats or [p.stat().st_size, p.stat().st_mtime_ns] != stats[path]:
+            raise ValueError("原片已改变，请重新核验身份")
+        original = originals[path]
+        if not isinstance(original.get("score"), (int, float)) or not math.isfinite(original["score"]):
+            raise ValueError("冻结基线评分无效")
+        rows.append({"path": path, "group": (str(p.parent), row["group"]), "index": len(rows),
+                     "ai_rating": row["ai_rating"], "human_retained": row["human_retained"],
+                     "score": original["score"]})
+    protected = {Path(p).parent.resolve() for p in stats} | {baseline.parent.resolve(), reference.parent.resolve()}
+    if output.exists() or any(output.resolve().is_relative_to(p) for p in protected):
+        raise ValueError("输出必须是原片、人工交付和冻结证据外的新目录")
+    samples = _review_candidates(rows, per_category)
+    output.mkdir(parents=True)
+    errors, previews = [], {}
+
+    def cached_preview(path):
+        # Same file may illustrate multiple categories; shared loader runs once.
+        if path not in previews:
+            previews[path] = load_preview(path)
+        return previews[path]
+
+    titles = {"same_group_different_frame": "同组选帧分歧",
+              "human_group_missed": "人工保留但当前组漏选",
+              "ai_group_not_delivered": "AI 留片但当前组未交付"}
+    lines = ["# 1011 选片分歧：请标注原因", "", "这是已有启发式分组的抽样，不代表真实故事分组。",
+             "未交付不等于废片；请标注表情、动作、构图、人物组合、故事价值、基本等价或其他原因。",
+             "不要只回答 A/B；每组补一句原因，更有利于识别下一步缺少的特征。", ""]
+    for category, items in samples.items():
+        _draw_sheet(items, output / f"{category}.jpg", cached_preview, errors)
+        lines += [f"## {titles[category]}", "", f"![对照]({category}.jpg)", ""]
+        for item in items:
+            ai = Path(item["ai_path"]).name if item["ai_path"] else "无"
+            human = Path(item["human_path"]).name if item["human_path"] else "无"
+            lines += [f"- {Path(item['folder']).name} · 组 {item['group']}：AI {ai}；人工 {human}。原因：____", ""]
+    validate_delivery_inventory(stats)
+    for row in rows:
+        p = Path(row["path"])
+        if not p.is_file() or [p.stat().st_size, p.stat().st_mtime_ns] != stats[str(p)]:
+            raise ValueError("原片生成期间改变，不发布完成报告")
+    if any(p.read_bytes() != raw for p,raw in zip((baseline, reference, inventory),
+                                                   (baseline_bytes, reference_bytes, inventory_bytes))):
+        raise ValueError("冻结证据生成期间改变")
+    report = {"identity_mode": "EXIF_verified_original_path", "baseline_sha256": digest,
+              "reference_sha256": hashlib.sha256(reference_bytes).hexdigest(),
+              "samples": samples, "excluded_missing_originals": missing, "visual_errors": errors,
+              "unique_decodes": len(previews), "training_performed": False, "source_modified": False,
+              "sampling": "每类按原始拍摄顺序均匀抽取；不作为模型验收成绩。"}
+    with (output / "review.json").open("x", encoding="utf-8") as stream:
+        json.dump(report, stream, ensure_ascii=False, indent=2)
+    with (output / "请标注原因.md").open("x", encoding="utf-8") as stream:
+        stream.write("\n".join(lines))
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline", type=Path)
@@ -182,9 +264,15 @@ def main() -> None:
     parser.add_argument("manual", type=Path, help="manual delivery; protected from report output")
     parser.add_argument("output", type=Path)
     parser.add_argument("--per-category", type=int, default=8)
+    parser.add_argument("--capture-inventory", type=Path,
+                        help="Use evaluation as EXIF-verified capture reference, with its frozen inventory")
     args = parser.parse_args()
-    report = build_packet(args.baseline, args.evaluation, args.manual, args.output,
-                          per_category=args.per_category)
+    if args.capture_inventory:
+        report = build_capture_packet(args.baseline, args.evaluation, args.capture_inventory,
+                                      args.manual, args.output, per_category=args.per_category)
+    else:
+        report = build_packet(args.baseline, args.evaluation, args.manual, args.output,
+                              per_category=args.per_category)
     print(json.dumps({"output": str(args.output), "counts": {k: len(v) for k, v in report["samples"].items()},
                       "visual_errors": len(report["visual_errors"])}, ensure_ascii=False))
 

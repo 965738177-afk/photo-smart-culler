@@ -367,7 +367,8 @@ class LicenseDialog(tk.Toplevel):
 
         # First use needs one clear answer.  Keep this card before every
         # email-related field so photographers can try the workflow directly.
-        trial = ttk.Frame(outer, style="LicenseTrial.TFrame", padding=(20, 17))
+        self.trial_panel = ttk.Frame(outer, style="LicenseTrial.TFrame", padding=(20, 17))
+        trial = self.trial_panel
         trial.pack(fill="x")
         trial.columnconfigure(0, weight=1)
         ttk.Label(trial, text="首次使用", style="LicenseTrialEyebrow.TLabel").grid(row=0, column=0, sticky="w")
@@ -385,6 +386,7 @@ class LicenseDialog(tk.Toplevel):
         ttk.Label(trial_actions, text=f"每台{device_label()}限领一次", style="LicenseTrialHint.TLabel").pack(side="left", padx=(12, 0))
 
         card = ttk.Frame(outer, style="LicenseStatus.TFrame", padding=(15, 11))
+        self.status_card = card
         card.pack(fill="x", pady=(10, 0))
         card.columnconfigure(0, weight=1)
         self.status = tk.StringVar()
@@ -399,24 +401,53 @@ class LicenseDialog(tk.Toplevel):
             justify="left",
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
-        self.team_access = ttk.Frame(outer, style="LicenseTeam.TFrame", padding=(15, 12))
-        self.team_access.pack(fill="x", pady=(10, 0))
-        self.team_access.columnconfigure(0, weight=1)
-        ttk.Label(self.team_access, text="我是团队成员 / 团队主人", style="LicenseTeamTitle.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
+        # Keep the routes in reading order, with trial first and purchase last.
+        # Each route opens its own form so email and activation-code inputs
+        # cannot be confused with one another.
+        self.mode_choices = ttk.Frame(outer, style="LicenseRoot.TFrame")
+        self.mode_choices.pack(fill="x", pady=(14, 0))
         ttk.Label(
-            self.team_access,
-            text=f"已受邀请的邮箱不需要购买或输入个人激活码；验证邮箱即可将团队永久授权绑定到当前{device_label()}。",
-            style="LicenseTeamCopy.TLabel", wraplength=400, justify="left",
-        ).grid(row=1, column=0, sticky="w", pady=(3, 0))
-        self.team_button = ttk.Button(
-            self.team_access,
-            text="使用团队邮箱验证",
-            command=self.manage_team,
-            style="LicensePrimary.TButton",
+            self.mode_choices, text="选择使用方式", style="LicenseSecondaryHeading.TLabel"
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        self.mode_choices.columnconfigure(0, weight=1)
+        choices = (
+            ("trial", f"免费试用 {TRIAL_DAYS} 天\n无需邮箱，每台 Mac 一次", "LicenseChoiceTrial.TButton"),
+            ("team", "已有邮箱授权\n受邀内测用户在这里填写邮箱", "LicenseChoiceTeam.TButton"),
+            ("activate", "已有激活码\n输入购买邮箱和激活码", "LicenseChoiceActivate.TButton"),
+            ("purchase", "购买或续订\n月度订阅 / 永久授权", "LicenseChoicePurchase.TButton"),
         )
-        self.team_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(14, 0))
+        self.mode_buttons: list[ttk.Button] = []
+        for index, (mode, label, button_style) in enumerate(choices):
+            heading, description = label.split("\n", 1)
+            button = ttk.Button(
+                self.mode_choices, text=heading,
+                command=lambda selected=mode: self.manage_team() if selected == "team" else self._show_license_mode(selected),
+                style=button_style, cursor="hand2",
+            )
+            button.grid(row=1 + index, column=0, sticky="ew", pady=5)
+            # A separate caption keeps its font small while the native button
+            # retains keyboard focus, disabled state, and activation behavior.
+            caption = ttk.Label(button, text=description, style=button_style.replace("TButton", "TLabel"))
+            caption.place(x=17, rely=1, y=-12, anchor="sw")
+            arrow = ttk.Label(button, text="›", font=("Helvetica Neue", 24, "bold"),
+                              style=button_style.replace("TButton", "TLabel"), cursor="hand2")
+            arrow.place(relx=1, x=-20, rely=0.5, anchor="e")
+            for overlay in (caption, arrow):
+                overlay.bind("<Button-1>", lambda _event, target=button: target.invoke())
+            def update_hover(_event, target=button, detail=caption, indicator=arrow, active=True):
+                target.state(["active" if active else "!active"])
+                detail.state(["active" if active else "!active"])
+                indicator.state(["active" if active else "!active"])
+            button.bind("<Enter>", update_hover, add="+")
+            button.bind("<Leave>", lambda event, callback=update_hover: callback(event, active=False), add="+")
+            for overlay in (caption, arrow):
+                overlay.bind("<Enter>", update_hover)
+                overlay.bind("<Leave>", lambda event, callback=update_hover: callback(event, active=False))
+            self.mode_buttons.append(button)
+        self.mode_back = ttk.Button(
+            outer, text="← 返回选择使用方式",
+            command=lambda: self._show_license_mode(None), style="LicenseQuiet.TButton",
+        )
 
         # Do not open a nested Toplevel here. On recent macOS releases, Tk's
         # text-input bridge can crash when a third-party input method switches
@@ -424,25 +455,26 @@ class LicenseDialog(tk.Toplevel):
         # Keeping the verification fields in this same scrollable window
         # avoids that native path entirely.
         self.team_verify = ttk.Frame(outer, style="LicenseTeam.TFrame", padding=(15, 12))
-        ttk.Label(self.team_verify, text="验证团队邀请邮箱", style="LicenseTeamTitle.TLabel").pack(anchor="w")
+        ttk.Label(self.team_verify, text="已有邮箱授权", style="LicenseTeamTitle.TLabel").pack(anchor="w")
         ttk.Label(
             self.team_verify,
             text=f"输入受邀请的邮箱，获取验证码后即可授权当前{device_label()}。",
             style="LicenseTeamCopy.TLabel", wraplength=540, justify="left",
         ).pack(anchor="w", pady=(3, 9))
         self.team_email = tk.StringVar()
-        ttk.Entry(self.team_verify, textvariable=self.team_email).pack(fill="x")
         team_request = ttk.Frame(self.team_verify, style="LicenseTeam.TFrame")
-        team_request.pack(fill="x", pady=(8, 0))
+        team_request.pack(anchor="w")
+        ttk.Entry(team_request, textvariable=self.team_email, width=30).pack(side="left")
         self.team_send_button = ttk.Button(
             team_request,
             text="发送验证码",
             command=self.request_team_code,
-            style="LicenseSecondary.TButton",
+            style="LicenseCodeSend.TButton",
         )
-        self.team_send_button.pack(side="left")
+        self.team_send_button.pack(side="left", padx=(10, 0))
         self.team_note = tk.StringVar(value="验证码会发送至受邀请的邮箱。")
-        ttk.Label(team_request, textvariable=self.team_note, style="LicenseTeamCopy.TLabel").pack(side="left", padx=(10, 0))
+        ttk.Label(self.team_verify, textvariable=self.team_note, style="LicenseTeamCopy.TLabel",
+                  wraplength=540, justify="left").pack(anchor="w", pady=(7, 0))
         team_verify_row = ttk.Frame(self.team_verify, style="LicenseTeam.TFrame")
         team_verify_row.pack(fill="x", pady=(10, 0))
         self.team_code = tk.StringVar()
@@ -455,16 +487,14 @@ class LicenseDialog(tk.Toplevel):
         )
         self.team_activate_button.pack(side="right")
 
-        self.secondary_heading = ttk.Frame(outer, style="LicenseRoot.TFrame")
-        self.secondary_heading.pack(fill="x", pady=(15, 7))
-        ttk.Label(self.secondary_heading, text="个人授权，或准备购买", style="LicenseSecondaryHeading.TLabel").pack(side="left")
-
         offers = ttk.Frame(outer, style="LicenseRoot.TFrame")
-        offers.pack(fill="x")
+        self.offers = offers
+        offers.pack(fill="x", pady=(10, 0))
         offers.columnconfigure(0, weight=6)
         offers.columnconfigure(1, weight=4)
 
         account = ttk.Frame(offers, style="LicenseCard.TFrame", padding=(17, 14))
+        self.account_panel = account
         account.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         ttk.Label(account, text="个人购买激活", style="LicenseSection.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(account, text="个人购买 / 激活邮箱", style="LicenseField.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
@@ -478,6 +508,7 @@ class LicenseDialog(tk.Toplevel):
         account.columnconfigure(0, weight=1)
 
         purchase = ttk.Frame(offers, style="LicenseCard.TFrame", padding=(17, 14))
+        self.purchase_panel = purchase
         purchase.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         ttk.Label(purchase, text="购买或续订", style="LicenseSection.TLabel").pack(anchor="w")
         self.plan = tk.StringVar(value="monthly")
@@ -533,11 +564,13 @@ class LicenseDialog(tk.Toplevel):
         self._controls = [
             self.trial_start_button, self.alipay_button,
             self.wechat_button, self.activate_button,
-            self.refresh_button, self.devices_button, self.team_button,
+            self.refresh_button, self.devices_button, self.mode_back,
             self.team_send_button, self.team_activate_button,
             self.monthly_plan, self.lifetime_plan,
-        ]
+        ] + self.mode_buttons
 
+        self._active_mode: str | None = None
+        self._show_license_mode(None)
         self.refresh_view()
 
     def _center_on_parent(self) -> None:
@@ -562,6 +595,30 @@ class LicenseDialog(tk.Toplevel):
             self._scroll_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
         return "break"
 
+    def _show_license_mode(self, mode: str | None) -> None:
+        """Keep the four authorization paths mutually exclusive in one window."""
+        if mode not in {None, "team", "trial", "activate", "purchase"}:
+            raise ValueError(f"Unsupported authorization mode: {mode}")
+        for panel in (self.trial_panel, self.team_verify, self.offers, self.mode_choices, self.mode_back):
+            panel.pack_forget()
+        self._active_mode = mode
+        if mode is None:
+            self.mode_choices.pack(fill="x", pady=(14, 0), after=self.status_card)
+        else:
+            self.mode_back.pack(fill="x", pady=(10, 0), after=self.status_card)
+            if mode == "trial":
+                self.trial_panel.pack(fill="x", pady=(10, 0), after=self.mode_back)
+            elif mode == "team":
+                self.team_verify.pack(fill="x", pady=(10, 0), after=self.mode_back)
+            else:
+                self.account_panel.grid_remove()
+                self.purchase_panel.grid_remove()
+                panel = self.account_panel if mode == "activate" else self.purchase_panel
+                panel.grid(row=0, column=0, columnspan=2, sticky="nsew")
+                self.offers.pack(fill="x", pady=(10, 0), after=self.mode_back)
+        self._sync_scroll_region()
+        self._scroll_canvas.yview_moveto(0)
+
     def _configure_subscription_styles(self) -> None:
         """Use a calm subscription hierarchy instead of one large control stack."""
         style = ttk.Style(self)
@@ -570,6 +627,22 @@ class LicenseDialog(tk.Toplevel):
         style.configure("LicenseTrial.TFrame", background="#1c2924")
         style.configure("LicenseStatus.TFrame", background="#17191b")
         style.configure("LicenseTeam.TFrame", background="#1c2924")
+        # Distinct colors reinforce the labels without being the only cue.
+        choice_styles = (
+            ("LicenseChoiceTrial.TButton", "#d99536", "#18130c", "#e9ab50"),
+            ("LicenseChoiceTeam.TButton", "#1f593c", "#f4fff6", "#2b7650"),
+            ("LicenseChoiceActivate.TButton", "#285da6", "#ffffff", "#3476cc"),
+            ("LicenseChoicePurchase.TButton", "#674491", "#ffffff", "#8056af"),
+        )
+        for name, background, foreground, active_background in choice_styles:
+            style.configure(name, background=background, foreground=foreground, borderwidth=0,
+                            padding=(17, 12, 17, 32), anchor="w", font=("Helvetica Neue", 20, "bold"))
+            style.map(name, background=[("disabled", "#25282a"), ("active", active_background)],
+                      foreground=[("disabled", "#9da6ad")])
+            caption_style = name.replace("TButton", "TLabel")
+            style.configure(caption_style, background=background, foreground=foreground,
+                            font=("Helvetica Neue", 11))
+            style.map(caption_style, background=[("active", active_background)])
         style.configure("LicenseTitle.TLabel", background="#101112", foreground="#f5f7f8", font=("Helvetica Neue", 25, "bold"))
         style.configure("LicenseSubtitle.TLabel", background="#101112", foreground="#9da6ad", font=("Helvetica Neue", 11))
         style.configure("LicensePreview.TLabel", background="#101112", foreground="#d5a348", font=("Helvetica Neue", 10, "bold"))
@@ -593,6 +666,10 @@ class LicenseDialog(tk.Toplevel):
         style.map("LicensePlan.TRadiobutton", background=[("active", "#1a1d20")], foreground=[("disabled", "#70777d")])
         style.configure("LicensePrimary.TButton", background="#3478e5", foreground="#ffffff", borderwidth=0, padding=(13, 9), font=("Helvetica Neue", 11, "bold"))
         style.map("LicensePrimary.TButton", background=[("active", "#4a8bf0"), ("disabled", "#35465f")], foreground=[("disabled", "#98a4b5")])
+        style.configure("LicenseCodeSend.TButton", background="#f2c94c", foreground="#201a08", borderwidth=0,
+                        padding=(13, 9), font=("Helvetica Neue", 11, "bold"))
+        style.map("LicenseCodeSend.TButton", background=[("disabled", "#625731"), ("active", "#ffda65")],
+                  foreground=[("disabled", "#c2b991")])
         style.configure("LicenseAlipay.TButton", background="#1677ff", foreground="#ffffff", borderwidth=0, padding=(12, 9), font=("Helvetica Neue", 11, "bold"))
         style.map("LicenseAlipay.TButton", background=[("active", "#4096ff"), ("disabled", "#2d4769")], foreground=[("disabled", "#aab8ca")])
         style.configure("LicenseWeChat.TButton", background="#07c160", foreground="#ffffff", borderwidth=0, padding=(12, 9), font=("Helvetica Neue", 11, "bold"))
@@ -633,15 +710,13 @@ class LicenseDialog(tk.Toplevel):
             f"{team_name} · 团队永久授权已启用。{decision.message}团队主人可在网站管理成员和设备。"
             if team_name else decision.message
         )
-        if team_name:
-            self.team_access.pack_forget()
-            self.team_verify.pack_forget()
-        elif not self.team_access.winfo_manager():
-            self.team_access.pack(fill="x", pady=(10, 0), before=self.secondary_heading)
-        self.team_button.configure(text="使用团队邮箱验证")
+        if team_name and self._active_mode == "team":
+            self._show_license_mode(None)
         # _run disables every action while a request is in flight. Restore
         # the controls needed for the second step of email verification too.
-        self.team_button.configure(state="normal")
+        self.mode_back.configure(state="normal")
+        for button in self.mode_buttons:
+            button.configure(state="normal")
         self.team_send_button.configure(state="normal")
         self.team_activate_button.configure(state="normal")
         self.monthly_plan.configure(state="normal")
@@ -662,7 +737,7 @@ class LicenseDialog(tk.Toplevel):
 
     def activate(self) -> None:
         if not self.code.get().strip():
-            self.manage_team(initial_email=self.email.get())
+            self.payment_note.set("请填写购买邮件中的激活码；受邀用户请返回选择“已有邮箱授权”。")
             return
         self._run(lambda: self.controller.activate(self.email.get(), self.code.get()), self._activated)
 
@@ -726,14 +801,4 @@ class LicenseDialog(tk.Toplevel):
             return
         if initial_email.strip() and not self.team_email.get().strip():
             self.team_email.set(initial_email.strip())
-        if self.team_verify.winfo_manager():
-            self.team_verify.pack_forget()
-            self.team_button.configure(text="使用团队邮箱验证")
-            return
-        self.team_verify.pack(
-            fill="x",
-            pady=(0, 0),
-            before=self.secondary_heading,
-        )
-        self.team_button.configure(text="收起团队邮箱验证")
-        self._sync_scroll_region()
+        self._show_license_mode("team")

@@ -55,6 +55,20 @@ class ContentModelCancelled(Exception):
     pass
 
 
+def encode_preview(preview, *, maximum_side=1280):
+    """Shared bounded encoding for all local content-observation adapters."""
+    if type(maximum_side) is not int or not 32 <= maximum_side <= 2048:
+        raise ValueError("预览编码尺寸不合法")
+    height, width = preview.shape[:2]
+    if max(height, width) > maximum_side:
+        scale = maximum_side / max(height, width)
+        preview = cv2.resize(preview, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    ok, encoded_image = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    if not ok:
+        raise ValueError("预览无法编码")
+    return base64.b64encode(encoded_image).decode("ascii")
+
+
 def validate_observation(value: dict, allowed_ids: set[str]) -> None:
     """Use the same strict boundary for service replies and feature caches."""
     checks = value.get("checks")
@@ -152,14 +166,7 @@ class LocalWeddingContentModel:
             self._checkpoint()
             if not self.ready:
                 return {"status": "unavailable", "error": self.error}
-            height, width = preview.shape[:2]
-            if max(height, width) > 1280:
-                scale = 1280 / max(height, width)
-                preview = cv2.resize(preview, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-            ok, encoded_image = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 88])
-            if not ok:
-                raise ValueError("预览无法编码")
-            encoded = base64.b64encode(encoded_image).decode("ascii")
+            encoded = encode_preview(preview)
             route = self._chat(encoded,
                 "先判断内容类型 formal_group/documentary/portrait/dynamic/details/auto；不明返回 auto。"
                 "选择最相关规则章节：5-6正式合影，7新娘准备，8新郎准备，9接亲，10敬茶，"

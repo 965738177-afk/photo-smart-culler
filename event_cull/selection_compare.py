@@ -11,6 +11,23 @@ from pathlib import Path
 from event_cull.calibration import exported_selection_files
 
 
+def validate_delivery_inventory(inventory: dict) -> set[Path]:
+    """Shared read-only guard for frozen JPG delivery evidence, including renames."""
+    selected = {p: stats for p, stats in inventory.items() if Path(p).suffix.lower() in (".jpg", ".jpeg")}
+    if not selected:
+        raise ValueError("Missing frozen delivery inventory")
+    folders = {Path(p).parent for p in selected}
+    current = {str(p) for folder in folders for p in folder.iterdir()
+               if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg")}
+    if current != set(selected):
+        raise ValueError("Manual delivery file list changed")
+    for path, stats in selected.items():
+        p = Path(path)
+        if [p.stat().st_size, p.stat().st_mtime_ns] != list(stats):
+            raise ValueError("Manual delivery changed: " + path)
+    return folders
+
+
 def group_allocation_diagnostic(groups: dict) -> dict:
     """Separate missed group allocations from within-group exact-file gaps.
 

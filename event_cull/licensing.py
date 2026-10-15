@@ -34,7 +34,7 @@ LEASE_ACCOUNT = "verified-lease"
 CREDENTIAL_ACCOUNT = "device-credential"
 DEVICE_ID_ACCOUNT = "device-id"
 OFFLINE_GRACE_DAYS = 5
-TRIAL_DAYS = 3
+TRIAL_DAYS = 7
 
 # This key is public by design.  It can verify an API-issued lease but cannot
 # create one.  Its private counterpart exists only on the authorization host.

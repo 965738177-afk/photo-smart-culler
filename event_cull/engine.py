@@ -289,6 +289,10 @@ def _resize_preview(image: np.ndarray, maximum_dimension: int) -> np.ndarray:
 
 
 def _load_preview(path: Path, *, maximum_dimension: int = 1600) -> np.ndarray:
+    # Missing originals cannot benefit from decoder fallbacks. Fail before
+    # LibRaw/Quick Look so moved files do not stall every preview consumer.
+    if not path.is_file():
+        raise FileNotFoundError(f"原片不存在或不是文件：{path}")
     if path.suffix.lower() in RAW_EXTENSIONS:
         if rawpy is None:
             raise RuntimeError("RAW support requires rawpy; install requirements-mvp.txt")

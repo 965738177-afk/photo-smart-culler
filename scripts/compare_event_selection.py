@@ -118,11 +118,15 @@ def main():
     with (args.output/"comparison.json").open("x", encoding="utf-8") as stream:
         json.dump(report, stream, ensure_ascii=False, indent=2)
     metrics = report["metrics"]
+    settings = payload.get("settings") or {}
+    target = settings.get("target_selection_count") or {}
+    target_min = settings.get("target_keep_count", target.get("min"))
+    target_max = settings.get("target_keep_max_count", target.get("max"))
     summary = ["# 本批婚礼人工选片对比", "", "本报告未写星级、未修改照片、未训练模型。", "",
                f"- 原片：{len(data)}；人工交付：{len(human)} 个唯一文件名。",
                f"- 基线：已冻结的共享筛选引擎结果，软件 {report['software_version']}。",
                f"- 基线路径：`{args.baseline}`。SHA-256：`{report['baseline_sha256']}`。",
-               f"- 目标保留：{payload['settings']['target_keep_count']}–{payload['settings']['target_keep_max_count']} 张。",
+               f"- 目标保留：{target_min}–{target_max} 张。",
                f"- AI 星级分布：{report['ai_ratings']}。自动只有 0、1、3 星，2 星保留给人工。", ""]
     if metrics:
         summary += ["## 原片保留对比", "", "| 项目 | 数量 |", "| --- | ---: |",

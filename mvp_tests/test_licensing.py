@@ -63,7 +63,7 @@ def test_unactivated_sidebar_keeps_activation_entry():
     assert licensing.license_label(licensing.evaluate_lease(None)) == "开始试用 / 激活"
 
 
-def test_three_day_trial_copy_and_remaining_time_are_not_described_as_a_subscription():
+def test_seven_day_trial_copy_and_remaining_time_are_not_described_as_a_subscription():
     moment = datetime.now(UTC)
     lease = licensing.LicenseLease(
         account_id="trial+opaque@device.local",
@@ -74,9 +74,9 @@ def test_three_day_trial_copy_and_remaining_time_are_not_described_as_a_subscrip
         subscription_until=moment + timedelta(days=licensing.TRIAL_DAYS),
     )
 
-    assert licensing.TRIAL_DAYS == 3
-    assert "3 天试用" in licensing.evaluate_lease(None).message
-    assert licensing.license_label(licensing.evaluate_lease(lease)) == "试用剩余 2 天 23 小时"
+    assert licensing.TRIAL_DAYS == 7
+    assert "7 天试用" in licensing.evaluate_lease(None).message
+    assert licensing.license_label(licensing.evaluate_lease(lease)) == "试用剩余 6 天 23 小时"
 
 
 def test_signed_lease_is_verified_and_tampering_is_rejected(monkeypatch):

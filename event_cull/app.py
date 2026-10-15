@@ -42,9 +42,10 @@ from event_cull.calibration import (
     CalibrationError,
     CalibrationProfile,
     apply_profile,
-    build_profile,
+    load_cumulative_history,
+    load_cumulative_profiles,
     load_profile,
-    save_profile,
+    update_cumulative_profile,
 )
 from event_cull.build_info import APP_VERSION
 from event_cull.rating_policy import RATING_LABELS, RATING_POLICY_VERSION, RETAINED_RATINGS
@@ -77,6 +78,8 @@ from event_cull.export_selected import (
 from event_cull.source_scan import scan_source_images
 from event_cull.platform_paths import application_data_dir, hidden_subprocess_options
 from event_cull.preview_warmup import PreviewWarmup
+from event_cull.duplicate_review import DuplicateReviewSession
+from event_cull.duplicate_review_ui import DuplicateReviewDialog
 from event_cull.xmp import (
     EMBEDDED_EXTENSIONS,
     MetadataCancelled,
@@ -532,7 +535,13 @@ class EventCullApp(TkinterDnD.Tk):
         self.analysis_completed_at: str | None = None
         self.current_log_path: Path | None = None
         self.running_metadata_editors: tuple[str, ...] = ()
-        self.calibration_profile: CalibrationProfile | None = load_profile()
+        self._legacy_profile: CalibrationProfile | None = load_profile()
+        self._active_scene_profiles = load_cumulative_profiles()
+        self._calibration_history = load_cumulative_history()
+        self.calibration_profile: CalibrationProfile | None = (
+            next(iter(self._active_scene_profiles.values()), None) or self._legacy_profile
+        )
+        self._calibration_pending_summary = ""
         self.calibration_running = False
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._request_close)
@@ -1589,6 +1598,10 @@ class EventCullApp(TkinterDnD.Tk):
             command=lambda: self._set_photo_view("list"),
         )
         self.list_view_button.pack(side="left")
+        self.duplicate_review_button = ttk.Button(
+            toolbar, text="A/B 人工复核", command=self.open_duplicate_review,
+            style="ViewMode.TButton", state="disabled")
+        self.duplicate_review_button.grid(row=3, column=0, columnspan=10, sticky="w", pady=(8, 0))
         self.grid_hint = ttk.Label(toolbar, text="", style="Toolbar.TLabel")
         self.grid_hint.grid(row=1, column=0, columnspan=7, sticky="w", pady=(8, 0))
         self.import_badge = ttk.Label(toolbar, textvariable=self.import_notice, style="Toolbar.TLabel")
@@ -1680,7 +1693,7 @@ class EventCullApp(TkinterDnD.Tk):
         ttk.Label(self.calibration_panel, text="选片偏好校准", style="TaskTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(
             self.calibration_panel,
-            text="告诉软件你最后留下了哪些照片，作为下次 3 星推荐的排序参考。",
+            text="告诉软件你最后留下了哪些原片；按题材累计学习，供下次 1 星原片取舍参考。",
             style="Muted.TLabel",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 18))
         loop = ttk.Frame(self.calibration_panel, style="Soft.TFrame", padding=(18, 16))
@@ -1689,7 +1702,7 @@ class EventCullApp(TkinterDnD.Tk):
         steps = (
             ("1", "先完成一次筛选", "软件自动保存本次结果，不需要手动导出日志。"),
             ("2", "整理你真正要留下的照片", "放进一个文件夹；可以是原片，也可以是 Lightroom 导出的 JPG。"),
-            ("3", "选择这个文件夹", "按原文件名与本次任务对照，在本机学习；下次分析时使用。"),
+            ("3", "选择这个文件夹", "与同题材的旧任务累积；同一任务重导会更新，不会重复计数。"),
         )
         loop_grid = ttk.Frame(loop, style="Soft.TFrame")
         loop_grid.pack(fill="x")
@@ -1717,7 +1730,7 @@ class EventCullApp(TkinterDnD.Tk):
         self.calibration_report = ttk.Label(insight, text=self._calibration_report_text(), style="PanelMuted.TLabel", justify="left", wraplength=360)
         self.calibration_report.pack(anchor="w", fill="x", pady=(9, 16))
         ttk.Label(insight, text="注意这几点", style="Paper.TLabel").pack(anchor="w")
-        ttk.Label(insight, text="• 原片仍需保留在原位置\n• 用同一题材的完整人工留片学习\n• 样本不足或验证不通过，不启用新偏好\n• 目前只保存一份偏好；成功更新会替换旧偏好", style="PanelMuted.TLabel", justify="left", wraplength=360).pack(anchor="w", pady=(7, 0))
+        ttk.Label(insight, text="• 原片仍需保留在原位置；本机只存特征和留片结果\n• 每次补导都累积，同题材才合并；同一任务重导替换旧记录\n• 验证未通过会暂存反馈，但不启用新偏好\n• 旧版只保存偏好权重，旧任务要补导才能计入\n• 学得更多不保证准确，仍需人工复核", style="PanelMuted.TLabel", justify="left", wraplength=360).pack(anchor="w", pady=(7, 0))
         # Present the existing worker's state here when task chrome is hidden.
         # This is a second view, not a separate worker or decoding pipeline.
         self.calibration_activity = ttk.Frame(self.calibration_panel, style="Soft.TFrame", padding=(18, 12))
@@ -1732,8 +1745,27 @@ class EventCullApp(TkinterDnD.Tk):
         self._refresh_calibration_button()
 
     def _calibration_report_text(self) -> str:
+        profiles = self.__dict__.get("_active_scene_profiles", {})
+        history = self.__dict__.get("_calibration_history", {})
+        pending = self.__dict__.get("_calibration_pending_summary", "")
+        if history:
+            lines = []
+            for scene, (tasks, examples, positives) in sorted(history.items()):
+                profile = profiles.get(scene)
+                fully_active = (profile is not None and profile.task_count == tasks
+                                and profile.training_examples == examples
+                                and profile.positive_examples == positives)
+                state = ("已启用" if fully_active else
+                         "新反馈待验证，旧偏好仍启用" if profile is not None else "待验证")
+                lines.append(f"{scene}：累计 {tasks} 个任务、{examples:,} 张原片；"
+                             f"其中 {positives:,} 张人工保留（{state}）。")
+            return ("本机累计的 1 星原片保留反馈：\n" + "\n".join(lines)
+                    + ("\n" + pending if pending else "")
+                    + "\n不同题材不混训；只有验证通过的偏好用于后续分析，仍需人工复核。")
+        if pending:
+            return pending + "\n已暂存反馈，尚无通过验证的新偏好；基础筛选或旧偏好继续使用。"
         if self.calibration_profile is None:
-            return "还没有学习记录。\n选好照片后，选择左侧的最终留片文件夹即可开始。"
+            return "还没有累计学习记录。\n选好照片后，选择左侧的最终留片文件夹即可开始。"
         if getattr(self.calibration_profile, "objective", "featured") == "retention":
             profile = self.calibration_profile
             precision, recall = profile.validation_precision, profile.validation_recall
@@ -1743,6 +1775,7 @@ class EventCullApp(TkinterDnD.Tk):
                     f"仅用于{profile.scene_type or '对应题材'}原片取舍；不学习精修标签。\n"
                     + validation + "这是同批分组留出结果，不代表其他婚礼；未达 75% 不会显示达标。")
         return (
+            "旧版偏好（只有权重，没有逐张样本；旧任务可补导）：\n"
             f"已学习 {self.calibration_profile.training_examples:,} 张原片，"
             f"其中 {self.calibration_profile.positive_examples:,} 张是你最终保留的照片。\n"
             "已启用：用于下次分析的 3 星排序，不改本次星级。\n"
@@ -3635,6 +3668,10 @@ end run
 
     def _reset_task_state(self) -> None:
         """Clear in-memory task state without touching photos, XMP, or Lightroom."""
+        self._close_duplicate_review()
+        self._duplicate_review_session = None
+        if "duplicate_review_button" in self.__dict__:
+            self.duplicate_review_button.configure(state="disabled", text="A/B 人工复核")
         self.results = []
         self.imported_files = []
         self.analysis_completed_at = None
@@ -3821,11 +3858,12 @@ end run
             def on_progress(current: int, total: int, path: Path) -> None:
                 self.ui_events.put(("calibration_progress", (current, total, path)))
 
-            profile = build_profile(log_path, exported_folder, sources, progress_callback=on_progress,
-                                    checkpoint=self._analysis_checkpoint)
+            update = update_cumulative_profile(
+                log_path, exported_folder, sources, progress_callback=on_progress,
+                checkpoint=self._analysis_checkpoint,
+            )
             self._analysis_checkpoint()
-            save_profile(profile)
-            self.ui_events.put(("calibration_completed", profile))
+            self.ui_events.put(("calibration_completed", update))
         except AnalysisCancelled:
             self.ui_events.put(("calibration_cancelled", None))
         except CalibrationError as exc:
@@ -4247,6 +4285,13 @@ end run
 
     def _zoom_preview_image(self, path: Path) -> Image.Image:
         """Read one larger, disposable preview off the UI thread for close review."""
+        # A/B review and the existing single-photo zoom share this decoder and
+        # cache. Concurrent consumers must not render the same RAW twice.
+        key = path.resolve()
+        with self._preview_load_locks[hash(key) % len(self._preview_load_locks)]:
+            return self._load_zoom_preview_image(path)
+
+    def _load_zoom_preview_image(self, path: Path) -> Image.Image:
         try:
             key = path.resolve()
         except OSError:
@@ -4449,6 +4494,10 @@ end run
     def _clear_results_for_source_change(self) -> None:
         """Invalidate stale analysis while preserving the accumulating source list."""
         self.results = []
+        self._close_duplicate_review()
+        self._duplicate_review_session = None
+        if "duplicate_review_button" in self.__dict__:
+            self.duplicate_review_button.configure(state="disabled", text="A/B 人工复核")
         self.selected = None
         self.active_result_index = None
         self.active_import_path = None
@@ -4654,6 +4703,20 @@ end run
                 if reason not in item.reasons:
                     item.reasons.append(reason)
 
+    def _profile_for_scene(self, scene_type: str) -> CalibrationProfile | None:
+        """Apply only this scene's active profile; legacy data is a fallback."""
+        profiles = self.__dict__.get("_active_scene_profiles")
+        if isinstance(profiles, dict):
+            profile = profiles.get(scene_type)
+            if profile is not None:
+                return profile
+            legacy = self.__dict__.get("_legacy_profile")
+            return legacy if legacy is not None and getattr(legacy, "scene_type", "") in {"", scene_type} else None
+        # Old test fixtures and third-party integrations may instantiate this
+        # class without running __init__; preserve their legacy path.
+        legacy = self.__dict__.get("calibration_profile")
+        return legacy if legacy is not None and getattr(legacy, "scene_type", "") in {"", scene_type} else None
+
     def _analyze(
         self,
         source: Path | list[Path],
@@ -4661,9 +4724,9 @@ end run
         preserved_manual_ratings: dict[Path, int] | None = None,
     ) -> None:
         try:
-            if (getattr(self.calibration_profile, "objective", "featured") == "retention"
-                    and getattr(self.calibration_profile, "scene_type", "") in {"", options.scene_type}):
-                options = replace(options, calibration_feature_pipeline=self.calibration_profile.feature_pipeline)
+            active_profile = self._profile_for_scene(options.scene_type)
+            if getattr(active_profile, "objective", "featured") == "retention":
+                options = replace(options, calibration_feature_pipeline=active_profile.feature_pipeline)
             def on_progress(current: int, total: int, path: Path) -> None:
                 # Tk must only be called from its main thread on macOS.
                 self.ui_events.put(("progress", (current, total, path)))
@@ -4678,13 +4741,13 @@ end run
             self._restore_manual_ratings(
                 results, preserved_manual_ratings or {}, self.language
             )
-            if self.calibration_profile is not None:
+            if active_profile is not None:
                 try:
                     def on_calibration_progress(current: int, total: int, path: Path) -> None:
                         self.ui_events.put(("calibration_apply_progress", (current, total, path)))
 
                     apply_profile(
-                        results, self.calibration_profile, progress_callback=on_calibration_progress,
+                        results, active_profile, progress_callback=on_calibration_progress,
                         checkpoint=self._analysis_checkpoint,
                         protected_paths=frozenset(preserved_manual_ratings or {}),
                         options=options,
@@ -4770,13 +4833,22 @@ end run
                     current, total, path = payload
                     self.update_calibration_progress(current, total, path, apply=True)
                 elif event == "calibration_completed":
-                    self.calibration_profile = payload
-                    self._finish_calibration()
-                    message = self.t["calibration_done"].format(
-                        samples=payload.training_examples,
-                        positive=payload.positive_examples,
-                        auc=payload.validation_auc,
+                    self._calibration_history[payload.scene_type] = (
+                        payload.task_count, payload.example_count, payload.positive_count,
                     )
+                    if payload.profile is not None:
+                        self._active_scene_profiles[payload.scene_type] = payload.profile
+                        self.calibration_profile = payload.profile
+                        self._calibration_pending_summary = ""
+                        message = (f"{payload.scene_type}偏好已更新：累计 {payload.task_count} 个任务、"
+                                   f"{payload.example_count:,} 张原片，人工保留 {payload.positive_count:,} 张。"
+                                   "下次分析生效；仍需人工复核。")
+                    else:
+                        message = (f"已暂存 {payload.scene_type}反馈：累计 {payload.task_count} 个任务、"
+                                   f"{payload.example_count:,} 张原片。{payload.pending_reason}"
+                                   "现有偏好未改变；以后补导该题材任务会继续合并验证。")
+                        self._calibration_pending_summary = message
+                    self._finish_calibration()
                     self.status.set(message)
                     if not self._close_after_operations:
                         messagebox.showinfo(self.t["calibration"], message)
@@ -5112,6 +5184,14 @@ end run
         self.analysis_running = False
         self.set_workflow_stage(4)
         self.results = results
+        if "duplicate_review_button" in self.__dict__:
+            session = self.__dict__.get("_duplicate_review_session")
+            if session is not None and self.__dict__.get("_duplicate_review_results") is results:
+                session.reconcile_manual_edits()
+                count = len(session.pending) + len(session.deferred)
+            else:
+                count = DuplicateReviewSession(results, self.manual_ratings).total_groups
+            self.duplicate_review_button.configure(state="normal", text=f"A/B 复核 · {count} 组待确认")
         self.selected = None
         self.active_result_index = None
         self.active_import_path = None
@@ -5192,12 +5272,17 @@ end run
             for rating in range(4)
         }
         target_text = self.target.get().strip()
+        active_calibration = self._profile_for_scene(self.scene_type.get())
         return {
             "version": 7,
             "rating_policy": RATING_POLICY_VERSION,
             "automatic_ratings": [0, 1, 3],
             "manual_confirmation_rating": 2,
             "manual_ratings": {str(path): rating for path, rating in self.manual_ratings.items()},
+            "duplicate_review_decisions": (
+                list(self._duplicate_review_session.decisions)
+                if self.__dict__.get("_duplicate_review_session") is not None
+                and self.__dict__.get("_duplicate_review_results") is self.results else []),
             "selection_policy": ("wedding-v2-240-evidence-gates" if self.scene_type.get() == "婚礼"
                                  else "scene-minimum-3plus-dynamic-density-v7-scene-rules"),
             "task": {
@@ -5226,15 +5311,16 @@ end run
             "source_folders": sorted({str(path.parent) for path in self.imported_files}),
             "counts": counts,
             "tier_to_xmp_rating": self._star_mapping(),
-            "personal_calibration": None if self.calibration_profile is None else {
-                "version": 3,
-                "training_examples": self.calibration_profile.training_examples,
-                "validation_auc": round(self.calibration_profile.validation_auc, 4),
-                "objective": getattr(self.calibration_profile, "objective", "featured"),
-                "scene_type": getattr(self.calibration_profile, "scene_type", ""),
-                "validation_precision": getattr(self.calibration_profile, "validation_precision", None),
-                "validation_recall": getattr(self.calibration_profile, "validation_recall", None),
-                "validation_scope": getattr(self.calibration_profile, "validation_scope", "burst_holdout"),
+            "personal_calibration": None if active_calibration is None else {
+                "version": 4,
+                "training_examples": active_calibration.training_examples,
+                "validation_auc": round(active_calibration.validation_auc, 4),
+                "objective": getattr(active_calibration, "objective", "featured"),
+                "scene_type": getattr(active_calibration, "scene_type", ""),
+                "validation_precision": getattr(active_calibration, "validation_precision", None),
+                "validation_recall": getattr(active_calibration, "validation_recall", None),
+                "validation_scope": getattr(active_calibration, "validation_scope", "burst_holdout"),
+                "task_count": getattr(active_calibration, "task_count", 1),
             },
             "selected_total": int(counts["1"]) + int(counts["2"]) + int(counts["3"]),
             "photos": [
@@ -5593,6 +5679,47 @@ end run
         details = f"{item.path.name}\n{score_label.format(score=item.score, sharpness=sharpness)}\n{review_status}\n" + ("\n".join(item.reasons) or self.t["best"])
         self.detail.configure(text=details)
 
+    def _close_duplicate_review(self) -> None:
+        dialog = self.__dict__.get("_duplicate_review_dialog")
+        if dialog is not None and dialog.winfo_exists():
+            dialog.close()
+        self._duplicate_review_dialog = None
+
+    def open_duplicate_review(self) -> None:
+        """Review existing groups without new analysis or automatic metadata writes."""
+        if self._task_operation_running() or not self.results:
+            return
+        existing = self.__dict__.get("_duplicate_review_dialog")
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            return
+        session = self.__dict__.get("_duplicate_review_session")
+        if session is None or self.__dict__.get("_duplicate_review_results") is not self.results:
+            session = DuplicateReviewSession(self.results, self.manual_ratings)
+            if not session.total_groups:
+                if not messagebox.askyesno("没有分数接近的待确认组", "是否查看全部相似组？已有人工评级的照片会跳过。"):
+                    return
+                session = DuplicateReviewSession(self.results, self.manual_ratings, uncertain_only=False)
+            if not session.total_groups:
+                messagebox.showinfo("A/B 人工复核", "当前没有可对比的相似组；已有人工评级不会被自动覆盖。")
+                return
+            self._duplicate_review_session = session
+            self._duplicate_review_results = self.results
+        session.reconcile_manual_edits()
+        self._duplicate_review_dialog = DuplicateReviewDialog(
+            self, session, load_preview=self._zoom_preview_image,
+            preview_source=self._preview_source, on_change=self._duplicate_review_changed)
+
+    def _duplicate_review_changed(self) -> None:
+        selected_index = next((i for i, p in enumerate(self.results) if p is self.selected), None)
+        self.show_results(self.results, selected_index=selected_index)
+        self.status.set("A/B 人工确认已更新；未删除原片，未写入星级元数据。")
+        try:
+            self._write_automatic_log()
+        except OSError as exc:
+            self.status.set(f"人工确认已在界面更新，但日志保存失败：{exc}")
+        self._write_task_history("已人工确认")
+
     def set_manual_rating(self, rating: int) -> None:
         if self._task_operation_running():
             return
@@ -5855,6 +5982,53 @@ end run
         else:
             self.destroy()
 
+def _run_ab_packaging_smoke_test() -> None:
+    """Verify the frozen A/B screen without user history, licenses or photos."""
+    from tempfile import TemporaryDirectory
+    root = tk.Tk()
+    root.withdraw()
+    with TemporaryDirectory(prefix="MiaoXuan-AB-Smoke-") as temporary:
+        folder = Path(temporary)
+        photos = []
+        for index, color in enumerate(("#4682b4", "#75633d", "#405c46")):
+            path = folder / f"fixture-{index}.jpg"
+            Image.new("RGB", (640, 480), color).save(path)
+            photos.append(PhotoResult(path=path, group_id=1, score=70, suggested_rating=1))
+        manual = {}
+        session = DuplicateReviewSession(photos, manual)
+        updates = []
+        def load(path):
+            frame = _load_preview(path)
+            return Image.fromarray(frame[:, :, ::-1].copy())
+        dialog = DuplicateReviewDialog(root, session, load_preview=load,
+                                      preview_source=lambda path, _pairs: path,
+                                      on_change=lambda: updates.append(True))
+        try:
+            deadline = time.monotonic() + 15
+            while len(dialog._loaded_paths) != 2:
+                root.update()
+                if time.monotonic() > deadline:
+                    raise RuntimeError("Bundled A/B preview timed out")
+                time.sleep(.01)
+            dialog._toggle_zoom()
+            dialog.act("a")
+            if manual != {photos[0].path: 2, photos[1].path: 0} or session.pair != (photos[0], photos[2]):
+                raise RuntimeError("Bundled A/B choice failed")
+            dialog.undo()
+            if manual or session.pair != (photos[0], photos[1]):
+                raise RuntimeError("Bundled A/B undo failed")
+            dialog.act("skip")
+            if not session.deferred or manual:
+                raise RuntimeError("Bundled A/B skip changed ratings")
+            dialog.revisit()
+            if session.pair != (photos[0], photos[1]):
+                raise RuntimeError("Bundled A/B revisit failed")
+            print(f"MiaoXuan {APP_VERSION} A/B packaging smoke passed ({sys.platform})", flush=True)
+        finally:
+            dialog.close()
+            root.destroy()
+
+
 def _run_packaging_smoke_test() -> None:
     """Exercise the frozen Windows shell and its primary navigation in CI."""
     trace_path = os.environ.get("MIAOXUAN_SMOKE_TRACE")
@@ -6102,7 +6276,9 @@ def _run_packaging_smoke_test() -> None:
 
 
 if __name__ == "__main__":
-    if "--packaging-smoke-test" in sys.argv:
+    if "--ab-review-smoke-test" in sys.argv:
+        _run_ab_packaging_smoke_test()
+    elif "--packaging-smoke-test" in sys.argv:
         _run_packaging_smoke_test()
     else:
         EventCullApp().mainloop()

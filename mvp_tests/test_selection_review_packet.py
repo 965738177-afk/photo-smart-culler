@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from scripts.build_selection_review_packet import build_packet
+from scripts.build_selection_review_packet import build_packet, build_capture_packet
 
 
 def _case(tmp_path):
@@ -80,3 +80,43 @@ def test_review_packet_rejects_partial_or_misaligned_reference_without_writes(tm
         build_packet(baseline, evaluation, manual, manual / "report")
     with pytest.raises(ValueError, match="1–24"):
         build_packet(baseline, evaluation, manual, output, per_category=25)
+
+
+def test_capture_packet_matches_paths_not_duplicate_names(tmp_path):
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    manual = tmp_path / "manual"
+    manual.mkdir()
+    (manual / "a_副本.JPG").write_bytes(b"export")
+    photos, capture_rows, stats = [], [], {}
+    for folder, rating, human in (("morning", 1, False), ("afternoon", 0, True)):
+        source = tmp_path / folder
+        source.mkdir()
+        path = source / "a.ARW"
+        path.write_bytes(b"raw")
+        photos.append({"folder": str(source), "file": path.name, "group": 1, "score": 1.})
+        capture_rows.append({"path": str(path), "group": 1, "ai_rating": rating, "human_retained": human})
+    for path in [*(tmp_path / folder / "a.ARW" for folder in ("morning", "afternoon")),
+                 manual / "a_副本.JPG"]:
+        stats[str(path)] = [path.stat().st_size, path.stat().st_mtime_ns]
+    baseline, reference, inventory = [evidence / n for n in ("baseline.json", "reference.json", "inventory.json")]
+    baseline.write_text(json.dumps({"photos": photos, "manual_ratings": {}}))
+    reference.write_text(json.dumps({"baseline_sha256": hashlib.sha256(baseline.read_bytes()).hexdigest(),
+                                     "photos": capture_rows}))
+    inventory.write_text(json.dumps(stats))
+    seen = []
+
+    def preview(path):
+        seen.append(path)
+        return np.zeros((20, 20, 3), np.uint8)
+
+    report = build_capture_packet(baseline, reference, inventory, manual, tmp_path / "review",
+                                  load_preview=preview)
+    assert not report["samples"]["same_group_different_frame"]
+    assert len(report["samples"]["human_group_missed"]) == 1
+    assert len(report["samples"]["ai_group_not_delivered"]) == 1
+    assert len(set(seen)) == len(seen) == report["unique_decodes"] == 2
+    (manual / "extra.JPG").touch()
+    with pytest.raises(ValueError, match="file list changed"):
+        build_capture_packet(baseline, reference, inventory, manual, tmp_path / "refused", load_preview=preview)
+    assert not (tmp_path / "refused").exists()

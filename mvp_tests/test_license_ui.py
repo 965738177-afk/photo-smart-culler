@@ -133,7 +133,7 @@ def test_background_request_never_calls_tk_after_window_closes():
     assert delivered == []
 
 
-def test_team_email_verification_expands_inline_without_a_second_tk_window():
+def test_team_email_verification_is_one_choice_without_a_second_tk_window():
     class Value:
         def __init__(self, value=""):
             self.value = value
@@ -144,41 +144,82 @@ def test_team_email_verification_expands_inline_without_a_second_tk_window():
         def set(self, value):
             self.value = value
 
-    class Panel:
-        visible = False
-        packed = None
-
-        def winfo_manager(self):
-            return "pack" if self.visible else ""
-
-        def pack(self, **kwargs):
-            self.visible = True
-            self.packed = kwargs
-
-        def pack_forget(self):
-            self.visible = False
-
-    class Button:
-        def __init__(self):
-            self.text = ""
-
-        def configure(self, **kwargs):
-            self.text = kwargs.get("text", self.text)
-
     dialog = object.__new__(license_ui.LicenseDialog)
     dialog.controller = type("Controller", (), {"lease": None})()
     dialog.team_email = Value("")
-    dialog.team_verify = Panel()
-    dialog.team_button = Button()
-    dialog.secondary_heading = object()
-    dialog._sync_scroll_region = lambda: None
+    selected = []
+    dialog._show_license_mode = selected.append
 
     dialog.manage_team(initial_email="member@example.com")
 
     assert dialog.team_email.get() == "member@example.com"
-    assert dialog.team_verify.visible is True
-    assert dialog.team_verify.packed["before"] is dialog.secondary_heading
-    assert dialog.team_button.text == "收起团队邮箱验证"
+    assert selected == ["team"]
+
+
+def test_license_choice_shows_only_the_selected_authorization_form():
+    class Panel:
+        def __init__(self):
+            self.visible = False
+
+        def pack(self, **_kwargs):
+            self.visible = True
+
+        def pack_forget(self):
+            self.visible = False
+
+        def grid(self, **_kwargs):
+            self.visible = True
+
+        def grid_remove(self):
+            self.visible = False
+
+    dialog = object.__new__(license_ui.LicenseDialog)
+    for name in ("trial_panel", "team_verify", "offers", "mode_choices", "mode_back",
+                 "status_card", "account_panel", "purchase_panel"):
+        setattr(dialog, name, Panel())
+    dialog._sync_scroll_region = lambda: None
+    dialog._scroll_canvas = type("Canvas", (), {"yview_moveto": lambda self, _value: None})()
+
+    dialog._show_license_mode(None)
+    assert dialog.mode_choices.visible
+    assert not dialog.team_verify.visible
+    assert not dialog.offers.visible
+
+    dialog._show_license_mode("team")
+    assert dialog.team_verify.visible
+    assert not dialog.mode_choices.visible
+    assert not dialog.offers.visible
+
+    dialog._show_license_mode("purchase")
+    assert dialog.purchase_panel.visible
+    assert not dialog.account_panel.visible
+    assert dialog.offers.visible
+    assert not dialog.team_verify.visible
+
+    dialog._show_license_mode("activate")
+    assert dialog.account_panel.visible
+    assert not dialog.purchase_panel.visible
+
+
+def test_missing_personal_code_does_not_redirect_to_team_authorization():
+    class Value:
+        def __init__(self, value=""):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    dialog = object.__new__(license_ui.LicenseDialog)
+    dialog.code = Value("")
+    dialog.payment_note = Value()
+    dialog.manage_team = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("wrong flow"))
+
+    dialog.activate()
+
+    assert "购买邮件中的激活码" in dialog.payment_note.get()
 
 
 def test_team_code_response_reenables_confirmation_button():
@@ -198,10 +239,6 @@ def test_team_code_response_reenables_confirmation_button():
 
         def configure(self, **kwargs):
             self.state = kwargs.get("state", self.state)
-
-    class Panel:
-        def winfo_manager(self):
-            return "pack"
 
     class Service:
         def credential(self):
@@ -227,16 +264,16 @@ def test_team_code_response_reenables_confirmation_button():
     dialog.payment_note = Value()
     dialog.status = Value()
     dialog.detail = Value()
-    dialog.team_access = Panel()
-    dialog.team_verify = Panel()
+    dialog._active_mode = "team"
+    dialog.mode_buttons = []
     dialog.on_changed = lambda: None
     for name in (
-        "team_button", "team_send_button", "team_activate_button", "monthly_plan",
+        "mode_back", "team_send_button", "team_activate_button", "monthly_plan",
         "lifetime_plan", "devices_button", "refresh_button", "activate_button",
         "alipay_button", "wechat_button", "trial_start_button",
     ):
         setattr(dialog, name, Control())
-    dialog._controls = [dialog.team_send_button, dialog.team_activate_button, dialog.team_button]
+    dialog._controls = [dialog.team_send_button, dialog.team_activate_button, dialog.mode_back]
     dialog.bind = lambda *args, **kwargs: None
     callbacks = []
     dialog.after = lambda _delay, callback: callbacks.append(callback)
